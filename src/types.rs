@@ -182,6 +182,28 @@ pub struct BudgetLedger {
     pub entries: Vec<CostEntry>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum GoalStatus {
+    Pending,
+    InProgress,
+    Complete,
+    Blocked,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GoalNode {
+    pub id: String,
+    pub title: String,
+    pub children: Vec<GoalNode>,
+    pub status: GoalStatus,
+    pub assigned_turn: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct GoalTree {
+    pub root: Option<GoalNode>,
+}
+
 /// σ: The Global State
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ConversationState {
@@ -197,6 +219,8 @@ pub struct ConversationState {
     pub state_hash: [u8; 32],
     #[serde(default)]
     pub budget: BudgetLedger,
+    #[serde(default)]
+    pub goal_tree: GoalTree,
 }
 
 /// Events emitted by the Orchestrator to the UI
@@ -229,6 +253,7 @@ impl ConversationState {
             completion_probability: 0.0,
             state_hash: [0u8; 32],
             budget: BudgetLedger::default(),
+            goal_tree: GoalTree::default(),
         }
     }
 

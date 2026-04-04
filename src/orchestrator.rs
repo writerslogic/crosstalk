@@ -17,6 +17,7 @@ use crate::reasoning::{ReasoningEngine, FallacyDetector};
 use crate::quality::{QualityEngine, RegressionDetector};
 use crate::self_improvement::SelfImprovementEngine;
 use crate::swarm::SwarmController;
+use crate::planning::PlanningEngine;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -40,6 +41,7 @@ pub struct Orchestrator {
     pub reasoning: ReasoningEngine,
     pub self_improve: SelfImprovementEngine,
     pub swarm: SwarmController,
+    pub planning: PlanningEngine,
 }
 
 impl Orchestrator {
@@ -70,6 +72,7 @@ impl Orchestrator {
             reasoning: ReasoningEngine,
             self_improve: SelfImprovementEngine,
             swarm: SwarmController::new(),
+            planning: PlanningEngine,
         }
     }
 
@@ -289,8 +292,12 @@ impl Orchestrator {
 
             self.state_manager.checkpoint(&sigma)?;
             
-            // Swarm Broadcast
             self.swarm.broadcast_turn(turn.clone());
+
+            // Planning: Update Goal Tree
+            if let Some(ref mut root) = sigma.goal_tree.root {
+                PlanningEngine::update_goal_status(root);
+            }
 
             let _ = self.event_tx.send(StreamEvent::TokenReceived(format!("\n[Turn Complete | P(C): {:.2} | Hash: {:02x?}]\n", sigma.completion_probability, &sigma.state_hash[..4]))).await;
             let _ = self.event_tx.send(StreamEvent::TurnComplete(turn)).await;
