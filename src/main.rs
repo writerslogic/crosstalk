@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
             diffs: vec![],
             certainty: Some(1.0),
             outcome: types::TurnOutcome::Unknown,
+            task_category: Some(types::TaskCategory::Research),
         });
     }
 

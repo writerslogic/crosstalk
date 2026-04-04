@@ -1,7 +1,7 @@
 use crate::agent_trait::PromptAgent;
 use crate::diff::DiffEngine;
 use crate::state::StateManager;
-use crate::types::{Artifact, ControlSignal, ConversationState, StreamEvent, Turn, TurnOutcome};
+use crate::types::{Artifact, ControlSignal, ConversationState, StreamEvent, Turn, TurnOutcome, TaskCategory};
 use crate::validation::AstValidator;
 use crate::consensus::{CertaintyAnalyzer, KalmanConvergence, InfluenceWeightManager};
 use crate::sandbox::SandboxManager;
@@ -11,6 +11,7 @@ use crate::environment::ToolDiscovery;
 use crate::verification::{HashChain, TautologyFilter};
 use crate::proof::ProofManager;
 use crate::memory::{MemoryStore, ContextDistiller};
+use crate::intelligence::{IntelligenceEngine, QualityScorer};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -28,6 +29,7 @@ pub struct Orchestrator {
     mc_runner: MonteCarloRunner,
     pub mcp_gateway: McpGateway,
     pub memory_store: MemoryStore,
+    pub intelligence: Mutex<IntelligenceEngine>,
 }
 
 impl Orchestrator {
@@ -53,6 +55,7 @@ impl Orchestrator {
             mc_runner: MonteCarloRunner::new().expect("Failed to init simulation"),
             mcp_gateway,
             memory_store: MemoryStore::new("/tmp/crosstalk-memory"),
+            intelligence: Mutex::new(IntelligenceEngine::new()),
         }
     }
 
@@ -63,7 +66,6 @@ impl Orchestrator {
                 self.state_manager.checkpoint(&s)?;
             }
             let contents: Vec<String> = s.turns.iter().map(|t| t.content.clone()).collect();
-            // 1. Context Distillation
             let distilled_prompt = ContextDistiller::distill(&s, 2000);
             (s.iteration_index, distilled_prompt, contents)
         };
@@ -173,7 +175,7 @@ impl Orchestrator {
                     current_artifact.proof_attachments.push(proof);
 
                     turn_diffs.push((name, delta));
-                    outcome = TurnOutcome::Compiled; // Basic success
+                    outcome = TurnOutcome::Compiled;
                 }
             }
 
@@ -191,7 +193,16 @@ impl Orchestrator {
                 diffs: turn_diffs,
                 certainty: Some(certainty),
                 outcome,
+                task_category: Some(TaskCategory::CodeGeneration),
             };
+            
+            // Intelligence Update
+            let quality_score = QualityScorer::score(&turn);
+            {
+                let mut intell = self.intelligence.lock().await;
+                intell.update_profile(&turn, quality_score);
+            }
+
             sigma.turns.push(turn.clone());
             sigma.iteration_index += 1;
 
