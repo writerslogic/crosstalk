@@ -98,7 +98,9 @@ impl Orchestrator {
                 self.state_manager.checkpoint(&s)?;
             }
             let contents: Vec<String> = s.turns.iter().map(|t| t.content.clone()).collect();
-            let distilled_prompt = ContextDistiller::distill(&s, 2000);
+            
+            // Step 2 Hardening: Differential Context Delivery (Δσ)
+            let distilled_prompt = self.build_differential_prompt(&s);
             
             let agent_idx = (s.iteration_index as usize) % self.agents.len();
             let model_id = self.agents[agent_idx].name().to_string();
@@ -215,6 +217,7 @@ impl Orchestrator {
                     ast_versions: HashMap::new(),
                     proof_attachments: vec![],
                     metrics: crate::quality::ArtifactMetrics::default(),
+                    skeleton: String::new(),
                 });
 
                 if current_artifact.content != new_content {
@@ -243,6 +246,7 @@ impl Orchestrator {
                     current_artifact.version += 1;
                     current_artifact.language = lang.clone();
                     current_artifact.metrics = new_metrics;
+                    current_artifact.skeleton = AstValidator::generate_skeleton(&new_content, &lang);
 
                     let nodes = AstValidator::extract_nodes(&new_content, &lang);
                     for (node_id, content) in nodes {
@@ -329,7 +333,6 @@ impl Orchestrator {
                 PlanningEngine::update_goal_status(root);
             }
 
-            // Visualization: Render Frame
             {
                 let mut viz = self.viz.lock().await;
                 let _ = viz.render_frame(&sigma).await;
@@ -353,6 +356,61 @@ impl Orchestrator {
 
             Ok(is_converged)
         }
+    }
+
+    /// Step 2 Hardening: Differential Context Delivery (Δσ)
+    fn build_differential_prompt(&self, sigma: &ConversationState) -> String {
+        let mut p = format!("Project Context: {}\n\n", sigma.session_id);
+        
+        p.push_str("Artifacts (Semantic Skeleton + Active Nodes):\n");
+        for artifact in sigma.artifacts.values() {
+            p.push_str(&format!("--- Artifact: {} ---\n", artifact.name));
+            p.push_str("Skeleton:\n");
+            p.push_str(&artifact.skeleton);
+            p.push_str("\nActive Nodes (Full Content):\n");
+            
+            // Identify active nodes from last 2 turns
+            let mut active_node_ids = std::collections::HashSet::new();
+            for turn in sigma.turns.iter().rev().take(2) {
+                for (name, diff) in &turn.diffs {
+                    if name == &artifact.name {
+                        // Use historical artifact content to identify changes
+                        // Simplification: For now, if an artifact was changed, 
+                        // we'll assume its recently changed nodes are important.
+                        let changed_nodes = AstValidator::identify_changed_nodes(
+                            "", // We'd need prior version for exact node identification
+                            &artifact.content, 
+                            &artifact.language
+                        );
+                        for id in changed_nodes {
+                            active_node_ids.insert(id);
+                        }
+                    }
+                }
+            }
+
+            let nodes = AstValidator::extract_nodes(&artifact.content, &artifact.language);
+            for id in active_node_ids {
+                if let Some(content) = nodes.get(&id) {
+                    p.push_str(&format!("Node {}:\n{}\n", id, content));
+                }
+            }
+
+            // Include most recent Δα
+            if let Some(last_diff) = artifact.history.last() {
+                p.push_str("\nMost Recent Δα:\n");
+                p.push_str(&last_diff.diff_text);
+            }
+            p.push_str("\n");
+        }
+
+        p.push_str("\nRecent History (Last 5 turns):\n");
+        for t in sigma.turns.iter().rev().take(5).rev() {
+            let _ = writeln!(p, "{}: {}", t.model_id, t.content);
+        }
+        
+        p.push_str("\nRefine artifacts or debate the solution. Use ```lang:filename to propose changes. Tag completion with 'OPTIMAL'.");
+        p
     }
 
     fn parse_artifacts(response: &str) -> HashMap<String, (String, String)> {
@@ -383,14 +441,5 @@ impl Orchestrator {
 
     pub fn resume(&self, index: u32) -> Result<ConversationState> {
         self.rewind(index)
-    }
-
-    fn build_prompt(&self, sigma: &ConversationState) -> String {
-        let mut p = format!("Project Context: {}\n\nHistory:\n", sigma.session_id);
-        for t in sigma.turns.iter().rev().take(10).rev() {
-            let _ = writeln!(p, "{}: {}", t.model_id, t.content);
-        }
-        p.push_str("\nRefine artifacts or debate the solution. Use ```lang:filename to propose changes. Tag completion with 'OPTIMAL'.");
-        p
     }
 }

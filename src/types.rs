@@ -190,6 +190,8 @@ pub struct Artifact {
     pub proof_attachments: Vec<ProofAttachment>,
     #[serde(default)]
     pub metrics: ArtifactMetrics,
+    #[serde(default)]
+    pub skeleton: String, // Compressed AST representation (signatures only)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

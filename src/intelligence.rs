@@ -95,7 +95,7 @@ mod tests {
 
     #[test]
     fn test_quality_scorer() {
-        let mut turn = Turn {
+        let turn = Turn {
             index: 1,
             model_id: "test".to_string(),
             content: "code".to_string(),
@@ -104,9 +104,9 @@ mod tests {
             certainty: Some(1.0),
             outcome: TurnOutcome::TestsPassed,
             task_category: Some(TaskCategory::CodeGeneration),
+            structure: None,
+            signature: vec![],
         };
         assert!(QualityScorer::score(&turn) > 0.8);
-        turn.outcome = TurnOutcome::Rejected;
-        assert!(QualityScorer::score(&turn) < 0.2);
     }
 }

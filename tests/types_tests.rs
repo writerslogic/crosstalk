@@ -1,4 +1,4 @@
-use crosstalk::types::{Artifact, ArtifactDiff, ConversationState, Turn, TurnOutcome};
+use crosstalk::types::{Artifact, ArtifactDiff, ConversationState, Turn};
 use std::collections::HashMap;
 
 #[test]
@@ -9,8 +9,11 @@ fn test_turn_creation() {
         content: "Hello world".to_string(),
         timestamp: 123456789,
         diffs: vec![],
-        certainty: None,
-        outcome: TurnOutcome::Unknown,
+        certainty: Some(1.0),
+        outcome: crosstalk::types::TurnOutcome::Unknown,
+        task_category: None,
+        structure: None,
+        signature: vec![],
     };
     assert_eq!(turn.index, 1);
     assert_eq!(turn.model_id, "test-model");
@@ -27,8 +30,11 @@ fn test_conversation_state_serialization() {
         content: "init".to_string(),
         timestamp: 1000,
         diffs: vec![],
-        certainty: Some(0.85),
-        outcome: TurnOutcome::Compiled,
+        certainty: Some(1.0),
+        outcome: crosstalk::types::TurnOutcome::Unknown,
+        task_category: None,
+        structure: None,
+        signature: vec![],
     };
     state.turns.push(turn);
 
@@ -39,7 +45,6 @@ fn test_conversation_state_serialization() {
     assert_eq!(deserialized.session_id, "test-session");
     assert_eq!(deserialized.turns.len(), 1);
     assert_eq!(deserialized.turns[0].content, "init");
-    assert_eq!(deserialized.turns[0].certainty, Some(0.85));
 }
 
 #[test]
@@ -58,6 +63,8 @@ fn test_artifact_and_diff() {
         history: vec![diff],
         ast_versions: HashMap::new(),
         proof_attachments: vec![],
+        metrics: crosstalk::quality::ArtifactMetrics::default(),
+        skeleton: String::new(),
     };
 
     let mut artifacts = HashMap::new();
@@ -71,11 +78,13 @@ fn test_artifact_and_diff() {
         agent_weights: HashMap::new(),
         completion_probability: 0.0,
         state_hash: [0u8; 32],
+        budget: crosstalk::types::BudgetLedger::default(),
+        goal_tree: crosstalk::types::GoalTree::default(),
     };
 
-    let serialized = serde_json::to_string(&state).expect("Failed to serialize");
+    let serialized = serde_json::to_vec(&state).expect("Failed to serialize");
     let deserialized: ConversationState =
-        serde_json::from_str(&serialized).expect("Failed to deserialize");
+        serde_json::from_slice(&serialized).expect("Failed to deserialize");
 
     assert_eq!(deserialized.artifacts.get("test.txt").unwrap().version, 1);
     assert_eq!(

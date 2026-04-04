@@ -57,6 +57,109 @@ impl AstValidator {
         nodes
     }
 
+    /// Generates a semantic skeleton (signatures only) for the given content.
+    pub fn generate_skeleton(content: &str, language: &str) -> String {
+        if !matches!(language.to_lowercase().as_str(), "rust" | "rs") {
+            return content.lines().take(10).collect::<Vec<_>>().join("\n") + "\n...";
+        }
+
+        let mut parser = Parser::new();
+        let _ = parser.set_language(&tree_sitter_rust::LANGUAGE.into());
+        let tree = match parser.parse(content, None) {
+            Some(t) => t,
+            None => return String::new(),
+        };
+
+        let mut skeleton = String::new();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+
+        for child in root.children(&mut cursor) {
+            match child.kind() {
+                "function_item" => {
+                    // Extract signature (everything up to the block)
+                    if let Some(body) = child.child_by_field_name("body") {
+                        let start = child.start_byte();
+                        let end = body.start_byte();
+                        if let Ok(sig) = std::str::from_utf8(&content.as_bytes()[start..end]) {
+                            skeleton.push_str(sig.trim_end());
+                            skeleton.push_str(" { ... }\n");
+                        }
+                    }
+                },
+                "struct_item" | "enum_item" | "trait_item" => {
+                    // For now, include the full definition as they are usually small
+                    if let Ok(text) = child.utf8_text(content.as_bytes()) {
+                        skeleton.push_str(text);
+                        skeleton.push('\n');
+                    }
+                },
+                "impl_item" => {
+                    // Extract impl header and method signatures
+                    let mut impl_text = String::new();
+                    if let Some(body) = child.child_by_field_name("body") {
+                        let start = child.start_byte();
+                        let end = body.start_byte();
+                        if let Ok(header) = std::str::from_utf8(&content.as_bytes()[start..end]) {
+                            impl_text.push_str(header.trim_end());
+                            impl_text.push_str(" {\n");
+                            
+                            // Extract signatures of methods inside the impl
+                            let mut inner_cursor = body.walk();
+                            for method in body.children(&mut inner_cursor) {
+                                if method.kind() == "function_item" {
+                                    if let Some(m_body) = method.child_by_field_name("body") {
+                                        let m_start = method.start_byte();
+                                        let m_end = m_body.start_byte();
+                                        if let Ok(m_sig) = std::str::from_utf8(&content.as_bytes()[m_start..m_end]) {
+                                            impl_text.push_str("    ");
+                                            impl_text.push_str(m_sig.trim_end());
+                                            impl_text.push_str(" { ... }\n");
+                                        }
+                                    }
+                                }
+                            }
+                            impl_text.push_str("}\n");
+                        }
+                    }
+                    skeleton.push_str(&impl_text);
+                },
+                _ => {
+                    // Skip other items for the skeleton (like use statements, which aren't "logic")
+                    // Actually, use statements might be useful for context.
+                    // Spec says stripped of function bodies.
+                }
+            }
+        }
+        skeleton
+    }
+
+    /// Compares two versions of content and returns the IDs of nodes that changed.
+    pub fn identify_changed_nodes(old_content: &str, new_content: &str, language: &str) -> Vec<String> {
+        let old_nodes = Self::extract_nodes(old_content, language);
+        let new_nodes = Self::extract_nodes(new_content, language);
+        let mut changed = vec![];
+
+        for (id, content) in &new_nodes {
+            if let Some(old_val) = old_nodes.get(id) {
+                if old_val != content {
+                    changed.push(id.clone());
+                }
+            } else {
+                changed.push(id.clone()); // New node
+            }
+        }
+        
+        // Also check for deleted nodes
+        for id in old_nodes.keys() {
+            if !new_nodes.contains_key(id) {
+                changed.push(id.clone());
+            }
+        }
+
+        changed
+    }
+
     fn get_node_name(node: Node, content: &str) -> Option<String> {
         // Find identifier child
         for i in 0..node.child_count() {
@@ -128,5 +231,29 @@ impl AstValidator {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_skeleton() {
+        let code = r#"
+            pub fn add(a: i32, b: i32) -> i32 {
+                a + b
+            }
+            struct Point { x: i32, y: i32 }
+            impl Point {
+                fn new() -> Self { Point { x: 0, y: 0 } }
+            }
+        "#;
+        let skeleton = AstValidator::generate_skeleton(code, "rust");
+        assert!(skeleton.contains("pub fn add(a: i32, b: i32) -> i32 { ... }"));
+        assert!(skeleton.contains("struct Point { x: i32, y: i32 }"));
+        assert!(skeleton.contains("impl Point {"));
+        assert!(skeleton.contains("fn new() -> Self { ... }"));
+        assert!(!skeleton.contains("a + b"));
     }
 }

@@ -22,12 +22,12 @@ impl QualityEngine {
         let comment_lines = lines.iter().filter(|l| l.trim().starts_with("//") || l.trim().starts_with("/*")).count();
         let comment_density = if line_count > 0 { comment_lines as f64 / line_count as f64 } else { 0.0 };
 
-        // Simplified complexity: count branch keywords
+        // Simplified complexity: count branch keywords occurrences
         let branch_keywords = ["if", "for", "while", "match", "&&", "||"];
         let mut complexity = 1;
         for line in &lines {
             for kw in branch_keywords {
-                if line.contains(kw) { complexity += 1; }
+                complexity += line.matches(kw).count() as u32;
             }
         }
 
@@ -100,6 +100,7 @@ mod tests {
             ast_versions: HashMap::new(),
             proof_attachments: vec![],
             metrics: ArtifactMetrics::default(),
+            skeleton: String::new(),
         };
         let metrics = QualityEngine::analyze_artifact(&art);
         assert!(metrics.cyclomatic_complexity >= 3);
