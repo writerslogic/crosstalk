@@ -14,6 +14,11 @@ impl Orchestrator {
     }
 
     pub async fn run_turn(&self, sigma: &mut ConversationState) -> Result<bool> {
+        // Ensure initial state is checkpointed if it's the first turn
+        if sigma.iteration_index == 0 && sigma.turns.is_empty() {
+             self.state_manager.checkpoint(sigma)?;
+        }
+
         let agent_idx = (sigma.iteration_index as usize) % self.agents.len();
         let agent = &self.agents[agent_idx];
         let model_id = agent.name();
@@ -36,6 +41,17 @@ impl Orchestrator {
 
         let is_optimal = response.contains("OPTIMAL") || response.contains("CONVERGED");
         Ok(is_optimal)
+    }
+
+    /// Rewind :: σ_t ← σ_{t-k}
+    pub fn rewind(&self, index: u32) -> Result<ConversationState> {
+        self.state_manager.restore(index)?
+            .context(format!("Failed to rewind to index {}", index))
+    }
+
+    /// Resume :: Continue from the latest or specified state
+    pub fn resume(&self, index: u32) -> Result<ConversationState> {
+        self.rewind(index)
     }
 
     fn build_prompt(&self, sigma: &ConversationState) -> String {
