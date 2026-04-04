@@ -1,0 +1,4 @@
+/target
+.env
+.crosstalk_db
+**/*.rs.bk

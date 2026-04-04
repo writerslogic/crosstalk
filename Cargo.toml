@@ -1,0 +1,21 @@
+[package]
+name = "crosstalk"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+chrono = "0.4.44"
+clap = { version = "4.6.0", features = ["derive"] }
+crossterm = "0.29.0"
+dotenv = "0.15.0"
+futures = "0.3.32"
+indicatif = "0.18.4"
+ratatui = "0.30.0"
+rig-core = "0.34.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+similar = "3.0.0"
+sled = "0.34.7"
+thiserror = "2.0.18"
+tokio = { version = "1.51.0", features = ["full"] }
