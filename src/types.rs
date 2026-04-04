@@ -109,11 +109,13 @@ pub struct ArtifactDiff {
     pub diff_text: String,
 }
 
+use crate::quality::ArtifactMetrics;
+
 /// α: A project artifact (code, docs, research)
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Artifact {
     pub name: String,
-    pub language: String,
+    pub language: String, // e.g., "rust"
     pub content: String,
     pub version: u32,
     pub history: Vec<ArtifactDiff>,
@@ -121,6 +123,8 @@ pub struct Artifact {
     pub ast_versions: HashMap<String, Vec<(u32, String)>>,
     #[serde(default)]
     pub proof_attachments: Vec<ProofAttachment>,
+    #[serde(default)]
+    pub metrics: ArtifactMetrics,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

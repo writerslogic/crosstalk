@@ -14,6 +14,7 @@ use crate::memory::{MemoryStore, ContextDistiller};
 use crate::intelligence::{IntelligenceEngine, QualityScorer};
 use crate::compute::ComputeManager;
 use crate::reasoning::{ReasoningEngine, FallacyDetector};
+use crate::quality::{QualityEngine, RegressionDetector};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -78,7 +79,6 @@ impl Orchestrator {
             let agent_idx = (s.iteration_index as usize) % self.agents.len();
             let model_id = self.agents[agent_idx].name().to_string();
             
-            // Reasoning: Structure Selection
             let structure = ReasoningEngine::select_structure(TaskCategory::CodeGeneration, &model_id);
             let mut final_prompt = distilled_prompt;
             match structure {
@@ -145,7 +145,6 @@ impl Orchestrator {
             return Ok(false);
         }
 
-        // Reasoning: Fallacy Detection
         let fallacies = FallacyDetector::scan(&response);
         if !fallacies.is_empty() {
             println!("[reasoning] fallacies detected: {:?}", fallacies);
@@ -171,6 +170,12 @@ impl Orchestrator {
                     break;
                 }
 
+                // Quality: Duplication Detection
+                let dups = QualityEngine::detect_duplication(&new_content, &sigma.artifacts);
+                if !dups.is_empty() {
+                    println!("[quality] duplication detected for \"{name}\": {:?}", dups);
+                }
+
                 let current_artifact = sigma.artifacts.entry(name.clone()).or_insert_with(|| Artifact {
                     name: name.clone(),
                     language: lang.clone(),
@@ -179,6 +184,7 @@ impl Orchestrator {
                     history: vec![],
                     ast_versions: HashMap::new(),
                     proof_attachments: vec![],
+                    metrics: crate::quality::ArtifactMetrics::default(),
                 });
 
                 if current_artifact.content != new_content {
@@ -191,17 +197,30 @@ impl Orchestrator {
                         break;
                     }
 
+                    // Quality: Regression Detection
+                    let new_metrics = QualityEngine::analyze_artifact(&Artifact {
+                        content: new_content.clone(),
+                        ..current_artifact.clone()
+                    });
+                    if RegressionDetector::is_regressive(&current_artifact.metrics, &new_metrics) {
+                        println!("[quality] regression blocked for \"{name}\"");
+                        all_valid = false;
+                        outcome = TurnOutcome::Rejected;
+                        break;
+                    }
+
                     current_artifact.history.push(delta.clone());
                     current_artifact.content = new_content.clone();
                     current_artifact.version += 1;
                     current_artifact.language = lang.clone();
+                    current_artifact.metrics = new_metrics;
 
                     let nodes = AstValidator::extract_nodes(&new_content, &lang);
                     for (node_id, content) in nodes {
                         current_artifact.ast_versions.entry(node_id).or_default().push((current_i, content));
                     }
 
-                    let proof = ProofManager::generate_proof(current_artifact, vec!["ast_valid".to_string(), "mc_safe".to_string()]);
+                    let proof = ProofManager::generate_proof(current_artifact, vec!["ast_valid".to_string(), "mc_safe".to_string(), "quality_checked".to_string()]);
                     current_artifact.proof_attachments.push(proof);
 
                     turn_diffs.push((name, delta));
