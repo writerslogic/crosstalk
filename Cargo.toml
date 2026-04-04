@@ -5,12 +5,14 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-chrono = "0.4.44"
+chrono = "0.4.39"
 clap = { version = "4.6.0", features = ["derive"] }
 crossterm = "0.29.0"
 dotenv = "0.15.0"
 futures = "0.3.32"
 indicatif = "0.18.4"
+lancedb = "0.18.0"
+arrow-array = "53.3.0"
 ratatui = "0.30.0"
 rig-core = "0.34.0"
 serde = { version = "1.0.228", features = ["derive"] }

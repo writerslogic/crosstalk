@@ -2,6 +2,45 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum TurnOutcome {
+    Compiled,
+    TestsPassed,
+    AdvancedConvergence,
+    RolledBack,
+    Rejected,
+    Stalled,
+    Unknown,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Lesson {
+    pub id: String,
+    pub category: String,
+    pub description: String,
+    pub evidence_turn_ids: Vec<u32>,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FailureSignature {
+    pub error_type: String,
+    pub context_hash: String,
+    pub agent_id: String,
+    pub occurrence_count: u32,
+    pub context_embedding: Vec<f32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MemoryRecord {
+    pub turn_id: u32,
+    pub session_id: String,
+    pub embedding: Vec<f32>,
+    pub content_hash: String,
+    pub timestamp: u64,
+    pub metadata_json: String,
+}
+
 /// μ_n: An atomic turn in the debate
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Turn {
@@ -11,7 +50,13 @@ pub struct Turn {
     pub timestamp: u64,
     pub diffs: Vec<(String, ArtifactDiff)>,
     #[serde(default)]
-    pub certainty: Option<f64>, // [0.0, 1.0] confidence score
+    pub certainty: Option<f64>,
+    #[serde(default = "default_outcome")]
+    pub outcome: TurnOutcome,
+}
+
+fn default_outcome() -> TurnOutcome {
+    TurnOutcome::Unknown
 }
 
 /// Δα: Represents a change to an artifact
@@ -19,14 +64,14 @@ pub struct Turn {
 pub struct ArtifactDiff {
     pub original_version: u32,
     pub new_version: u32,
-    pub diff_text: String, // Standard unified diff format
+    pub diff_text: String,
 }
 
 /// α: A project artifact (code, docs, research)
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Artifact {
     pub name: String,
-    pub language: String, // e.g., "rust"
+    pub language: String,
     pub content: String,
     pub version: u32,
     pub history: Vec<ArtifactDiff>,
@@ -56,7 +101,7 @@ pub struct ConversationState {
     #[serde(default)]
     pub completion_probability: f64,
     #[serde(default)]
-    pub state_hash: [u8; 32], // SHA256 chain hash
+    pub state_hash: [u8; 32],
 }
 
 /// Events emitted by the Orchestrator to the UI

@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
             timestamp: ConversationState::now(),
             diffs: vec![],
             certainty: Some(1.0),
+            outcome: types::TurnOutcome::Unknown,
         });
     }
 
