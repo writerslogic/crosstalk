@@ -3,6 +3,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
+    text::{Span, Line, Text},
     widgets::{Block, Borders, List, ListItem, Paragraph, Row, Table, Wrap},
     Terminal,
 };
@@ -16,10 +17,12 @@ pub enum FocusedPane {
     History,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UIMode {
     Normal,
     Insert,
     Rewind,
+    Playback,
 }
 
 pub struct CrosstalkUI {
@@ -30,6 +33,9 @@ pub struct CrosstalkUI {
     mode: UIMode,
     input_buffer: String,
     active_pane: FocusedPane,
+    playback_index: u32,
+    #[allow(dead_code)]
+    expanded_nodes: std::collections::HashSet<String>,
 }
 
 impl CrosstalkUI {
@@ -48,6 +54,8 @@ impl CrosstalkUI {
             mode: UIMode::Normal,
             input_buffer: String::new(),
             active_pane: FocusedPane::GhostStream,
+            playback_index: 0,
+            expanded_nodes: std::collections::HashSet::new(),
         })
     }
 
@@ -58,20 +66,22 @@ impl CrosstalkUI {
 
         loop {
             // 1. Process Events
-            while let Ok(event) = self.event_rx.try_recv() {
-                match event {
-                    StreamEvent::TokenReceived(token) => {
-                        self.ghost_stream_buffer.push_str(&token);
+            if self.mode == UIMode::Normal || self.mode == UIMode::Insert {
+                while let Ok(event) = self.event_rx.try_recv() {
+                    match event {
+                        StreamEvent::TokenReceived(token) => {
+                            self.ghost_stream_buffer.push_str(&token);
+                        }
+                        StreamEvent::TurnComplete(turn) => {
+                            sigma.turns.push(turn);
+                            sigma.iteration_index += 1;
+                            self.ghost_stream_buffer.clear();
+                        }
+                        StreamEvent::Error(err) => {
+                            self.ghost_stream_buffer.push_str(&format!("\n[ERROR] {}\n", err));
+                        }
+                        _ => {}
                     }
-                    StreamEvent::TurnComplete(turn) => {
-                        sigma.turns.push(turn);
-                        sigma.iteration_index += 1;
-                        self.ghost_stream_buffer.clear();
-                    }
-                    StreamEvent::Error(err) => {
-                        self.ghost_stream_buffer.push_str(&format!("\n[ERROR] {}\n", err));
-                    }
-                    _ => {}
                 }
             }
 
@@ -92,9 +102,12 @@ impl CrosstalkUI {
                                     self.mode = UIMode::Insert;
                                     let _ = self.control_tx.send(ControlSignal::Pause).await;
                                 }
-                                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                    self.mode = UIMode::Rewind;
-                                    let _ = self.control_tx.send(ControlSignal::Pause).await;
+                                KeyCode::Char('p') => {
+                                    self.mode = UIMode::Playback;
+                                    self.playback_index = sigma.iteration_index;
+                                }
+                                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    let _ = self.capture_to_svg(&sigma);
                                 }
                                 KeyCode::Tab => {
                                     self.active_pane = match self.active_pane {
@@ -102,6 +115,24 @@ impl CrosstalkUI {
                                         FocusedPane::Artifacts => FocusedPane::History,
                                         FocusedPane::History => FocusedPane::GhostStream,
                                     };
+                                }
+                                _ => {}
+                            },
+                            UIMode::Playback => match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    self.mode = UIMode::Normal;
+                                }
+                                KeyCode::Left | KeyCode::Char(',') => {
+                                    if self.playback_index > 0 {
+                                        self.playback_index -= 1;
+                                        let _ = self.control_tx.send(ControlSignal::Rewind(self.playback_index)).await;
+                                    }
+                                }
+                                KeyCode::Right | KeyCode::Char('.') => {
+                                    if self.playback_index < sigma.iteration_index {
+                                        self.playback_index += 1;
+                                        let _ = self.control_tx.send(ControlSignal::Rewind(self.playback_index)).await;
+                                    }
                                 }
                                 _ => {}
                             },
@@ -129,9 +160,7 @@ impl CrosstalkUI {
                                     self.mode = UIMode::Normal;
                                     let _ = self.control_tx.send(ControlSignal::Resume).await;
                                 }
-                                _ => {
-                                    // Rewind selection logic placeholder
-                                }
+                                _ => {}
                             },
                         }
                     }
@@ -143,6 +172,12 @@ impl CrosstalkUI {
 
     /// Renders the current state σ to the terminal.
     pub fn render(&mut self, sigma: &ConversationState) -> Result<(), io::Error> {
+        let ghost_stream_content = self.ghost_stream_buffer.clone();
+        let mode = self.mode;
+        let playback_index = self.playback_index;
+        let active_pane = self.active_pane;
+        let input_buffer = self.input_buffer.clone();
+
         self.terminal.draw(|f| {
             let area = f.area();
 
@@ -150,31 +185,32 @@ impl CrosstalkUI {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3), // Top Bar (σ State)
+                    Constraint::Length(3), // Top Bar
                     Constraint::Min(10),   // Center Dashboard
                     Constraint::Length(3), // Neural Intercept Area
                     Constraint::Length(1), // Status Bar
                 ])
                 .split(area);
 
-            // 1. Top Bar (σ State)
+            // 1. Top Bar
             let top_chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Percentage(50), // Session info
-                    Constraint::Percentage(50), // μ Indicators
+                    Constraint::Percentage(50),
+                    Constraint::Percentage(50),
                 ])
                 .split(chunks[0]);
 
             let sigma_state = Paragraph::new(format!(
-                "Ω CROSSTALK | Session: {} | i_{}",
-                sigma.session_id, sigma.iteration_index
+                "Ω CROSSTALK | Session: {} | i_{} {}",
+                sigma.session_id, 
+                if mode == UIMode::Playback { playback_index } else { sigma.iteration_index },
+                if mode == UIMode::Playback { "[PLAYBACK]" } else { "" }
             ))
             .block(Block::default().borders(Borders::ALL).title(" σ State "));
             f.render_widget(sigma_state, top_chunks[0]);
 
-            let agents_list = " μ Agents: [Gemini-1.5] [GPT-4o] "; // Dynamic later
-            let mu_indicators = Paragraph::new(agents_list)
+            let mu_indicators = Paragraph::new(" μ Agents: [Gemini-1.5] [GPT-4o] ")
                 .block(Block::default().borders(Borders::ALL).title(" μ Agents "));
             f.render_widget(mu_indicators, top_chunks[1]);
 
@@ -182,20 +218,27 @@ impl CrosstalkUI {
             let dashboard_chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Percentage(70), // Left: Ghost Stream
-                    Constraint::Percentage(30), // Right: Metadata/Diffs
+                    Constraint::Percentage(70),
+                    Constraint::Percentage(30),
                 ])
                 .split(chunks[1]);
 
             let ghost_block = Block::default()
                 .borders(Borders::ALL)
-                .title(" Ghost Stream ")
-                .border_style(if self.active_pane == FocusedPane::GhostStream {
+                .title(" Ghost Stream / Code View ")
+                .border_style(if active_pane == FocusedPane::GhostStream {
                     Style::default().fg(Color::Yellow)
                 } else {
                     Style::default()
                 });
-            let ghost = Paragraph::new(self.ghost_stream_buffer.as_str())
+            
+            let display_text = if mode == UIMode::Playback {
+                Text::from(format!("[Playback of iteration i_{}]", playback_index))
+            } else {
+                render_heatmap_content(&ghost_stream_content)
+            };
+
+            let ghost = Paragraph::new(display_text)
                 .block(ghost_block)
                 .wrap(Wrap { trim: false });
             f.render_widget(ghost, dashboard_chunks[0]);
@@ -203,10 +246,24 @@ impl CrosstalkUI {
             let right_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Percentage(50), // Δα Diffs
-                    Constraint::Percentage(50), // Entropy Map
+                    Constraint::Percentage(40), // Interactive AST
+                    Constraint::Percentage(30), // Δα Diffs
+                    Constraint::Percentage(30), // Entropy Map
                 ])
                 .split(dashboard_chunks[1]);
+
+            // AST side panel
+            let mut ast_items = vec![];
+            for artifact in sigma.artifacts.values() {
+                ast_items.push(ListItem::new(Span::styled(format!("📁 {}", artifact.name), Style::default().add_modifier(Modifier::BOLD))));
+                for line in artifact.skeleton.lines() {
+                    ast_items.push(ListItem::new(format!("  {}", line)));
+                }
+            }
+            let ast_list = List::new(ast_items)
+                .block(Block::default().borders(Borders::ALL).title(" AST Navigator ")
+                .border_style(if active_pane == FocusedPane::Artifacts { Style::default().fg(Color::Yellow) } else { Style::default() }));
+            f.render_widget(ast_list, right_chunks[0]);
 
             // Δα Panel
             let diffs: Vec<ListItem> = sigma.turns.iter().rev().take(5).map(|t| {
@@ -214,7 +271,7 @@ impl CrosstalkUI {
             }).collect();
             let diffs_list = List::new(diffs)
                 .block(Block::default().borders(Borders::ALL).title(" Δα Diffs "));
-            f.render_widget(diffs_list, right_chunks[0]);
+            f.render_widget(diffs_list, right_chunks[1]);
 
             // Entropy Map Panel
             let mut friction_rows = vec![];
@@ -233,24 +290,68 @@ impl CrosstalkUI {
             )
             .header(Row::new(vec!["Artifact", "Ver", "Fric"]).style(Style::default().add_modifier(Modifier::BOLD)))
             .block(Block::default().title(" Entropy Map ").borders(Borders::ALL));
-            f.render_widget(entropy_table, right_chunks[1]);
+            f.render_widget(entropy_table, right_chunks[2]);
 
             // 3. Neural Intercept Area
-            let input_text = match self.mode {
+            let input_text = match mode {
                 UIMode::Normal => " [NORMAL] Wait for turn or Ctrl+I to intercept... ".to_string(),
-                UIMode::Insert => format!(" [INSERT] > {}", self.input_buffer),
+                UIMode::Insert => format!(" [INSERT] > {}", input_buffer),
                 UIMode::Rewind => " [REWIND] Select checkpoint index... ".to_string(),
+                UIMode::Playback => format!(" [PLAYBACK] i_{} | Use < / > to seek, Esc to exit", playback_index),
             };
             let input_para = Paragraph::new(input_text)
                 .block(Block::default().title(" Neural Intercept ").borders(Borders::ALL).border_style(
-                    if matches!(self.mode, UIMode::Insert) { Style::default().fg(Color::Cyan) } else { Style::default() }
+                    if matches!(mode, UIMode::Insert) { Style::default().fg(Color::Cyan) } else { Style::default() }
                 ));
             f.render_widget(input_para, chunks[2]);
 
             // 4. Status Bar
-            let status = Paragraph::new(" [Tab] Cycle Panes | [Ctrl+I] Inject | [Ctrl+R] Rewind | [q] Quit ");
+            let status = Paragraph::new(" [Tab] Cycle Panes | [Ctrl+I] Inject | [p] Playback | [Ctrl+S] Save SVG | [q] Quit ");
             f.render_widget(status, chunks[3]);
         })?;
         Ok(())
     }
+
+    pub fn capture_to_svg(&self, sigma: &ConversationState) -> io::Result<()> {
+        use std::fs::File;
+        use std::io::Write;
+
+        let filename = format!("capture_{}_{}.svg", sigma.session_id, sigma.iteration_index);
+        let mut file = File::create(filename)?;
+
+        writeln!(file, r##"<svg width="800" height="600" xmlns="http://www.w3.org/2000/svg">"##)?;
+        writeln!(file, r##"  <rect width="100%" height="100%" fill="#0a0a0f" />"##)?;
+        writeln!(file, r##"  <text x="20" y="40" font-family="monospace" font-size="16" fill="#00ff88">Ω CROSSTALK SNAPSHOT</text>"##)?;
+        writeln!(file, r##"  <text x="20" y="70" font-family="monospace" font-size="12" fill="#ffffff">Session: {}</text>"##, sigma.session_id)?;
+        writeln!(file, r##"  <text x="20" y="90" font-family="monospace" font-size="12" fill="#ffffff">Iteration: i_{}</text>"##, sigma.iteration_index)?;
+        
+        writeln!(file, r##"  <rect x="20" y="120" width="540" height="300" stroke="#ffffff" fill="none" />"##)?;
+        writeln!(file, r##"  <text x="30" y="140" font-family="monospace" font-size="10" fill="#ffffff">Ghost Stream Content...</text>"##)?;
+        
+        writeln!(file, r##"  <rect x="580" y="120" width="200" height="140" stroke="#ffffff" fill="none" />"##)?;
+        writeln!(file, r##"  <text x="590" y="140" font-family="monospace" font-size="10" fill="#ffffff">Δα Diffs</text>"##)?;
+
+        writeln!(file, "</svg>")?;
+        Ok(())
+    }
+}
+
+fn render_heatmap_content<'a>(content: &'a str) -> Text<'a> {
+    let mut lines = vec![];
+    for line in content.lines() {
+        let mut spans = vec![];
+        for word in line.split_whitespace() {
+            let friction = (word.len() as f32 % 10.0) / 10.0;
+            let color = if friction > 0.7 {
+                Color::Rgb(100, 0, 0)
+            } else if friction > 0.4 {
+                Color::Rgb(60, 60, 0)
+            } else {
+                Color::Reset
+            };
+            spans.push(Span::styled(word.to_string() + " ", Style::default().bg(color)));
+        }
+        lines.push(Line::from(spans));
+    }
+    Text::from(lines)
 }
