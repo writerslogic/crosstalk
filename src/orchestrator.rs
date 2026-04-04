@@ -15,6 +15,7 @@ use crate::intelligence::{IntelligenceEngine, QualityScorer};
 use crate::compute::ComputeManager;
 use crate::reasoning::{ReasoningEngine, FallacyDetector};
 use crate::quality::{QualityEngine, RegressionDetector};
+use crate::self_improvement::SelfImprovementEngine;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -36,6 +37,7 @@ pub struct Orchestrator {
     pub intelligence: Mutex<IntelligenceEngine>,
     pub compute: Mutex<ComputeManager>,
     pub reasoning: ReasoningEngine,
+    pub self_improve: SelfImprovementEngine,
 }
 
 impl Orchestrator {
@@ -64,6 +66,7 @@ impl Orchestrator {
             intelligence: Mutex::new(IntelligenceEngine::new()),
             compute: Mutex::new(ComputeManager::new()),
             reasoning: ReasoningEngine,
+            self_improve: SelfImprovementEngine,
         }
     }
 
@@ -170,7 +173,6 @@ impl Orchestrator {
                     break;
                 }
 
-                // Quality: Duplication Detection
                 let dups = QualityEngine::detect_duplication(&new_content, &sigma.artifacts);
                 if !dups.is_empty() {
                     println!("[quality] duplication detected for \"{name}\": {:?}", dups);
@@ -197,7 +199,6 @@ impl Orchestrator {
                         break;
                     }
 
-                    // Quality: Regression Detection
                     let new_metrics = QualityEngine::analyze_artifact(&Artifact {
                         content: new_content.clone(),
                         ..current_artifact.clone()
@@ -288,6 +289,13 @@ impl Orchestrator {
             let _ = self.event_tx.send(StreamEvent::TurnComplete(turn)).await;
 
             let is_converged = sigma.completion_probability > 0.95;
+            
+            if is_converged {
+                // Self-Improvement: Evaluate Session
+                let eval = SelfImprovementEngine::evaluate_session(&sigma);
+                println!("[self-improve] Session evaluation: {:?}", eval);
+            }
+
             Ok(is_converged)
         }
     }
