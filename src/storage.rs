@@ -1,7 +1,7 @@
 use crate::types::Artifact;
+use anyhow::Result;
 use std::fs;
 use std::path::Path;
-use anyhow::Result;
 
 pub struct ArtifactStorage {
     base_path: String,
@@ -10,7 +10,9 @@ pub struct ArtifactStorage {
 impl ArtifactStorage {
     pub fn new(path: &str) -> Result<Self> {
         fs::create_dir_all(path)?;
-        Ok(Self { base_path: path.to_string() })
+        Ok(Self {
+            base_path: path.to_string(),
+        })
     }
 
     /// Write α to disk

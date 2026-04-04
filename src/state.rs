@@ -17,7 +17,7 @@ impl StateManager {
         let key = format!("state:{}", state.iteration_index);
         let encoded = serde_json::to_vec(state)?;
         self.db.insert(key, encoded)?;
-        self.db.flush()?; 
+        self.db.flush()?;
         Ok(())
     }
 
@@ -31,12 +31,15 @@ impl StateManager {
     }
 
     pub fn list_checkpoints(&self) -> Vec<u32> {
-        self.db.range("state:0".."state:999999")
+        self.db
+            .range("state:0".."state:999999")
             .filter_map(|r| r.ok())
             .filter_map(|(k, _)| {
-                std::str::from_utf8(&k).ok()?
+                std::str::from_utf8(&k)
+                    .ok()?
                     .strip_prefix("state:")?
-                    .parse::<u32>().ok()
+                    .parse::<u32>()
+                    .ok()
             })
             .collect()
     }

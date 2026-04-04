@@ -1,4 +1,4 @@
-use crosstalk::types::{Artifact, ArtifactDiff, ConversationState, Turn};
+use crosstalk::types::{Artifact, ArtifactDiff, ConversationState, Turn, TurnOutcome};
 use std::collections::HashMap;
 
 #[test]
@@ -9,6 +9,8 @@ fn test_turn_creation() {
         content: "Hello world".to_string(),
         timestamp: 123456789,
         diffs: vec![],
+        certainty: None,
+        outcome: TurnOutcome::Unknown,
     };
     assert_eq!(turn.index, 1);
     assert_eq!(turn.model_id, "test-model");
@@ -25,6 +27,8 @@ fn test_conversation_state_serialization() {
         content: "init".to_string(),
         timestamp: 1000,
         diffs: vec![],
+        certainty: Some(0.85),
+        outcome: TurnOutcome::Compiled,
     };
     state.turns.push(turn);
 
@@ -35,6 +39,7 @@ fn test_conversation_state_serialization() {
     assert_eq!(deserialized.session_id, "test-session");
     assert_eq!(deserialized.turns.len(), 1);
     assert_eq!(deserialized.turns[0].content, "init");
+    assert_eq!(deserialized.turns[0].certainty, Some(0.85));
 }
 
 #[test]
@@ -51,6 +56,8 @@ fn test_artifact_and_diff() {
         content: "original".to_string(),
         version: 1,
         history: vec![diff],
+        ast_versions: HashMap::new(),
+        proof_attachments: vec![],
     };
 
     let mut artifacts = HashMap::new();
@@ -61,6 +68,9 @@ fn test_artifact_and_diff() {
         iteration_index: 1,
         turns: vec![],
         artifacts,
+        agent_weights: HashMap::new(),
+        completion_probability: 0.0,
+        state_hash: [0u8; 32],
     };
 
     let serialized = serde_json::to_string(&state).expect("Failed to serialize");

@@ -1,6 +1,6 @@
-use std::fs::{OpenOptions, File};
-use std::io::Write;
 use anyhow::Result;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 
 pub struct VerboseLogger {
     file: File,
@@ -8,10 +8,7 @@ pub struct VerboseLogger {
 
 impl VerboseLogger {
     pub fn new(path: &str) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self { file })
     }
 

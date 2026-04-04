@@ -41,6 +41,37 @@ pub struct MemoryRecord {
     pub metadata_json: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct RunningAverage {
+    pub mean: f64,
+    pub count: u32,
+}
+
+impl RunningAverage {
+    pub fn update(&mut self, value: f64) {
+        self.count += 1;
+        self.mean += (value - self.mean) / f64::from(self.count);
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TaskCategory {
+    CodeGeneration,
+    Debugging,
+    Architecture,
+    Refactoring,
+    Research,
+    Testing,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ModelProfile {
+    pub model_id: String,
+    pub task_scores: HashMap<TaskCategory, RunningAverage>,
+    pub total_turns: u32,
+    pub last_updated: u64,
+}
+
 /// μ_n: An atomic turn in the debate
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Turn {
@@ -53,6 +84,7 @@ pub struct Turn {
     pub certainty: Option<f64>,
     #[serde(default = "default_outcome")]
     pub outcome: TurnOutcome,
+    pub task_category: Option<TaskCategory>,
 }
 
 fn default_outcome() -> TurnOutcome {
