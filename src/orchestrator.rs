@@ -22,6 +22,7 @@ use crate::security::{SecretScanner, TurnSigner};
 use crate::analytics::AnalyticsEngine;
 use crate::release::{ReleaseManager, ConvergenceReport};
 use crate::collective_intelligence::CollectiveIntelligenceEngine;
+use crate::visualization::GodView;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -50,6 +51,7 @@ pub struct Orchestrator {
     pub analytics: AnalyticsEngine,
     pub release: ReleaseManager,
     pub collective: Mutex<CollectiveIntelligenceEngine>,
+    pub viz: Mutex<GodView>,
 }
 
 impl Orchestrator {
@@ -85,6 +87,7 @@ impl Orchestrator {
             analytics: AnalyticsEngine,
             release: ReleaseManager,
             collective: Mutex::new(CollectiveIntelligenceEngine::new()),
+            viz: Mutex::new(GodView::new()),
         }
     }
 
@@ -282,7 +285,6 @@ impl Orchestrator {
                 intell.update_profile(&turn, quality_score);
             }
 
-            // Collective Update
             {
                 let mut coll = self.collective.lock().await;
                 coll.update_specialization(&turn);
@@ -325,6 +327,12 @@ impl Orchestrator {
 
             if let Some(ref mut root) = sigma.goal_tree.root {
                 PlanningEngine::update_goal_status(root);
+            }
+
+            // Visualization: Render Frame
+            {
+                let mut viz = self.viz.lock().await;
+                let _ = viz.render_frame(&sigma).await;
             }
 
             let _ = self.event_tx.send(StreamEvent::TokenReceived(format!("\n[Turn Complete | P(C): {:.2} | Hash: {:02x?}]\n", sigma.completion_probability, &sigma.state_hash[..4]))).await;

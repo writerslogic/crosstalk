@@ -36,6 +36,10 @@ tree-sitter-rust = "0.23.2"
 wasmtime = "29.0.1"
 wasmtime-wasi = "29.0.1"
 which = "7.0.1"
+wgpu = "24.0.1"
+winit = "0.30.9"
+bytemuck = { version = "1.21.0", features = ["derive"] }
+
 
 [dev-dependencies]
 tempfile = "3.10.1"
