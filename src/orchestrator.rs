@@ -20,6 +20,7 @@ use crate::swarm::SwarmController;
 use crate::planning::PlanningEngine;
 use crate::security::{SecretScanner, TurnSigner};
 use crate::analytics::AnalyticsEngine;
+use crate::release::{ReleaseManager, ConvergenceReport};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -46,6 +47,7 @@ pub struct Orchestrator {
     pub planning: PlanningEngine,
     pub signer: TurnSigner,
     pub analytics: AnalyticsEngine,
+    pub release: ReleaseManager,
 }
 
 impl Orchestrator {
@@ -79,6 +81,7 @@ impl Orchestrator {
             planning: PlanningEngine,
             signer: TurnSigner::new(),
             analytics: AnalyticsEngine,
+            release: ReleaseManager,
         }
     }
 
@@ -324,9 +327,12 @@ impl Orchestrator {
                 let eval = SelfImprovementEngine::evaluate_session(&sigma);
                 println!("[self-improve] Session evaluation: {:?}", eval);
                 
-                // Analytics: Generate Report
                 let report = AnalyticsEngine::generate_report(&sigma);
                 println!("[analytics] Session report: {:?}", report);
+
+                // Release: Final Report
+                let exec_summary = ConvergenceReport::generate(&sigma);
+                println!("[release] Convergence Report:\n{}", exec_summary);
             }
 
             Ok(is_converged)
