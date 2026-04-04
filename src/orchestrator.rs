@@ -3,6 +3,7 @@ use crate::diff::DiffEngine;
 use crate::state::StateManager;
 use crate::types::{Artifact, ControlSignal, ConversationState, StreamEvent, Turn};
 use crate::validation::AstValidator;
+use crate::consensus::{CertaintyAnalyzer, KalmanConvergence, InfluenceWeightManager};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -102,6 +103,9 @@ impl Orchestrator {
         let proposed_artifacts = Self::parse_artifacts(&response);
         let mut turn_diffs = vec![];
 
+        // Consensus Analysis
+        let certainty = CertaintyAnalyzer::compute(&response);
+
         {
             let mut sigma = sigma_lock.lock().await;
 
@@ -146,19 +150,35 @@ impl Orchestrator {
                 content: response.clone(),
                 timestamp: ConversationState::now(),
                 diffs: turn_diffs,
+                certainty: Some(certainty),
             };
             sigma.turns.push(turn.clone());
             sigma.iteration_index += 1;
 
+            // Update Consensus Metrics
+            sigma.agent_weights = InfluenceWeightManager::calculate_weights(&sigma);
+            
+            let mut kalman = KalmanConvergence {
+                p_c: sigma.completion_probability,
+                variance: 0.1, // Heuristic
+            };
+            // Measurement: 1.0 if response contains OPTIMAL, else certainty-based
+            let measurement = if response.contains("OPTIMAL") || response.contains("CONVERGED") {
+                1.0
+            } else {
+                certainty * 0.8 // Heuristic
+            };
+            sigma.completion_probability = kalman.update(measurement);
+
             self.state_manager.checkpoint(&sigma)?;
             
             // Signal turn completion to UI
-            let _ = self.event_tx.send(StreamEvent::TokenReceived("\n[Turn Complete]\n".to_string())).await;
+            let _ = self.event_tx.send(StreamEvent::TokenReceived(format!("\n[Turn Complete | P(C): {:.2}]\n", sigma.completion_probability))).await;
             let _ = self.event_tx.send(StreamEvent::TurnComplete(turn)).await;
-        }
 
-        let is_optimal = response.contains("OPTIMAL") || response.contains("CONVERGED");
-        Ok(is_optimal)
+            let is_converged = sigma.completion_probability > 0.95;
+            Ok(is_converged)
+        }
     }
 
     /// Parses the response for artifacts. 

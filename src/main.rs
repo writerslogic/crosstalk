@@ -58,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
             content: args.task,
             timestamp: ConversationState::now(),
             diffs: vec![],
+            certainty: Some(1.0),
         });
     }
 
