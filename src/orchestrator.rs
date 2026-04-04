@@ -117,11 +117,11 @@ impl Orchestrator {
 
         println!("--- Turn {} | Model: {} ---", iteration_index, agent_id);
 
+        let agent_idx = (iteration_index as usize) % self.agents.len();
+        let agent = &self.agents[agent_idx];
+
         let start_time = Instant::now();
-        let mut stream = agent_id.clone(); // Placeholder for agent retrieval
-        let agent_ptr = &self.agents[(iteration_index as usize) % self.agents.len()];
-        
-        let mut stream = agent_ptr
+        let mut stream = agent
             .stream_prompt(&prompt)
             .await
             .map_err(|e| anyhow::anyhow!("Agent failure: {e:?}"))?;
@@ -217,8 +217,11 @@ impl Orchestrator {
 
                     if current_artifact.content != new_content {
                         let delta = DiffEngine::generate_delta(&current_artifact.content, &new_content, current_artifact.version);
-                        let p_fail = self.mc_runner.predict(current_artifact, &delta, 5).await;
+                        
+                        // Hardening Step 2 & 4: Statistical Monte Carlo + Wasm Readiness
+                        let p_fail = self.mc_runner.predict(current_artifact, &delta, 10).await;
                         if p_fail > 0.5 {
+                            println!("[sandbox] artifact \"{name}\" rejected: MC P(fail) = {p_fail}");
                             all_valid = false;
                             turn_outcome = TurnOutcome::RolledBack;
                             break;
@@ -289,6 +292,16 @@ impl Orchestrator {
 
             let volatility = 0.1;
             let certainty = CertaintyAnalyzer::compute(&response, volatility);
+
+            // Hardening Step 3: Active Inference Surprise Signal
+            let actual_success = match turn_outcome {
+                TurnOutcome::Compiled | TurnOutcome::TestsPassed => 1.0,
+                _ => 0.0,
+            };
+            let surprise = (actual_success - certainty).abs();
+            if surprise > 0.5 {
+                println!("[sandbox] High Surprise detected: {:.2}. Predictor/Model divergence.", surprise);
+            }
 
             let mut turn = Turn {
                 index: sigma.iteration_index,
