@@ -9,6 +9,7 @@ pub struct Turn {
     pub model_id: String,
     pub content: String,
     pub timestamp: u64,
+    pub diffs: Vec<(String, ArtifactDiff)>, // New: (artifact_name, delta)
 }
 
 /// Δα: Represents a change to an artifact
@@ -48,6 +49,9 @@ impl ConversationState {
     }
 
     pub fn now() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 }

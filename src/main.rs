@@ -1,20 +1,20 @@
-mod types;
-mod state;
-mod orchestrator;
 mod agent_trait;
 mod diff;
 mod factory;
-mod storage;
-mod ui;
 mod logger;
+mod orchestrator;
+mod state;
+mod storage;
+mod types;
+mod ui;
 
-use clap::Parser;
-use state::StateManager;
-use orchestrator::Orchestrator;
-use types::ConversationState;
-use rig::providers::{gemini, openai};
-use rig::prelude::*;
 use crate::agent_trait::PromptAgent;
+use clap::Parser;
+use orchestrator::Orchestrator;
+use rig::prelude::*;
+use rig::providers::{gemini, openai};
+use state::StateManager;
+use types::ConversationState;
 
 #[derive(Parser)]
 #[command(name = "Crosstalk", version = "1.0", about = "AI Multi-Model Mediator")]
@@ -37,16 +37,18 @@ async fn main() -> anyhow::Result<()> {
     let mut sigma = ConversationState::new("main-session");
 
     let mut agents: Vec<Box<dyn PromptAgent>> = vec![];
-    
+
     for m in args.models {
         if m.contains("gemini") {
             let api_key = std::env::var("GEMINI_API_KEY")?;
-            let client = gemini::Client::new(&api_key).map_err(|e| anyhow::anyhow!("Gemini client error: {:?}", e))?;
+            let client = gemini::Client::new(&api_key)
+                .map_err(|e| anyhow::anyhow!("Gemini client error: {:?}", e))?;
             let agent = client.agent(&m).build();
             agents.push(Box::new((m.clone(), agent)));
         } else if m.contains("gpt") {
             let api_key = std::env::var("OPENAI_API_KEY")?;
-            let client = openai::Client::new(&api_key).map_err(|e| anyhow::anyhow!("OpenAI client error: {:?}", e))?;
+            let client = openai::Client::new(&api_key)
+                .map_err(|e| anyhow::anyhow!("OpenAI client error: {:?}", e))?;
             let agent = client.agent(&m).build();
             agents.push(Box::new((m.clone(), agent)));
         }
@@ -63,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
         model_id: "User".to_string(),
         content: args.task,
         timestamp: ConversationState::now(),
+        diffs: vec![],
     });
 
     println!("Starting debate loop...");
