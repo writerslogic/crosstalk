@@ -19,6 +19,8 @@ similar = "3.0.0"
 sled = "0.34.7"
 thiserror = "2.0.18"
 tokio = { version = "1.51.0", features = ["full"] }
+tree-sitter = "0.24.7"
+tree-sitter-rust = "0.23.2"
 
 [dev-dependencies]
 tempfile = "3.10.1"
