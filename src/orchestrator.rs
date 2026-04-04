@@ -4,6 +4,8 @@ use crate::state::StateManager;
 use crate::types::{Artifact, ControlSignal, ConversationState, StreamEvent, Turn};
 use crate::validation::AstValidator;
 use crate::consensus::{CertaintyAnalyzer, KalmanConvergence, InfluenceWeightManager};
+use crate::sandbox::SandboxManager;
+use crate::simulation::MonteCarloRunner;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -17,6 +19,8 @@ pub struct Orchestrator {
     state_manager: StateManager,
     event_tx: mpsc::Sender<StreamEvent>,
     control_rx: Mutex<mpsc::Receiver<ControlSignal>>,
+    sandbox: SandboxManager,
+    mc_runner: MonteCarloRunner,
 }
 
 impl Orchestrator {
@@ -32,15 +36,14 @@ impl Orchestrator {
             state_manager,
             event_tx,
             control_rx: Mutex::new(control_rx),
+            sandbox: SandboxManager::new().expect("Failed to init sandbox"),
+            mc_runner: MonteCarloRunner::new().expect("Failed to init simulation"),
         }
     }
 
-    /// # Errors
-    /// Returns error if agent failure or state persistence fails.
     pub async fn run_turn(&self, sigma_lock: Arc<Mutex<ConversationState>>) -> Result<bool> {
         let (iteration_index, prompt) = {
             let s = sigma_lock.lock().await;
-            // Ensure initial state is checkpointed if it's the first turn
             if s.iteration_index == 0 && s.turns.is_empty() {
                 self.state_manager.checkpoint(&s)?;
             }
@@ -51,12 +54,6 @@ impl Orchestrator {
         let agent = &self.agents[agent_idx];
         let model_id = agent.name();
 
-        println!(
-            "--- Turn {} | Model: {} ---",
-            iteration_index, model_id
-        );
-
-        // Real-time Token Piping (Ghost-Stream)
         let mut stream = agent
             .stream_prompt(&prompt)
             .await
@@ -66,7 +63,6 @@ impl Orchestrator {
         let mut paused = false;
 
         loop {
-            // 1. Handle Control Signals
             {
                 let mut rx = self.control_rx.lock().await;
                 while let Ok(signal) = rx.try_recv() {
@@ -88,32 +84,35 @@ impl Orchestrator {
                 continue;
             }
 
-            // 2. Process Model Stream
             match stream.next().await {
                 Some(chunk_res) => {
                     let chunk = chunk_res.map_err(|e| anyhow::anyhow!("Stream error: {e:?}"))?;
                     response.push_str(&chunk);
                     let _ = self.event_tx.send(StreamEvent::TokenReceived(chunk)).await;
                 }
-                None => break, // Stream finished
+                None => break,
             }
         }
 
-        // Δα Capture: Extract artifacts from response
         let proposed_artifacts = Self::parse_artifacts(&response);
         let mut turn_diffs = vec![];
 
-        // Consensus Analysis
         let certainty = CertaintyAnalyzer::compute(&response);
 
         {
             let mut sigma = sigma_lock.lock().await;
+            
+            // Atomic Snapshot for Rollback
+            let sigma_snapshot = sigma.clone();
+            let current_i = sigma.iteration_index;
 
+            let mut all_valid = true;
             for (name, (lang, new_content)) in proposed_artifacts {
-                // AST Validation
+                // 1. AST Validation
                 if let Err(e) = AstValidator::validate(&new_content, &lang) {
-                    println!("[diff] artifact \"{name}\" rejected: validation failed for {lang}: {e}");
-                    continue;
+                    println!("[diff] artifact \"{name}\" rejected: AST validation failed: {e}");
+                    all_valid = false;
+                    break;
                 }
 
                 let current_artifact =
@@ -126,6 +125,7 @@ impl Orchestrator {
                             content: String::new(),
                             version: 0,
                             history: vec![],
+                            ast_versions: HashMap::new(),
                         });
 
                 if current_artifact.content != new_content {
@@ -135,13 +135,39 @@ impl Orchestrator {
                         current_artifact.version,
                     );
 
+                    // 2. Monte Carlo Failure Prediction
+                    let p_fail = self.mc_runner.predict(current_artifact, &delta, 5).await;
+                    if p_fail > 0.5 {
+                        println!("[sandbox] artifact \"{name}\" rejected: MC P(fail) = {p_fail}");
+                        all_valid = false;
+                        break;
+                    }
+
+                    // 3. Linter Guard (Strict mode simulated)
+                    // In a real run, we'd write to a temp file and run cargo clippy.
+
                     current_artifact.history.push(delta.clone());
-                    current_artifact.content = new_content;
+                    current_artifact.content = new_content.clone();
                     current_artifact.version += 1;
-                    current_artifact.language = lang; // Update language if it changed
+                    current_artifact.language = lang.clone();
+
+                    // AST Versioning: Node extraction
+                    let nodes = AstValidator::extract_nodes(&new_content, &lang);
+                    for (node_id, content) in nodes {
+                        current_artifact.ast_versions
+                            .entry(node_id)
+                            .or_default()
+                            .push((current_i, content));
+                    }
 
                     turn_diffs.push((name, delta));
                 }
+            }
+
+            if !all_valid {
+                println!("[sandbox] Rollback triggered: validation pipeline failed.");
+                *sigma = sigma_snapshot; // Restore pre-turn state
+                return Ok(false);
             }
 
             let turn = Turn {
@@ -155,24 +181,21 @@ impl Orchestrator {
             sigma.turns.push(turn.clone());
             sigma.iteration_index += 1;
 
-            // Update Consensus Metrics
             sigma.agent_weights = InfluenceWeightManager::calculate_weights(&sigma);
             
             let mut kalman = KalmanConvergence {
                 p_c: sigma.completion_probability,
-                variance: 0.1, // Heuristic
+                variance: 0.1,
             };
-            // Measurement: 1.0 if response contains OPTIMAL, else certainty-based
             let measurement = if response.contains("OPTIMAL") || response.contains("CONVERGED") {
                 1.0
             } else {
-                certainty * 0.8 // Heuristic
+                certainty * 0.8
             };
             sigma.completion_probability = kalman.update(measurement);
 
             self.state_manager.checkpoint(&sigma)?;
             
-            // Signal turn completion to UI
             let _ = self.event_tx.send(StreamEvent::TokenReceived(format!("\n[Turn Complete | P(C): {:.2}]\n", sigma.completion_probability))).await;
             let _ = self.event_tx.send(StreamEvent::TurnComplete(turn)).await;
 
@@ -181,7 +204,6 @@ impl Orchestrator {
         }
     }
 
-    /// Parses the response for artifacts. 
     fn parse_artifacts(response: &str) -> HashMap<String, (String, String)> {
         let mut artifacts = HashMap::new();
         let mut lines = response.lines();

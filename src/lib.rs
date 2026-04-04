@@ -18,6 +18,7 @@ pub mod release;
 pub mod sandbox;
 pub mod security;
 pub mod self_improvement;
+pub mod simulation;
 pub mod state;
 pub mod storage;
 pub mod swarm;

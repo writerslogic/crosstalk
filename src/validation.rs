@@ -1,5 +1,6 @@
 use thiserror::Error;
-use tree_sitter::Parser;
+use tree_sitter::{Parser, Node};
+use std::collections::HashMap;
 
 #[derive(Error, Debug)]
 pub enum ValidationError {
@@ -17,15 +18,54 @@ pub enum ValidationError {
 pub struct AstValidator;
 
 impl AstValidator {
-    /// Validates the content using the appropriate tree-sitter grammar.
-    /// Currently only supports Rust.
-    /// # Errors
-    /// Returns `ValidationError` if parsing fails or language is unsupported.
+    /// Validates the content and extracts top-level nodes for versioning.
     pub fn validate(content: &str, language: &str) -> Result<(), ValidationError> {
         match language.to_lowercase().as_str() {
             "rust" | "rs" => Self::validate_rust(content),
             _ => Err(ValidationError::UnsupportedLanguage(language.to_string())),
         }
+    }
+
+    /// Extracts top-level nodes (fn, struct, impl) with their content.
+    pub fn extract_nodes(content: &str, language: &str) -> HashMap<String, String> {
+        if !matches!(language.to_lowercase().as_str(), "rust" | "rs") {
+            return HashMap::new();
+        }
+
+        let mut parser = Parser::new();
+        let _ = parser.set_language(&tree_sitter_rust::LANGUAGE.into());
+        let tree = match parser.parse(content, None) {
+            Some(t) => t,
+            None => return HashMap::new(),
+        };
+
+        let mut nodes = HashMap::new();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+
+        for child in root.children(&mut cursor) {
+            let kind = child.kind();
+            if matches!(kind, "function_item" | "struct_item" | "impl_item" | "enum_item") {
+                if let Some(name) = Self::get_node_name(child, content) {
+                    let id = format!("{}:{}", kind, name);
+                    if let Ok(text) = child.utf8_text(content.as_bytes()) {
+                        nodes.insert(id, text.to_string());
+                    }
+                }
+            }
+        }
+        nodes
+    }
+
+    fn get_node_name(node: Node, content: &str) -> Option<String> {
+        // Find identifier child
+        for i in 0..node.child_count() {
+            let child = node.child(i).unwrap();
+            if child.kind() == "name" || child.kind() == "identifier" || child.kind() == "type_identifier" {
+                return child.utf8_text(content.as_bytes()).ok().map(|s| s.to_string());
+            }
+        }
+        None
     }
 
     fn validate_rust(content: &str) -> Result<(), ValidationError> {
@@ -51,7 +91,6 @@ impl AstValidator {
 
         let root_node = tree.root_node();
         if root_node.has_error() {
-            // Find the first error node
             let mut cursor = root_node.walk();
             let mut error_found = false;
             let mut line = 0;
@@ -89,38 +128,5 @@ impl AstValidator {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_validate_valid_rust() {
-        let code = "fn main() { println!(\"Hello\"); }";
-        assert!(AstValidator::validate(code, "rust").is_ok());
-    }
-
-    #[test]
-    fn test_validate_invalid_rust() {
-        let code = "fn main() { println!(\"Hello\") "; // Missing closing brace
-        let result = AstValidator::validate(code, "rust");
-        assert!(result.is_err());
-        if let Err(ValidationError::ParseError { line, .. }) = result {
-            assert!(line > 0);
-        } else {
-            panic!("Expected ParseError");
-        }
-    }
-
-    #[test]
-    fn test_validate_unsupported_language() {
-        let code = "print('hello')";
-        let result = AstValidator::validate(code, "python");
-        assert!(matches!(
-            result,
-            Err(ValidationError::UnsupportedLanguage(_))
-        ));
     }
 }

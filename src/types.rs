@@ -30,6 +30,8 @@ pub struct Artifact {
     pub content: String,
     pub version: u32,
     pub history: Vec<ArtifactDiff>,
+    #[serde(default)]
+    pub ast_versions: HashMap<String, Vec<(u32, String)>>, // node_id -> Vec<(turn_index, content)>
 }
 
 /// σ: The Global State
