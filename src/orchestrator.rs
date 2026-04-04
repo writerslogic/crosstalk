@@ -19,6 +19,7 @@ use crate::self_improvement::SelfImprovementEngine;
 use crate::swarm::SwarmController;
 use crate::planning::PlanningEngine;
 use crate::security::{SecretScanner, TurnSigner};
+use crate::analytics::AnalyticsEngine;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -44,6 +45,7 @@ pub struct Orchestrator {
     pub swarm: SwarmController,
     pub planning: PlanningEngine,
     pub signer: TurnSigner,
+    pub analytics: AnalyticsEngine,
 }
 
 impl Orchestrator {
@@ -76,6 +78,7 @@ impl Orchestrator {
             swarm: SwarmController::new(),
             planning: PlanningEngine,
             signer: TurnSigner::new(),
+            analytics: AnalyticsEngine,
         }
     }
 
@@ -151,7 +154,6 @@ impl Orchestrator {
 
         let latency_ms = start_time.elapsed().as_millis() as u64;
 
-        // Security: Secret Scanning
         let secrets = SecretScanner::scan(&response);
         if !secrets.is_empty() {
             println!("[security] turn {iteration_index} blocked: detected secrets {:?}", secrets);
@@ -265,7 +267,6 @@ impl Orchestrator {
                 signature: vec![],
             };
             
-            // Security: Turn Signing
             let serialized = serde_json::to_vec(&turn).unwrap();
             turn.signature = self.signer.sign(&serialized);
 
@@ -322,6 +323,10 @@ impl Orchestrator {
             if is_converged {
                 let eval = SelfImprovementEngine::evaluate_session(&sigma);
                 println!("[self-improve] Session evaluation: {:?}", eval);
+                
+                // Analytics: Generate Report
+                let report = AnalyticsEngine::generate_report(&sigma);
+                println!("[analytics] Session report: {:?}", report);
             }
 
             Ok(is_converged)
