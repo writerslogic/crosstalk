@@ -1,7 +1,7 @@
 use crate::agent_trait::PromptAgent;
 use crate::diff::DiffEngine;
 use crate::state::StateManager;
-use crate::types::{Artifact, ControlSignal, ConversationState, StreamEvent, Turn, TurnOutcome, TaskCategory, CostEntry, TokenUsage};
+use crate::types::{Artifact, ControlSignal, ConversationState, StreamEvent, Turn, TurnOutcome, TaskCategory, CostEntry, TokenUsage, TurnStructure};
 use crate::validation::AstValidator;
 use crate::consensus::{CertaintyAnalyzer, KalmanConvergence, InfluenceWeightManager};
 use crate::sandbox::SandboxManager;
@@ -13,6 +13,7 @@ use crate::proof::ProofManager;
 use crate::memory::{MemoryStore, ContextDistiller};
 use crate::intelligence::{IntelligenceEngine, QualityScorer};
 use crate::compute::ComputeManager;
+use crate::reasoning::{ReasoningEngine, FallacyDetector};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -33,6 +34,7 @@ pub struct Orchestrator {
     pub memory_store: MemoryStore,
     pub intelligence: Mutex<IntelligenceEngine>,
     pub compute: Mutex<ComputeManager>,
+    pub reasoning: ReasoningEngine,
 }
 
 impl Orchestrator {
@@ -60,25 +62,39 @@ impl Orchestrator {
             memory_store: MemoryStore::new("/tmp/crosstalk-memory"),
             intelligence: Mutex::new(IntelligenceEngine::new()),
             compute: Mutex::new(ComputeManager::new()),
+            reasoning: ReasoningEngine,
         }
     }
 
     pub async fn run_turn(&self, sigma_lock: Arc<Mutex<ConversationState>>) -> Result<bool> {
-        let (iteration_index, prompt, history_contents) = {
+        let (iteration_index, prompt, history_contents, agent_id) = {
             let s = sigma_lock.lock().await;
             if s.iteration_index == 0 && s.turns.is_empty() {
                 self.state_manager.checkpoint(&s)?;
             }
             let contents: Vec<String> = s.turns.iter().map(|t| t.content.clone()).collect();
             let distilled_prompt = ContextDistiller::distill(&s, 2000);
-            (s.iteration_index, distilled_prompt, contents)
+            
+            let agent_idx = (s.iteration_index as usize) % self.agents.len();
+            let model_id = self.agents[agent_idx].name().to_string();
+            
+            // Reasoning: Structure Selection
+            let structure = ReasoningEngine::select_structure(TaskCategory::CodeGeneration, &model_id);
+            let mut final_prompt = distilled_prompt;
+            match structure {
+                TurnStructure::StepByStep => final_prompt.push_str("\nStructure your response with numbered reasoning steps."),
+                TurnStructure::ProsCons => final_prompt.push_str("\nExplicitly analyze tradeoffs (Pros vs Cons)."),
+                TurnStructure::CodeFirst => final_prompt.push_str("\nProvide the code delta (Δα) before any explanation."),
+                _ => {}
+            }
+
+            (s.iteration_index, final_prompt, contents, model_id)
         };
+
+        println!("--- Turn {} | Model: {} ---", iteration_index, agent_id);
 
         let agent_idx = (iteration_index as usize) % self.agents.len();
         let agent = &self.agents[agent_idx];
-        let model_id = agent.name();
-
-        println!("--- Turn {} | Model: {} ---", iteration_index, model_id);
 
         let start_time = Instant::now();
         let mut stream = agent
@@ -127,6 +143,13 @@ impl Orchestrator {
             println!("[verification] turn {iteration_index} pruned: tautological reasoning detected");
             let _ = self.event_tx.send(StreamEvent::TokenReceived("\n[Pruned: Tautology]\n".to_string())).await;
             return Ok(false);
+        }
+
+        // Reasoning: Fallacy Detection
+        let fallacies = FallacyDetector::scan(&response);
+        if !fallacies.is_empty() {
+            println!("[reasoning] fallacies detected: {:?}", fallacies);
+            let _ = self.event_tx.send(StreamEvent::TokenReceived(format!("\n[Warning: {} fallacies detected]\n", fallacies.len()))).await;
         }
 
         let proposed_artifacts = Self::parse_artifacts(&response);
@@ -194,13 +217,14 @@ impl Orchestrator {
 
             let turn = Turn {
                 index: sigma.iteration_index,
-                model_id: model_id.to_string(),
+                model_id: agent_id.clone(),
                 content: response.clone(),
                 timestamp: ConversationState::now(),
                 diffs: turn_diffs,
                 certainty: Some(certainty),
                 outcome,
                 task_category: Some(TaskCategory::CodeGeneration),
+                structure: Some(ReasoningEngine::select_structure(TaskCategory::CodeGeneration, &agent_id)),
             };
             
             let quality_score = QualityScorer::score(&turn);
@@ -209,16 +233,15 @@ impl Orchestrator {
                 intell.update_profile(&turn, quality_score);
             }
 
-            // Compute Update
             let cost_entry = CostEntry {
                 turn_id: turn.index,
-                model_id: model_id.to_string(),
+                model_id: agent_id.clone(),
                 usage: TokenUsage {
-                    input_tokens: prompt.len() as u32 / 4, // Heuristic
+                    input_tokens: prompt.len() as u32 / 4,
                     output_tokens: response.len() as u32 / 4,
                     total_tokens: (prompt.len() + response.len()) as u32 / 4,
                 },
-                cost_usd: 0.01, // Mock
+                cost_usd: 0.01,
                 latency_ms,
                 timestamp: turn.timestamp,
             };

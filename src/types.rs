@@ -72,6 +72,15 @@ pub struct ModelProfile {
     pub last_updated: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum TurnStructure {
+    FreeForm,
+    StepByStep,
+    ProsCons,
+    HypothesisTest,
+    CodeFirst,
+}
+
 /// μ_n: An atomic turn in the debate
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Turn {
@@ -85,6 +94,7 @@ pub struct Turn {
     #[serde(default = "default_outcome")]
     pub outcome: TurnOutcome,
     pub task_category: Option<TaskCategory>,
+    pub structure: Option<TurnStructure>,
 }
 
 fn default_outcome() -> TurnOutcome {
