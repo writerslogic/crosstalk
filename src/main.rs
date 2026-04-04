@@ -1,9 +1,12 @@
 use crosstalk::agent_trait::PromptAgent;
 use crosstalk::orchestrator::Orchestrator;
 use crosstalk::state::StateManager;
-use crosstalk::types::{self, ConversationState};
-use rig::prelude::*;
-use rig::providers::{gemini, openai};
+use crosstalk::types::{self, ControlSignal, ConversationState, StreamEvent};
+use crosstalk::ui::CrosstalkUI;
+use crosstalk::factory::ModelFactory;
+use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use clap::Parser;
 
@@ -28,52 +31,63 @@ async fn main() -> anyhow::Result<()> {
     let dir = "/tmp/crosstalk";
     let manager = StateManager::new(dir)?;
 
-    let mut sigma = ConversationState::new("main-session");
+    let sigma = Arc::new(Mutex::new(ConversationState::new("main-session")));
 
     let mut agents: Vec<Box<dyn PromptAgent>> = vec![];
 
-    for m in args.models {
-        if m.contains("gemini") {
-            let api_key = std::env::var("GEMINI_API_KEY")?;
-            let client = gemini::Client::new(&api_key)
-                .map_err(|e| anyhow::anyhow!("Gemini client error: {e:?}"))?;
-            let agent = client.agent(&m).build();
-            agents.push(Box::new((m.clone(), agent)));
-        } else if m.contains("gpt") {
-            let api_key = std::env::var("OPENAI_API_KEY")?;
-            let client = openai::Client::new(&api_key)
-                .map_err(|e| anyhow::anyhow!("OpenAI client error: {e:?}"))?;
-            let agent = client.agent(&m).build();
-            agents.push(Box::new((m.clone(), agent)));
-        }
+    for m in &args.models {
+        agents.push(ModelFactory::create_agent(m)?);
     }
 
     if agents.is_empty() {
         anyhow::bail!("No valid models provided. Use --models <model_id>");
     }
 
-    let omicron = Orchestrator::new(manager, agents);
+    // Event System Setup
+    let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(1000);
+    let (control_tx, control_rx) = mpsc::channel::<ControlSignal>(100);
 
-    sigma.turns.push(types::Turn {
-        index: 0,
-        model_id: "User".to_string(),
-        content: args.task,
-        timestamp: ConversationState::now(),
-        diffs: vec![],
+    let omicron = Orchestrator::new(manager, agents, event_tx, control_rx);
+    let mut ui = CrosstalkUI::new(event_rx, control_tx)?;
+
+    {
+        let mut s = sigma.lock().await;
+        s.turns.push(types::Turn {
+            index: 0,
+            model_id: "User".to_string(),
+            content: args.task,
+            timestamp: ConversationState::now(),
+            diffs: vec![],
+        });
+    }
+
+    let sigma_orchestrator = Arc::clone(&sigma);
+
+    // Run UI and Orchestrator concurrently
+    tokio::spawn(async move {
+        let mut i = 0;
+        loop {
+            match omicron.run_turn(Arc::clone(&sigma_orchestrator)).await {
+                Ok(optimal) => {
+                    i += 1;
+                    if optimal || (args.iterations > 0 && i >= args.iterations) {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Orchestrator error: {:?}", e);
+                    break;
+                }
+            }
+        }
     });
 
-    println!("Starting debate loop...");
-
-    let mut i = 0;
-    loop {
-        let optimal = omicron.run_turn(&mut sigma).await?;
-        i += 1;
-
-        if optimal || (args.iterations > 0 && i >= args.iterations) {
-            println!("Process finished at i_{i}");
-            break;
-        }
-    }
+    // Main thread handles UI rendering
+    let initial_state = {
+        let s = sigma.lock().await;
+        s.clone()
+    };
+    ui.run(initial_state).await?;
 
     Ok(())
 }
