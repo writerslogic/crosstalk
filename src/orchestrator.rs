@@ -21,6 +21,7 @@ use crate::planning::PlanningEngine;
 use crate::security::{SecretScanner, TurnSigner};
 use crate::analytics::AnalyticsEngine;
 use crate::release::{ReleaseManager, ConvergenceReport};
+use crate::collective_intelligence::CollectiveIntelligenceEngine;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -48,6 +49,7 @@ pub struct Orchestrator {
     pub signer: TurnSigner,
     pub analytics: AnalyticsEngine,
     pub release: ReleaseManager,
+    pub collective: Mutex<CollectiveIntelligenceEngine>,
 }
 
 impl Orchestrator {
@@ -82,6 +84,7 @@ impl Orchestrator {
             signer: TurnSigner::new(),
             analytics: AnalyticsEngine,
             release: ReleaseManager,
+            collective: Mutex::new(CollectiveIntelligenceEngine::new()),
         }
     }
 
@@ -279,6 +282,12 @@ impl Orchestrator {
                 intell.update_profile(&turn, quality_score);
             }
 
+            // Collective Update
+            {
+                let mut coll = self.collective.lock().await;
+                coll.update_specialization(&turn);
+            }
+
             let cost_entry = CostEntry {
                 turn_id: turn.index,
                 model_id: agent_id.clone(),
@@ -330,7 +339,6 @@ impl Orchestrator {
                 let report = AnalyticsEngine::generate_report(&sigma);
                 println!("[analytics] Session report: {:?}", report);
 
-                // Release: Final Report
                 let exec_summary = ConvergenceReport::generate(&sigma);
                 println!("[release] Convergence Report:\n{}", exec_summary);
             }

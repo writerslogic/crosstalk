@@ -129,6 +129,21 @@ pub struct AnalyticsReport {
     pub timestamp: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AgentProfile {
+    pub model_id: String,
+    pub capabilities: HashMap<TaskCategory, f64>,
+    pub total_turns: u32,
+    pub compilation_success_rate: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TransferableLesson {
+    pub category: String,
+    pub content: String,
+    pub confidence: f64,
+}
+
 /// μ_n: An atomic turn in the debate
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Turn {
