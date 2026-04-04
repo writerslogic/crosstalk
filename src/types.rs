@@ -31,7 +31,17 @@ pub struct Artifact {
     pub version: u32,
     pub history: Vec<ArtifactDiff>,
     #[serde(default)]
-    pub ast_versions: HashMap<String, Vec<(u32, String)>>, // node_id -> Vec<(turn_index, content)>
+    pub ast_versions: HashMap<String, Vec<(u32, String)>>,
+    #[serde(default)]
+    pub proof_attachments: Vec<ProofAttachment>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ProofAttachment {
+    pub artifact_name: String,
+    pub proven_properties: Vec<String>,
+    pub proof_hash: String,
+    pub verified_at: u64,
 }
 
 /// σ: The Global State
@@ -44,7 +54,9 @@ pub struct ConversationState {
     #[serde(default)]
     pub agent_weights: HashMap<String, f64>,
     #[serde(default)]
-    pub completion_probability: f64, // P(C) from Kalman Filter
+    pub completion_probability: f64,
+    #[serde(default)]
+    pub state_hash: [u8; 32], // SHA256 chain hash
 }
 
 /// Events emitted by the Orchestrator to the UI
@@ -75,6 +87,7 @@ impl ConversationState {
             artifacts: HashMap::new(),
             agent_weights: HashMap::new(),
             completion_probability: 0.0,
+            state_hash: [0u8; 32],
         }
     }
 

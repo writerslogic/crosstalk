@@ -13,6 +13,7 @@ pub mod memory;
 pub mod mcp;
 pub mod orchestrator;
 pub mod planning;
+pub mod proof;
 pub mod quality;
 pub mod reasoning;
 pub mod release;
