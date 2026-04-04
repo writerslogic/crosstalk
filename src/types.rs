@@ -24,6 +24,7 @@ pub struct ArtifactDiff {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Artifact {
     pub name: String,
+    pub language: String, // New: e.g., "rust"
     pub content: String,
     pub version: u32,
     pub history: Vec<ArtifactDiff>,

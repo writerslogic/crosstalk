@@ -47,6 +47,7 @@ fn test_artifact_and_diff() {
 
     let artifact = Artifact {
         name: "test.txt".to_string(),
+        language: "text".to_string(),
         content: "original".to_string(),
         version: 1,
         history: vec![diff],

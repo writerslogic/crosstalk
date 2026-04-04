@@ -108,3 +108,24 @@ async fn test_orchestrator_artifact_capture() {
     assert_eq!(art.version, 1);
     assert_eq!(sigma.turns[0].diffs.len(), 1);
 }
+
+#[tokio::test]
+async fn test_orchestrator_ast_validation() {
+    let dir = tempdir().expect("Failed to create temp dir");
+    let path = dir.path().to_str().expect("Failed to get path");
+    let manager = StateManager::new(path).expect("Failed to create StateManager");
+
+    let agent = Box::new(MockAgent {
+        name: "MockModel".to_string(),
+        response: "Invalid rust code:\n```rust:broken.rs\nfn main() { println!(\"oops\") \n```"
+            .to_string(),
+    });
+
+    let omicron = Orchestrator::new(manager, vec![agent]);
+    let mut sigma = ConversationState::new("test-session");
+
+    omicron.run_turn(&mut sigma).await.expect("Turn failed");
+
+    // Artifact should be rejected
+    assert!(sigma.artifacts.is_empty());
+}

@@ -1,20 +1,11 @@
-mod agent_trait;
-mod diff;
-mod factory;
-mod logger;
-mod orchestrator;
-mod state;
-mod storage;
-mod types;
-mod ui;
-
-use crate::agent_trait::PromptAgent;
-use clap::Parser;
-use orchestrator::Orchestrator;
+use crosstalk::agent_trait::PromptAgent;
+use crosstalk::orchestrator::Orchestrator;
+use crosstalk::state::StateManager;
+use crosstalk::types::{self, ConversationState};
 use rig::prelude::*;
 use rig::providers::{gemini, openai};
-use state::StateManager;
-use types::ConversationState;
+
+use clap::Parser;
 
 #[derive(Parser)]
 #[command(name = "Crosstalk", version = "1.0", about = "AI Multi-Model Mediator")]
@@ -22,18 +13,21 @@ struct Args {
     #[arg(short, long)]
     task: String,
 
-    #[arg(short, long, default_value_t = 5)]
-    iterations: u32,
-
-    #[arg(short, long)]
+    #[arg(short, long, num_args = 1..)]
     models: Vec<String>,
+
+    #[arg(short, long, default_value_t = 0)]
+    iterations: u32,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     let args = Args::parse();
-    let manager = StateManager::new(".crosstalk_db")?;
+
+    let dir = "/tmp/crosstalk";
+    let manager = StateManager::new(dir)?;
+
     let mut sigma = ConversationState::new("main-session");
 
     let mut agents: Vec<Box<dyn PromptAgent>> = vec![];
@@ -42,13 +36,13 @@ async fn main() -> anyhow::Result<()> {
         if m.contains("gemini") {
             let api_key = std::env::var("GEMINI_API_KEY")?;
             let client = gemini::Client::new(&api_key)
-                .map_err(|e| anyhow::anyhow!("Gemini client error: {:?}", e))?;
+                .map_err(|e| anyhow::anyhow!("Gemini client error: {e:?}"))?;
             let agent = client.agent(&m).build();
             agents.push(Box::new((m.clone(), agent)));
         } else if m.contains("gpt") {
             let api_key = std::env::var("OPENAI_API_KEY")?;
             let client = openai::Client::new(&api_key)
-                .map_err(|e| anyhow::anyhow!("OpenAI client error: {:?}", e))?;
+                .map_err(|e| anyhow::anyhow!("OpenAI client error: {e:?}"))?;
             let agent = client.agent(&m).build();
             agents.push(Box::new((m.clone(), agent)));
         }
@@ -76,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
         i += 1;
 
         if optimal || (args.iterations > 0 && i >= args.iterations) {
-            println!("Process finished at i_{}", i);
+            println!("Process finished at i_{i}");
             break;
         }
     }
