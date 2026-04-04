@@ -265,6 +265,8 @@ pub struct ConversationState {
     pub budget: BudgetLedger,
     #[serde(default)]
     pub goal_tree: GoalTree,
+    #[serde(default)]
+    pub node_consensus: HashMap<String, f64>, // node_id -> P(C)
 }
 
 /// Events emitted by the Orchestrator to the UI
@@ -298,6 +300,7 @@ impl ConversationState {
             state_hash: [0u8; 32],
             budget: BudgetLedger::default(),
             goal_tree: GoalTree::default(),
+            node_consensus: HashMap::new(),
         }
     }
 

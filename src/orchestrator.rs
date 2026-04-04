@@ -98,8 +98,6 @@ impl Orchestrator {
                 self.state_manager.checkpoint(&s)?;
             }
             let contents: Vec<String> = s.turns.iter().map(|t| t.content.clone()).collect();
-            
-            // Step 2 Hardening: Differential Context Delivery (Δσ)
             let distilled_prompt = self.build_differential_prompt(&s);
             
             let agent_idx = (s.iteration_index as usize) % self.agents.len();
@@ -119,11 +117,11 @@ impl Orchestrator {
 
         println!("--- Turn {} | Model: {} ---", iteration_index, agent_id);
 
-        let agent_idx = (iteration_index as usize) % self.agents.len();
-        let agent = &self.agents[agent_idx];
-
         let start_time = Instant::now();
-        let mut stream = agent
+        let mut stream = agent_id.clone(); // Placeholder for agent retrieval
+        let agent_ptr = &self.agents[(iteration_index as usize) % self.agents.len()];
+        
+        let mut stream = agent_ptr
             .stream_prompt(&prompt)
             .await
             .map_err(|e| anyhow::anyhow!("Agent failure: {e:?}"))?;
@@ -167,27 +165,23 @@ impl Orchestrator {
 
         let secrets = SecretScanner::scan(&response);
         if !secrets.is_empty() {
-            println!("[security] turn {iteration_index} blocked: detected secrets {:?}", secrets);
             let _ = self.event_tx.send(StreamEvent::TokenReceived("\n[Blocked: Security Violation]\n".to_string())).await;
             return Ok(false);
         }
 
         if TautologyFilter::is_tautological(&response, &history_contents) {
-            println!("[verification] turn {iteration_index} pruned: tautological reasoning detected");
             let _ = self.event_tx.send(StreamEvent::TokenReceived("\n[Pruned: Tautology]\n".to_string())).await;
             return Ok(false);
         }
 
         let fallacies = FallacyDetector::scan(&response);
         if !fallacies.is_empty() {
-            println!("[reasoning] fallacies detected: {:?}", fallacies);
             let _ = self.event_tx.send(StreamEvent::TokenReceived(format!("\n[Warning: {} fallacies detected]\n", fallacies.len()))).await;
         }
 
         let proposed_artifacts = Self::parse_artifacts(&response);
         let mut turn_diffs = vec![];
-        let certainty = CertaintyAnalyzer::compute(&response);
-        let mut outcome = TurnOutcome::Unknown;
+        let mut turn_outcome = TurnOutcome::Unknown;
 
         {
             let mut sigma = sigma_lock.lock().await;
@@ -199,7 +193,7 @@ impl Orchestrator {
                 if let Err(e) = AstValidator::validate(&new_content, &lang) {
                     println!("[diff] artifact \"{name}\" rejected: AST validation failed: {e}");
                     all_valid = false;
-                    outcome = TurnOutcome::Rejected;
+                    turn_outcome = TurnOutcome::Rejected;
                     break;
                 }
 
@@ -208,64 +202,93 @@ impl Orchestrator {
                     println!("[quality] duplication detected for \"{name}\": {:?}", dups);
                 }
 
-                let current_artifact = sigma.artifacts.entry(name.clone()).or_insert_with(|| Artifact {
-                    name: name.clone(),
-                    language: lang.clone(),
-                    content: String::new(),
-                    version: 0,
-                    history: vec![],
-                    ast_versions: HashMap::new(),
-                    proof_attachments: vec![],
-                    metrics: crate::quality::ArtifactMetrics::default(),
-                    skeleton: String::new(),
-                });
-
-                if current_artifact.content != new_content {
-                    let delta = DiffEngine::generate_delta(&current_artifact.content, &new_content, current_artifact.version);
-                    let p_fail = self.mc_runner.predict(current_artifact, &delta, 5).await;
-                    if p_fail > 0.5 {
-                        println!("[sandbox] artifact \"{name}\" rejected: MC P(fail) = {p_fail}");
-                        all_valid = false;
-                        outcome = TurnOutcome::RolledBack;
-                        break;
-                    }
-
-                    let new_metrics = QualityEngine::analyze_artifact(&Artifact {
-                        content: new_content.clone(),
-                        ..current_artifact.clone()
+                let (delta, node_updates) = {
+                    let current_artifact = sigma.artifacts.entry(name.clone()).or_insert_with(|| Artifact {
+                        name: name.clone(),
+                        language: lang.clone(),
+                        content: String::new(),
+                        version: 0,
+                        history: vec![],
+                        ast_versions: HashMap::new(),
+                        proof_attachments: vec![],
+                        metrics: crate::quality::ArtifactMetrics::default(),
+                        skeleton: String::new(),
                     });
-                    if RegressionDetector::is_regressive(&current_artifact.metrics, &new_metrics) {
-                        println!("[quality] regression blocked for \"{name}\"");
-                        all_valid = false;
-                        outcome = TurnOutcome::Rejected;
-                        break;
+
+                    if current_artifact.content != new_content {
+                        let delta = DiffEngine::generate_delta(&current_artifact.content, &new_content, current_artifact.version);
+                        let p_fail = self.mc_runner.predict(current_artifact, &delta, 5).await;
+                        if p_fail > 0.5 {
+                            all_valid = false;
+                            turn_outcome = TurnOutcome::RolledBack;
+                            break;
+                        }
+
+                        let new_metrics = QualityEngine::analyze_artifact(&Artifact {
+                            content: new_content.clone(),
+                            ..current_artifact.clone()
+                        });
+                        if RegressionDetector::is_regressive(&current_artifact.metrics, &new_metrics) {
+                            all_valid = false;
+                            turn_outcome = TurnOutcome::Rejected;
+                            break;
+                        }
+
+                        current_artifact.history.push(delta.clone());
+                        current_artifact.content = new_content.clone();
+                        current_artifact.version += 1;
+                        current_artifact.language = lang.clone();
+                        current_artifact.metrics = new_metrics;
+                        current_artifact.skeleton = AstValidator::generate_skeleton(&new_content, &lang);
+
+                        let nodes = AstValidator::extract_nodes(&new_content, &lang);
+                        let mut updates = vec![];
+                        for (node_id, content) in nodes {
+                            current_artifact.ast_versions.entry(node_id.clone()).or_default().push((current_i, content.clone()));
+                            updates.push((node_id, content));
+                        }
+
+                        let proof = ProofManager::generate_proof(current_artifact, vec!["ast_valid".to_string(), "mc_safe".to_string(), "quality_checked".to_string()]);
+                        current_artifact.proof_attachments.push(proof);
+
+                        (Some(delta), updates)
+                    } else {
+                        (None, vec![])
+                    }
+                };
+
+                if let Some(d) = delta {
+                    turn_diffs.push((name.clone(), d));
+                    turn_outcome = TurnOutcome::Compiled;
+                }
+
+                for (node_id, _content) in node_updates {
+                    if let Some(history) = sigma.artifacts.get(&name).and_then(|a| a.ast_versions.get(&node_id)) {
+                        if history.len() >= 3 {
+                            let v1 = &history[history.len()-1].1;
+                            let v2 = &history[history.len()-2].1;
+                            let v3 = &history[history.len()-3].1;
+                            if v1 == v3 && v1 != v2 {
+                                let matrix = [[(0.8, 0.2), (0.1, 0.1)], [(0.1, 0.1), (0.2, 0.8)]];
+                                let _eq = crate::consensus::NashSolver::solve_2x2_pure(&matrix);
+                            }
+                        }
                     }
 
-                    current_artifact.history.push(delta.clone());
-                    current_artifact.content = new_content.clone();
-                    current_artifact.version += 1;
-                    current_artifact.language = lang.clone();
-                    current_artifact.metrics = new_metrics;
-                    current_artifact.skeleton = AstValidator::generate_skeleton(&new_content, &lang);
-
-                    let nodes = AstValidator::extract_nodes(&new_content, &lang);
-                    for (node_id, content) in nodes {
-                        current_artifact.ast_versions.entry(node_id).or_default().push((current_i, content));
-                    }
-
-                    let proof = ProofManager::generate_proof(current_artifact, vec!["ast_valid".to_string(), "mc_safe".to_string(), "quality_checked".to_string()]);
-                    current_artifact.proof_attachments.push(proof);
-
-                    turn_diffs.push((name, delta));
-                    outcome = TurnOutcome::Compiled;
+                    let node_p = sigma.node_consensus.entry(node_id).or_insert(0.1);
+                    let mut kalman = KalmanConvergence::new(*node_p);
+                    *node_p = kalman.update(0.8);
                 }
             }
 
             if !all_valid {
-                println!("[sandbox] Rollback triggered: validation pipeline failed.");
+                println!("[sandbox] Rollback triggered.");
                 *sigma = sigma_snapshot;
                 return Ok(false);
             }
+
+            let volatility = 0.1;
+            let certainty = CertaintyAnalyzer::compute(&response, volatility);
 
             let mut turn = Turn {
                 index: sigma.iteration_index,
@@ -274,7 +297,7 @@ impl Orchestrator {
                 timestamp: ConversationState::now(),
                 diffs: turn_diffs,
                 certainty: Some(certainty),
-                outcome,
+                outcome: turn_outcome,
                 task_category: Some(TaskCategory::CodeGeneration),
                 structure: Some(ReasoningEngine::select_structure(TaskCategory::CodeGeneration, &agent_id)),
                 signature: vec![],
@@ -315,18 +338,16 @@ impl Orchestrator {
             sigma.state_hash = HashChain::compute(&sigma, &prev_hash);
 
             if sigma.iteration_index <= current_i {
-                println!("[verification] Rollback: Non-monotonic index violation.");
                 *sigma = sigma_snapshot;
                 return Ok(false);
             }
 
             sigma.agent_weights = InfluenceWeightManager::calculate_weights(&sigma);
-            let mut kalman = KalmanConvergence { p_c: sigma.completion_probability, variance: 0.1 };
+            let mut kalman = KalmanConvergence::new(sigma.completion_probability);
             let measurement = if response.contains("OPTIMAL") || response.contains("CONVERGED") { 1.0 } else { certainty * 0.8 };
             sigma.completion_probability = kalman.update(measurement);
 
             self.state_manager.checkpoint(&sigma)?;
-            
             self.swarm.broadcast_turn(turn.clone());
 
             if let Some(ref mut root) = sigma.goal_tree.root {
@@ -342,14 +363,11 @@ impl Orchestrator {
             let _ = self.event_tx.send(StreamEvent::TurnComplete(turn)).await;
 
             let is_converged = sigma.completion_probability > 0.95;
-            
             if is_converged {
                 let eval = SelfImprovementEngine::evaluate_session(&sigma);
                 println!("[self-improve] Session evaluation: {:?}", eval);
-                
                 let report = AnalyticsEngine::generate_report(&sigma);
                 println!("[analytics] Session report: {:?}", report);
-
                 let exec_summary = ConvergenceReport::generate(&sigma);
                 println!("[release] Convergence Report:\n{}", exec_summary);
             }
@@ -358,57 +376,37 @@ impl Orchestrator {
         }
     }
 
-    /// Step 2 Hardening: Differential Context Delivery (Δσ)
     fn build_differential_prompt(&self, sigma: &ConversationState) -> String {
         let mut p = format!("Project Context: {}\n\n", sigma.session_id);
-        
         p.push_str("Artifacts (Semantic Skeleton + Active Nodes):\n");
         for artifact in sigma.artifacts.values() {
             p.push_str(&format!("--- Artifact: {} ---\n", artifact.name));
             p.push_str("Skeleton:\n");
             p.push_str(&artifact.skeleton);
             p.push_str("\nActive Nodes (Full Content):\n");
-            
-            // Identify active nodes from last 2 turns
             let mut active_node_ids = std::collections::HashSet::new();
             for turn in sigma.turns.iter().rev().take(2) {
-                for (name, diff) in &turn.diffs {
+                for (name, _diff) in &turn.diffs {
                     if name == &artifact.name {
-                        // Use historical artifact content to identify changes
-                        // Simplification: For now, if an artifact was changed, 
-                        // we'll assume its recently changed nodes are important.
-                        let changed_nodes = AstValidator::identify_changed_nodes(
-                            "", // We'd need prior version for exact node identification
-                            &artifact.content, 
-                            &artifact.language
-                        );
-                        for id in changed_nodes {
-                            active_node_ids.insert(id);
-                        }
+                        let changed_nodes = AstValidator::identify_changed_nodes("", &artifact.content, &artifact.language);
+                        for id in changed_nodes { active_node_ids.insert(id); }
                     }
                 }
             }
-
             let nodes = AstValidator::extract_nodes(&artifact.content, &artifact.language);
             for id in active_node_ids {
-                if let Some(content) = nodes.get(&id) {
-                    p.push_str(&format!("Node {}:\n{}\n", id, content));
-                }
+                if let Some(content) = nodes.get(&id) { p.push_str(&format!("Node {}:\n{}\n", id, content)); }
             }
-
-            // Include most recent Δα
             if let Some(last_diff) = artifact.history.last() {
                 p.push_str("\nMost Recent Δα:\n");
                 p.push_str(&last_diff.diff_text);
             }
             p.push_str("\n");
         }
-
         p.push_str("\nRecent History (Last 5 turns):\n");
         for t in sigma.turns.iter().rev().take(5).rev() {
             let _ = writeln!(p, "{}: {}", t.model_id, t.content);
         }
-        
         p.push_str("\nRefine artifacts or debate the solution. Use ```lang:filename to propose changes. Tag completion with 'OPTIMAL'.");
         p
     }
