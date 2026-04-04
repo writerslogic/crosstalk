@@ -1,7 +1,7 @@
 use crate::agent_trait::PromptAgent;
 use crate::diff::DiffEngine;
 use crate::state::StateManager;
-use crate::types::{Artifact, ControlSignal, ConversationState, StreamEvent, Turn, TurnOutcome, TaskCategory};
+use crate::types::{Artifact, ControlSignal, ConversationState, StreamEvent, Turn, TurnOutcome, TaskCategory, CostEntry, TokenUsage};
 use crate::validation::AstValidator;
 use crate::consensus::{CertaintyAnalyzer, KalmanConvergence, InfluenceWeightManager};
 use crate::sandbox::SandboxManager;
@@ -12,6 +12,7 @@ use crate::verification::{HashChain, TautologyFilter};
 use crate::proof::ProofManager;
 use crate::memory::{MemoryStore, ContextDistiller};
 use crate::intelligence::{IntelligenceEngine, QualityScorer};
+use crate::compute::ComputeManager;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -19,6 +20,7 @@ use tokio::sync::mpsc;
 use futures::StreamExt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use std::time::Instant;
 
 pub struct Orchestrator {
     agents: Vec<Box<dyn PromptAgent>>,
@@ -30,6 +32,7 @@ pub struct Orchestrator {
     pub mcp_gateway: McpGateway,
     pub memory_store: MemoryStore,
     pub intelligence: Mutex<IntelligenceEngine>,
+    pub compute: Mutex<ComputeManager>,
 }
 
 impl Orchestrator {
@@ -56,6 +59,7 @@ impl Orchestrator {
             mcp_gateway,
             memory_store: MemoryStore::new("/tmp/crosstalk-memory"),
             intelligence: Mutex::new(IntelligenceEngine::new()),
+            compute: Mutex::new(ComputeManager::new()),
         }
     }
 
@@ -76,6 +80,7 @@ impl Orchestrator {
 
         println!("--- Turn {} | Model: {} ---", iteration_index, model_id);
 
+        let start_time = Instant::now();
         let mut stream = agent
             .stream_prompt(&prompt)
             .await
@@ -115,6 +120,8 @@ impl Orchestrator {
                 None => break,
             }
         }
+
+        let latency_ms = start_time.elapsed().as_millis() as u64;
 
         if TautologyFilter::is_tautological(&response, &history_contents) {
             println!("[verification] turn {iteration_index} pruned: tautological reasoning detected");
@@ -196,12 +203,26 @@ impl Orchestrator {
                 task_category: Some(TaskCategory::CodeGeneration),
             };
             
-            // Intelligence Update
             let quality_score = QualityScorer::score(&turn);
             {
                 let mut intell = self.intelligence.lock().await;
                 intell.update_profile(&turn, quality_score);
             }
+
+            // Compute Update
+            let cost_entry = CostEntry {
+                turn_id: turn.index,
+                model_id: model_id.to_string(),
+                usage: TokenUsage {
+                    input_tokens: prompt.len() as u32 / 4, // Heuristic
+                    output_tokens: response.len() as u32 / 4,
+                    total_tokens: (prompt.len() + response.len()) as u32 / 4,
+                },
+                cost_usd: 0.01, // Mock
+                latency_ms,
+                timestamp: turn.timestamp,
+            };
+            ComputeManager::manage_budget(&mut sigma, cost_entry);
 
             sigma.turns.push(turn.clone());
             sigma.iteration_index += 1;

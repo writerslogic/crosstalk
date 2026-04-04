@@ -121,6 +121,30 @@ pub struct ProofAttachment {
     pub verified_at: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct TokenUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub total_tokens: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CostEntry {
+    pub turn_id: u32,
+    pub model_id: String,
+    pub usage: TokenUsage,
+    pub cost_usd: f64,
+    pub latency_ms: u64,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct BudgetLedger {
+    pub session_budget: f64,
+    pub spent: f64,
+    pub entries: Vec<CostEntry>,
+}
+
 /// σ: The Global State
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ConversationState {
@@ -134,6 +158,8 @@ pub struct ConversationState {
     pub completion_probability: f64,
     #[serde(default)]
     pub state_hash: [u8; 32],
+    #[serde(default)]
+    pub budget: BudgetLedger,
 }
 
 /// Events emitted by the Orchestrator to the UI
@@ -165,6 +191,7 @@ impl ConversationState {
             agent_weights: HashMap::new(),
             completion_probability: 0.0,
             state_hash: [0u8; 32],
+            budget: BudgetLedger::default(),
         }
     }
 
