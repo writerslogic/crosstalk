@@ -1,4 +1,4 @@
-use crate::types::{SessionEvaluation, ImprovementHypothesis, HypothesisStatus, ConversationState};
+use crate::types::{SessionEvaluation, ImprovementHypothesis, ConversationState};
 use std::collections::HashMap;
 use anyhow::{Result, anyhow};
 

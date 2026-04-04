@@ -18,6 +18,7 @@ use crate::quality::{QualityEngine, RegressionDetector};
 use crate::self_improvement::SelfImprovementEngine;
 use crate::swarm::SwarmController;
 use crate::planning::PlanningEngine;
+use crate::security::{SecretScanner, TurnSigner};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -42,6 +43,7 @@ pub struct Orchestrator {
     pub self_improve: SelfImprovementEngine,
     pub swarm: SwarmController,
     pub planning: PlanningEngine,
+    pub signer: TurnSigner,
 }
 
 impl Orchestrator {
@@ -73,6 +75,7 @@ impl Orchestrator {
             self_improve: SelfImprovementEngine,
             swarm: SwarmController::new(),
             planning: PlanningEngine,
+            signer: TurnSigner::new(),
         }
     }
 
@@ -147,6 +150,14 @@ impl Orchestrator {
         }
 
         let latency_ms = start_time.elapsed().as_millis() as u64;
+
+        // Security: Secret Scanning
+        let secrets = SecretScanner::scan(&response);
+        if !secrets.is_empty() {
+            println!("[security] turn {iteration_index} blocked: detected secrets {:?}", secrets);
+            let _ = self.event_tx.send(StreamEvent::TokenReceived("\n[Blocked: Security Violation]\n".to_string())).await;
+            return Ok(false);
+        }
 
         if TautologyFilter::is_tautological(&response, &history_contents) {
             println!("[verification] turn {iteration_index} pruned: tautological reasoning detected");
@@ -241,7 +252,7 @@ impl Orchestrator {
                 return Ok(false);
             }
 
-            let turn = Turn {
+            let mut turn = Turn {
                 index: sigma.iteration_index,
                 model_id: agent_id.clone(),
                 content: response.clone(),
@@ -251,8 +262,13 @@ impl Orchestrator {
                 outcome,
                 task_category: Some(TaskCategory::CodeGeneration),
                 structure: Some(ReasoningEngine::select_structure(TaskCategory::CodeGeneration, &agent_id)),
+                signature: vec![],
             };
             
+            // Security: Turn Signing
+            let serialized = serde_json::to_vec(&turn).unwrap();
+            turn.signature = self.signer.sign(&serialized);
+
             let quality_score = QualityScorer::score(&turn);
             {
                 let mut intell = self.intelligence.lock().await;
@@ -294,7 +310,6 @@ impl Orchestrator {
             
             self.swarm.broadcast_turn(turn.clone());
 
-            // Planning: Update Goal Tree
             if let Some(ref mut root) = sigma.goal_tree.root {
                 PlanningEngine::update_goal_status(root);
             }

@@ -1,4 +1,4 @@
-use crate::types::{Artifact, ArtifactDiff};
+use crate::types::Artifact;
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use petgraph::graph::DiGraph;
@@ -33,7 +33,7 @@ impl QualityEngine {
 
         ArtifactMetrics {
             cyclomatic_complexity: complexity,
-            coupling: 0, // Requires dependency graph
+            coupling: 0,
             cohesion: 1.0,
             line_count,
             comment_density,
@@ -43,7 +43,6 @@ impl QualityEngine {
     pub fn detect_duplication(new_content: &str, existing_artifacts: &HashMap<String, Artifact>) -> Vec<(String, f64)> {
         let mut duplicates = vec![];
         for (name, art) in existing_artifacts {
-            // Simplified: character similarity ratio
             let common = new_content.chars().filter(|c| art.content.contains(*c)).count();
             let ratio = if !new_content.is_empty() { common as f64 / new_content.len() as f64 } else { 0.0 };
             if ratio > 0.8 {
@@ -88,10 +87,11 @@ impl RegressionDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_complexity_counting() {
-        let mut art = Artifact {
+        let art = Artifact {
             name: "test.rs".to_string(),
             language: "rust".to_string(),
             content: "fn main() { if true { if false {} } }".to_string(),
@@ -99,6 +99,7 @@ mod tests {
             history: vec![],
             ast_versions: HashMap::new(),
             proof_attachments: vec![],
+            metrics: ArtifactMetrics::default(),
         };
         let metrics = QualityEngine::analyze_artifact(&art);
         assert!(metrics.cyclomatic_complexity >= 3);

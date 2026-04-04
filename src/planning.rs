@@ -1,7 +1,5 @@
-use crate::types::{GoalTree, GoalNode, GoalStatus, ConversationState, Turn};
-use std::collections::BinaryHeap;
+use crate::types::{GoalNode, GoalStatus, ConversationState, Turn};
 use std::cmp::Ordering;
-use anyhow::{Result, anyhow};
 
 pub struct PlanningEngine;
 

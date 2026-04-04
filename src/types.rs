@@ -118,6 +118,8 @@ pub struct Turn {
     pub outcome: TurnOutcome,
     pub task_category: Option<TaskCategory>,
     pub structure: Option<TurnStructure>,
+    #[serde(default)]
+    pub signature: Vec<u8>,
 }
 
 fn default_outcome() -> TurnOutcome {
