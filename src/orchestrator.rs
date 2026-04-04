@@ -16,6 +16,7 @@ use crate::compute::ComputeManager;
 use crate::reasoning::{ReasoningEngine, FallacyDetector};
 use crate::quality::{QualityEngine, RegressionDetector};
 use crate::self_improvement::SelfImprovementEngine;
+use crate::swarm::SwarmController;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -38,6 +39,7 @@ pub struct Orchestrator {
     pub compute: Mutex<ComputeManager>,
     pub reasoning: ReasoningEngine,
     pub self_improve: SelfImprovementEngine,
+    pub swarm: SwarmController,
 }
 
 impl Orchestrator {
@@ -67,6 +69,7 @@ impl Orchestrator {
             compute: Mutex::new(ComputeManager::new()),
             reasoning: ReasoningEngine,
             self_improve: SelfImprovementEngine,
+            swarm: SwarmController::new(),
         }
     }
 
@@ -285,13 +288,16 @@ impl Orchestrator {
             sigma.completion_probability = kalman.update(measurement);
 
             self.state_manager.checkpoint(&sigma)?;
+            
+            // Swarm Broadcast
+            self.swarm.broadcast_turn(turn.clone());
+
             let _ = self.event_tx.send(StreamEvent::TokenReceived(format!("\n[Turn Complete | P(C): {:.2} | Hash: {:02x?}]\n", sigma.completion_probability, &sigma.state_hash[..4]))).await;
             let _ = self.event_tx.send(StreamEvent::TurnComplete(turn)).await;
 
             let is_converged = sigma.completion_probability > 0.95;
             
             if is_converged {
-                // Self-Improvement: Evaluate Session
                 let eval = SelfImprovementEngine::evaluate_session(&sigma);
                 println!("[self-improve] Session evaluation: {:?}", eval);
             }
