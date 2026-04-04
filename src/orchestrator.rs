@@ -6,6 +6,8 @@ use crate::validation::AstValidator;
 use crate::consensus::{CertaintyAnalyzer, KalmanConvergence, InfluenceWeightManager};
 use crate::sandbox::SandboxManager;
 use crate::simulation::MonteCarloRunner;
+use crate::mcp::McpGateway;
+use crate::environment::ToolDiscovery;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -21,6 +23,7 @@ pub struct Orchestrator {
     control_rx: Mutex<mpsc::Receiver<ControlSignal>>,
     sandbox: SandboxManager,
     mc_runner: MonteCarloRunner,
+    pub mcp_gateway: McpGateway,
 }
 
 impl Orchestrator {
@@ -31,6 +34,12 @@ impl Orchestrator {
         event_tx: mpsc::Sender<StreamEvent>,
         control_rx: mpsc::Receiver<ControlSignal>,
     ) -> Self {
+        let mut mcp_gateway = McpGateway::new();
+        let tools = ToolDiscovery::scan();
+        for tool in tools {
+            mcp_gateway.register_tool(tool);
+        }
+
         Self {
             agents,
             state_manager,
@@ -38,6 +47,7 @@ impl Orchestrator {
             control_rx: Mutex::new(control_rx),
             sandbox: SandboxManager::new().expect("Failed to init sandbox"),
             mc_runner: MonteCarloRunner::new().expect("Failed to init simulation"),
+            mcp_gateway,
         }
     }
 
@@ -54,6 +64,12 @@ impl Orchestrator {
         let agent = &self.agents[agent_idx];
         let model_id = agent.name();
 
+        println!(
+            "--- Turn {} | Model: {} ---",
+            iteration_index, model_id
+        );
+
+        // Real-time Token Piping (Ghost-Stream)
         let mut stream = agent
             .stream_prompt(&prompt)
             .await
@@ -63,6 +79,7 @@ impl Orchestrator {
         let mut paused = false;
 
         loop {
+            // 1. Handle Control Signals
             {
                 let mut rx = self.control_rx.lock().await;
                 while let Ok(signal) = rx.try_recv() {
@@ -84,16 +101,18 @@ impl Orchestrator {
                 continue;
             }
 
+            // 2. Process Model Stream
             match stream.next().await {
                 Some(chunk_res) => {
                     let chunk = chunk_res.map_err(|e| anyhow::anyhow!("Stream error: {e:?}"))?;
                     response.push_str(&chunk);
                     let _ = self.event_tx.send(StreamEvent::TokenReceived(chunk)).await;
                 }
-                None => break,
+                None => break, // Stream finished
             }
         }
 
+        // Δα Capture: Extract artifacts from response
         let proposed_artifacts = Self::parse_artifacts(&response);
         let mut turn_diffs = vec![];
 
@@ -142,9 +161,6 @@ impl Orchestrator {
                         all_valid = false;
                         break;
                     }
-
-                    // 3. Linter Guard (Strict mode simulated)
-                    // In a real run, we'd write to a temp file and run cargo clippy.
 
                     current_artifact.history.push(delta.clone());
                     current_artifact.content = new_content.clone();
@@ -196,6 +212,7 @@ impl Orchestrator {
 
             self.state_manager.checkpoint(&sigma)?;
             
+            // Signal turn completion to UI
             let _ = self.event_tx.send(StreamEvent::TokenReceived(format!("\n[Turn Complete | P(C): {:.2}]\n", sigma.completion_probability))).await;
             let _ = self.event_tx.send(StreamEvent::TurnComplete(turn)).await;
 

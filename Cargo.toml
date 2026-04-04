@@ -19,10 +19,12 @@ similar = "3.0.0"
 sled = "0.34.7"
 thiserror = "2.0.18"
 tokio = { version = "1.51.0", features = ["full"] }
+tokio-util = { version = "0.7.13", features = ["codec"] }
 tree-sitter = "0.24.7"
 tree-sitter-rust = "0.23.2"
 wasmtime = "29.0.1"
 wasmtime-wasi = "29.0.1"
+which = "7.0.1"
 
 [dev-dependencies]
 tempfile = "3.10.1"
