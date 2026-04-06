@@ -1,6 +1,11 @@
 use crate::types::conversation::{ConversationState, Turn};
-use crate::types::planning::{GoalNode, GoalStatus};
+use crate::types::planning::{GoalNode, GoalStatus, GoalTree, GoalTreeAnalysis, Milestone};
+use anyhow::{anyhow, Result};
+use petgraph::algo::toposort;
+use petgraph::graph::DiGraph;
+use sled::Db;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 pub struct PlanningEngine;
 
@@ -14,7 +19,7 @@ impl PlanningEngine {
 
         let mut all_complete = true;
         let mut any_blocked = false;
-        let mut any_in_progress = false;
+        let mut any_work_seen = false;
 
         for child in &mut node.children {
             // Depth-first recursion to update leaves first
@@ -27,11 +32,11 @@ impl PlanningEngine {
                     all_complete = false;
                 }
                 GoalStatus::InProgress => {
-                    any_in_progress = true;
+                    any_work_seen = true;
                     all_complete = false;
                 }
                 GoalStatus::Complete => {
-                    any_in_progress = true; // Completed children imply work was done
+                    any_work_seen = true; // Completed children imply work was done
                 }
                 _ => {
                     all_complete = false;
@@ -44,7 +49,7 @@ impl PlanningEngine {
             node.status = GoalStatus::Blocked;
         } else if all_complete {
             node.status = GoalStatus::Complete;
-        } else if any_in_progress {
+        } else if any_work_seen {
             node.status = GoalStatus::InProgress;
         }
     }
@@ -155,3 +160,235 @@ impl ContextPruner {
         depth_factor + urgency_factor
     }
 }
+
+pub struct DifficultyEstimator;
+
+impl DifficultyEstimator {
+    /// Estimate task difficulty in [0.0, 1.0] from recent turn history.
+    /// Heuristics: failed/stalled outcomes raise difficulty; short content lowers it.
+    #[must_use]
+    pub fn estimate(turns: &[Turn]) -> f64 {
+        if turns.is_empty() {
+            return 0.5;
+        }
+        use crate::types::conversation::TurnOutcome;
+        let mut score = 0.0f64;
+        for t in turns {
+            score += match t.outcome {
+                TurnOutcome::Rejected | TurnOutcome::RolledBack => 0.8,
+                TurnOutcome::Stalled => 0.6,
+                TurnOutcome::Unknown => 0.5,
+                TurnOutcome::Compiled => 0.3,
+                TurnOutcome::TestsPassed | TurnOutcome::AdvancedConvergence => 0.1,
+            };
+        }
+        (score / turns.len() as f64).clamp(0.0, 1.0)
+    }
+}
+
+pub struct GoalScheduler;
+
+impl GoalScheduler {
+    /// Topological schedule of `tree` using petgraph.
+    /// Returns parallel batches: goals in the same batch have no mutual dependencies
+    /// and can execute concurrently. Inner vec is a single parallel batch.
+    pub fn schedule(tree: &GoalTree) -> Result<Vec<Vec<String>>> {
+        let root = match &tree.root {
+            Some(r) => r,
+            None => return Ok(vec![]),
+        };
+
+        // Collect all nodes and build id→index map
+        let mut nodes: Vec<&GoalNode> = Vec::new();
+        Self::collect_nodes(root, &mut nodes);
+
+        let mut graph = DiGraph::<String, ()>::new();
+        let mut id_to_idx: HashMap<&str, petgraph::graph::NodeIndex> = HashMap::new();
+
+        for node in &nodes {
+            let idx = graph.add_node(node.id.clone());
+            id_to_idx.insert(&node.id, idx);
+        }
+
+        // Parent→child edges (parent depends on children completing first)
+        Self::add_edges(root, &id_to_idx, &mut graph);
+        // Explicit dependency edges
+        for node in &nodes {
+            if let Some(&src) = id_to_idx.get(node.id.as_str()) {
+                for dep in &node.dependencies {
+                    if let Some(&dst) = id_to_idx.get(dep.as_str()) {
+                        graph.add_edge(src, dst, ());
+                    }
+                }
+            }
+        }
+
+        let sorted = toposort(&graph, None)
+            .map_err(|_| anyhow!("Goal dependency cycle detected"))?;
+
+        // Group into parallel batches using longest-path levels
+        let mut level: HashMap<petgraph::graph::NodeIndex, usize> = HashMap::new();
+        for &idx in &sorted {
+            let l = graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+                .map(|p| level.get(&p).copied().unwrap_or(0) + 1)
+                .max()
+                .unwrap_or(0);
+            level.insert(idx, l);
+        }
+
+        let max_level = level.values().copied().max().unwrap_or(0);
+        let mut batches: Vec<Vec<String>> = vec![Vec::new(); max_level + 1];
+        for (idx, l) in &level {
+            batches[*l].push(graph[*idx].clone());
+        }
+        Ok(batches.into_iter().filter(|b| !b.is_empty()).collect())
+    }
+
+    fn collect_nodes<'a>(node: &'a GoalNode, out: &mut Vec<&'a GoalNode>) {
+        out.push(node);
+        for child in &node.children {
+            Self::collect_nodes(child, out);
+        }
+    }
+
+    fn add_edges(
+        node: &GoalNode,
+        map: &HashMap<&str, petgraph::graph::NodeIndex>,
+        graph: &mut DiGraph<String, ()>,
+    ) {
+        if let Some(&parent_idx) = map.get(node.id.as_str()) {
+            for child in &node.children {
+                if let Some(&child_idx) = map.get(child.id.as_str()) {
+                    graph.add_edge(parent_idx, child_idx, ());
+                }
+                Self::add_edges(child, map, graph);
+            }
+        }
+    }
+}
+
+pub struct CriticalPathAnalyzer;
+
+impl CriticalPathAnalyzer {
+    /// Returns the sequence of goal IDs forming the longest root-to-leaf path.
+    #[must_use]
+    pub fn compute(tree: &GoalTree) -> Vec<String> {
+        match &tree.root {
+            None => vec![],
+            Some(root) => Self::longest_path(root),
+        }
+    }
+
+    fn longest_path(node: &GoalNode) -> Vec<String> {
+        if node.children.is_empty() {
+            return vec![node.id.clone()];
+        }
+        let best = node
+            .children
+            .iter()
+            .map(Self::longest_path)
+            .max_by_key(|p| p.len())
+            .unwrap_or_default();
+        let mut path = vec![node.id.clone()];
+        path.extend(best);
+        path
+    }
+}
+
+pub struct MilestoneDetector;
+
+impl MilestoneDetector {
+    const THRESHOLD: f64 = 0.5;
+
+    /// Check whether the current goal completion ratio crosses a milestone boundary.
+    /// Returns a `Milestone` when a root-level goal becomes Complete, or when
+    /// overall completion crosses 50% or 100%.
+    #[must_use]
+    pub fn check(sigma: &ConversationState, prev_ratio: f64) -> Option<Milestone> {
+        let analysis = sigma.goal_tree.analyze();
+        let ratio = analysis.completion_ratio;
+        let now = ConversationState::now();
+
+        // Root goal completed
+        if let Some(root) = &sigma.goal_tree.root {
+            if root.status == GoalStatus::Complete && prev_ratio < 1.0 {
+                return Some(Milestone {
+                    id: format!("root-complete-{now}"),
+                    title: format!("Root goal '{}' completed", root.title),
+                    triggered_at: now,
+                    completion_ratio: ratio,
+                });
+            }
+        }
+
+        // Crossed 50% threshold
+        if prev_ratio < Self::THRESHOLD && ratio >= Self::THRESHOLD {
+            return Some(Milestone {
+                id: format!("half-complete-{now}"),
+                title: "50% of goals completed".to_string(),
+                triggered_at: now,
+                completion_ratio: ratio,
+            });
+        }
+
+        // All goals complete
+        if prev_ratio < 1.0 && ratio >= 1.0 && analysis.total_count > 0 {
+            return Some(Milestone {
+                id: format!("all-complete-{now}"),
+                title: "All goals completed".to_string(),
+                triggered_at: now,
+                completion_ratio: ratio,
+            });
+        }
+
+        None
+    }
+}
+
+pub struct SessionManager {
+    db: Db,
+}
+
+impl SessionManager {
+    const TREE_NAME: &'static str = "sessions";
+
+    pub fn new(path: &str) -> Result<Self> {
+        let db = sled::open(path)?;
+        Ok(Self { db })
+    }
+
+    pub fn save(&self, session_id: &str, state: &ConversationState) -> Result<()> {
+        let tree = self.db.open_tree(Self::TREE_NAME)?;
+        let bytes = serde_json::to_vec(state)?;
+        tree.insert(session_id.as_bytes(), bytes)?;
+        self.db.flush()?;
+        Ok(())
+    }
+
+    pub fn load(&self, session_id: &str) -> Result<ConversationState> {
+        let tree = self.db.open_tree(Self::TREE_NAME)?;
+        let bytes = tree
+            .get(session_id.as_bytes())?
+            .ok_or_else(|| anyhow!("Session '{}' not found", session_id))?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    pub fn list(&self) -> Result<Vec<String>> {
+        let tree = self.db.open_tree(Self::TREE_NAME)?;
+        tree.iter()
+            .keys()
+            .map(|k| {
+                k.map_err(|e| anyhow!(e))
+                    .and_then(|b| String::from_utf8(b.to_vec()).map_err(|e| anyhow!(e)))
+            })
+            .collect()
+    }
+
+    pub fn delete(&self, session_id: &str) -> Result<()> {
+        let tree = self.db.open_tree(Self::TREE_NAME)?;
+        tree.remove(session_id.as_bytes())?;
+        Ok(())
+    }
+}
+
