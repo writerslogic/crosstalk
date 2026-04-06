@@ -808,9 +808,12 @@ async fn test_forget_removes_cluster_assignment() {
 }
 
 // ── snapshot / restore ────────────────────────────────────────────────────────
+// These tests mutate a global env var; serialise them with a static async mutex.
+static SNAP_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn test_snapshot_returns_non_empty_bytes() {
+    let _guard = SNAP_ENV_LOCK.lock().await;
     let db_dir = tempfile::tempdir().unwrap();
     let snap_dir = tempfile::tempdir().unwrap();
     unsafe { std::env::set_var("CROSSTALK_MEMORY_DIR", snap_dir.path()) };
@@ -824,6 +827,7 @@ async fn test_snapshot_returns_non_empty_bytes() {
 
 #[tokio::test]
 async fn test_snapshot_creates_file_on_disk() {
+    let _guard = SNAP_ENV_LOCK.lock().await;
     let db_dir = tempfile::tempdir().unwrap();
     let snap_dir = tempfile::tempdir().unwrap();
     unsafe { std::env::set_var("CROSSTALK_MEMORY_DIR", snap_dir.path()) };
@@ -838,6 +842,7 @@ async fn test_snapshot_creates_file_on_disk() {
 
 #[tokio::test]
 async fn test_snapshot_restore_round_trip() {
+    let _guard = SNAP_ENV_LOCK.lock().await;
     let db_dir = tempfile::tempdir().unwrap();
     let snap_dir = tempfile::tempdir().unwrap();
     unsafe { std::env::set_var("CROSSTALK_MEMORY_DIR", snap_dir.path()) };
@@ -864,6 +869,7 @@ async fn test_snapshot_restore_round_trip() {
 
 #[tokio::test]
 async fn test_restore_fails_on_missing_file() {
+    let _guard = SNAP_ENV_LOCK.lock().await;
     let db_dir = tempfile::tempdir().unwrap();
     let snap_dir = tempfile::tempdir().unwrap();
     unsafe { std::env::set_var("CROSSTALK_MEMORY_DIR", snap_dir.path()) };
