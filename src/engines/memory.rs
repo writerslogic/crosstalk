@@ -638,6 +638,11 @@ pub struct ContextDistiller;
 impl ContextDistiller {
     #[must_use]
     pub fn distill(sigma: &ConversationState, max_chars: usize) -> String {
+        Self::distill_with_decay(sigma, max_chars, 0.01)
+    }
+
+    #[must_use]
+    pub fn distill_with_decay(sigma: &ConversationState, max_chars: usize, decay_rate: f64) -> String {
         let now = ConversationState::now();
         let mut scored_turns: Vec<(&Turn, f64)> = sigma
             .turns
@@ -645,7 +650,7 @@ impl ContextDistiller {
             .map(|t| {
                 let age_hours = (now - t.timestamp) as f64 / 3600.0;
                 let weight = outcome_weight(&t.outcome);
-                (t, weight * (-0.01 * age_hours).exp())
+                (t, weight * (-decay_rate * age_hours).exp())
             })
             .collect();
 
@@ -805,9 +810,158 @@ impl Default for MemoryBridge {
     }
 }
 
+pub struct DecayCalibrator {
+    decay_rate: f64,
+    useful_turn_ages: Vec<f64>,
+}
+
+impl DecayCalibrator {
+    const DEFAULT_RATE: f64 = 0.01;
+    const MIN_SAMPLES: usize = 10;
+
+    #[must_use]
+    pub fn new() -> Self {
+        Self { decay_rate: Self::DEFAULT_RATE, useful_turn_ages: Vec::new() }
+    }
+
+    /// Record the age (in hours) of a turn that proved useful at retrieval time.
+    pub fn record_useful_turn(&mut self, age_hours: f64) {
+        if age_hours >= 0.0 {
+            self.useful_turn_ages.push(age_hours);
+        }
+    }
+
+    /// Re-fit the exponential decay rate using MLE: λ = 1 / mean(ages).
+    /// Requires at least MIN_SAMPLES observations; otherwise keeps current rate.
+    pub fn calibrate(&mut self) {
+        if self.useful_turn_ages.len() < Self::MIN_SAMPLES {
+            return;
+        }
+        let mean_age = self.useful_turn_ages.iter().sum::<f64>() / self.useful_turn_ages.len() as f64;
+        if mean_age > 0.0 {
+            self.decay_rate = (1.0 / mean_age).clamp(0.001, 0.1);
+        }
+    }
+
+    #[must_use]
+    pub fn decay_rate(&self) -> f64 {
+        self.decay_rate
+    }
+
+    #[must_use]
+    pub fn sample_count(&self) -> usize {
+        self.useful_turn_ages.len()
+    }
+}
+
+impl Default for DecayCalibrator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct SemanticClusterer;
 
 impl SemanticClusterer {
+    /// Automatically select the number of clusters using the elbow method.
+    /// Runs k-means for k = 1..=max_k and returns the k at the sharpest inertia drop.
+    #[must_use]
+    pub fn select_k(turns: &[Turn], max_k: Option<usize>) -> usize {
+        let n = turns.len();
+        if n <= 1 {
+            return 1;
+        }
+        let max = max_k
+            .unwrap_or_else(|| (n as f64).sqrt().ceil() as usize)
+            .min(n)
+            .max(1);
+
+        if max == 1 {
+            return 1;
+        }
+
+        let embeddings: Vec<Vec<f32>> = turns.iter().map(|t| embed_text(&t.content)).collect();
+
+        let inertia: Vec<f64> = (1..=max).map(|k| Self::kmeans_inertia(&embeddings, k)).collect();
+
+        // Elbow via largest second derivative (curvature) of the inertia curve.
+        if inertia.len() < 3 {
+            return max;
+        }
+        let mut best_k = 1usize;
+        let mut best_curv = f64::NEG_INFINITY;
+        for i in 1..inertia.len() - 1 {
+            let curv = inertia[i + 1] - 2.0 * inertia[i] + inertia[i - 1];
+            if curv > best_curv {
+                best_curv = curv;
+                best_k = i + 1; // 1-indexed
+            }
+        }
+        best_k
+    }
+
+    fn kmeans_inertia(embeddings: &[Vec<f32>], k: usize) -> f64 {
+        if embeddings.is_empty() || k == 0 {
+            return 0.0;
+        }
+        let k = k.min(embeddings.len());
+        let dim = embeddings[0].len();
+
+        let mut centroids: Vec<Vec<f32>> = (0..k)
+            .map(|i| embeddings[i * embeddings.len() / k].clone())
+            .collect();
+        let mut assignments = vec![0usize; embeddings.len()];
+
+        for _ in 0..20 {
+            let mut changed = false;
+            for (i, emb) in embeddings.iter().enumerate() {
+                let nearest = centroids
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| {
+                        cosine_sim(emb, a)
+                            .partial_cmp(&cosine_sim(emb, b))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0);
+                if assignments[i] != nearest {
+                    assignments[i] = nearest;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+            for (ci, centroid) in centroids.iter_mut().enumerate() {
+                let members: Vec<&Vec<f32>> = assignments
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &a)| a == ci)
+                    .map(|(i, _)| &embeddings[i])
+                    .collect();
+                if members.is_empty() {
+                    continue;
+                }
+                let mut c = vec![0.0f32; dim];
+                for m in &members {
+                    for (j, v) in m.iter().enumerate() {
+                        c[j] += v;
+                    }
+                }
+                let n = members.len() as f32;
+                *centroid = normalize_vector(&c.iter().map(|v| v / n).collect::<Vec<_>>());
+            }
+        }
+
+        // Inertia: sum of cosine distances (1 - sim) to assigned centroid.
+        assignments
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (1.0 - cosine_sim(&embeddings[i], &centroids[c])) as f64)
+            .sum()
+    }
+
     pub fn cluster(turns: &[Turn], k_clusters: usize) -> Result<Vec<Vec<u32>>> {
         if turns.is_empty() || k_clusters == 0 {
             return Ok(vec![]);

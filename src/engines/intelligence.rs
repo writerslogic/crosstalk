@@ -667,3 +667,144 @@ impl Default for LatencyPredictor {
         Self::new()
     }
 }
+
+pub struct ConvergenceVelocityTracker {
+    p_history: VecDeque<f64>,
+    velocity_history: VecDeque<f64>,
+    window: usize,
+}
+
+impl ConvergenceVelocityTracker {
+    #[must_use]
+    pub fn new(window: usize) -> Self {
+        Self {
+            p_history: VecDeque::new(),
+            velocity_history: VecDeque::new(),
+            window: window.max(2),
+        }
+    }
+
+    pub fn record(&mut self, completion_probability: f64) {
+        if let Some(&prev) = self.p_history.back() {
+            let v = completion_probability - prev;
+            if self.velocity_history.len() >= self.window {
+                self.velocity_history.pop_front();
+            }
+            self.velocity_history.push_back(v);
+        }
+        if self.p_history.len() >= self.window {
+            self.p_history.pop_front();
+        }
+        self.p_history.push_back(completion_probability);
+    }
+
+    #[must_use]
+    pub fn current_velocity(&self) -> f64 {
+        self.velocity_history.back().copied().unwrap_or(0.0)
+    }
+
+    #[must_use]
+    pub fn mean_velocity(&self) -> f64 {
+        if self.velocity_history.is_empty() {
+            return 0.0;
+        }
+        self.velocity_history.iter().sum::<f64>() / self.velocity_history.len() as f64
+    }
+
+    #[must_use]
+    pub fn acceleration(&self) -> f64 {
+        if self.velocity_history.len() < 2 {
+            return 0.0;
+        }
+        let mut it = self.velocity_history.iter().rev();
+        let latest = *it.next().unwrap();
+        let prior = *it.next().unwrap();
+        latest - prior
+    }
+
+    #[must_use]
+    pub fn is_stalled(&self) -> bool {
+        self.velocity_history.len() >= 3
+            && self.velocity_history.iter().rev().take(3).all(|&v| v.abs() < 0.005)
+    }
+
+    /// Estimated turns remaining until completion_probability reaches 1.0.
+    /// Returns `None` if velocity is zero or negative.
+    #[must_use]
+    pub fn predict_turns_to_completion(&self, current_p: f64) -> Option<u32> {
+        let v = self.mean_velocity();
+        if v <= 0.0 {
+            return None;
+        }
+        let remaining = (1.0 - current_p).max(0.0);
+        Some((remaining / v).ceil() as u32)
+    }
+}
+
+impl Default for ConvergenceVelocityTracker {
+    fn default() -> Self {
+        Self::new(10)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ParetoPoint {
+    pub model_id: String,
+    pub quality: f64,
+    pub cost_tokens: u32,
+}
+
+pub struct ParetoOptimizer;
+
+impl ParetoOptimizer {
+    /// Returns the non-dominated subset: no other point has both higher quality
+    /// and lower (or equal) cost. Result is sorted by quality descending.
+    #[must_use]
+    pub fn compute_frontier(points: Vec<ParetoPoint>) -> Vec<ParetoPoint> {
+        let mut frontier: Vec<ParetoPoint> = points
+            .iter()
+            .filter(|candidate| {
+                !points.iter().any(|other| {
+                    other.model_id != candidate.model_id
+                        && other.quality >= candidate.quality
+                        && other.cost_tokens <= candidate.cost_tokens
+                        && (other.quality > candidate.quality
+                            || other.cost_tokens < candidate.cost_tokens)
+                })
+            })
+            .cloned()
+            .collect();
+        frontier.sort_by(|a, b| b.quality.partial_cmp(&a.quality).unwrap_or(std::cmp::Ordering::Equal));
+        frontier
+    }
+
+    /// From the frontier, select the cheapest point meeting both constraints.
+    #[must_use]
+    pub fn select(frontier: &[ParetoPoint], min_quality: f64, max_tokens: u32) -> Option<&ParetoPoint> {
+        frontier
+            .iter()
+            .filter(|p| p.quality >= min_quality && p.cost_tokens <= max_tokens)
+            .min_by_key(|p| p.cost_tokens)
+    }
+
+    /// Build `ParetoPoint`s from live engine profiles for a given category.
+    #[must_use]
+    pub fn from_profiles(
+        engine: &IntelligenceEngine,
+        category: TaskCategory,
+        available_models: &[String],
+    ) -> Vec<ParetoPoint> {
+        available_models
+            .iter()
+            .filter_map(|model_id| {
+                let profile = engine.profiles.get(model_id)?;
+                let quality = profile.task_scores.get(&category).map_or(0.5, |ra| ra.mean);
+                Some(ParetoPoint {
+                    model_id: model_id.clone(),
+                    quality,
+                    cost_tokens: IntelligenceEngine::estimate_tokens(category),
+                })
+            })
+            .collect()
+    }
+}

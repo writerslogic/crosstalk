@@ -76,6 +76,65 @@ impl PromptTemplate {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum MutationStrategy {
+    /// Append a suffix (e.g. emphasis clause) to the template body.
+    Append(String),
+    /// Trim the template body to at most `max_chars` characters.
+    Trim(usize),
+    /// Prepend a prefix (e.g. role framing) before the template body.
+    Prefix(String),
+    /// Inject an `{{examples}}` slot if one is not already present.
+    InjectExamples,
+}
+
+impl PromptTemplate {
+    /// Produce a mutated copy of this template. The copy increments `version`
+    /// and appends `_v{version}` to the id; the original is not modified.
+    #[must_use]
+    pub fn mutate(&self, strategy: MutationStrategy) -> PromptTemplate {
+        let mut m = self.clone();
+        m.version += 1;
+        m.id = format!("{}_v{}", self.id, m.version);
+        match strategy {
+            MutationStrategy::Append(suffix) => {
+                m.template_text.push_str("\n\n");
+                m.template_text.push_str(&suffix);
+            }
+            MutationStrategy::Trim(max_chars) => {
+                m.template_text = m.template_text.chars().take(max_chars).collect();
+            }
+            MutationStrategy::Prefix(prefix) => {
+                m.template_text = format!("{}\n\n{}", prefix, m.template_text);
+            }
+            MutationStrategy::InjectExamples => {
+                if !m.template_text.contains("{{examples}}") {
+                    m.template_text.push_str("\n\nExamples:\n{{examples}}");
+                    if !m.variables.contains(&"examples".to_string()) {
+                        m.variables.push("examples".to_string());
+                    }
+                }
+            }
+        }
+        m
+    }
+
+    /// Record a quality score for a specific turn/outcome.
+    pub fn record_performance(&mut self, outcome_id: String, quality: f64) {
+        self.performance_history.push((outcome_id, quality));
+    }
+
+    /// Mean quality across all recorded performance observations (0.5 if none).
+    #[must_use]
+    pub fn mean_performance(&self) -> f64 {
+        if self.performance_history.is_empty() {
+            return 0.5;
+        }
+        self.performance_history.iter().map(|(_, q)| q).sum::<f64>()
+            / self.performance_history.len() as f64
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct RegressionAlert {
     pub agent_id: String,

@@ -1,9 +1,10 @@
 use crosstalk::engines::intelligence::{
-    ContextBudgeter, ConvergenceMonitor, IntelligenceEngine, LatencyPredictor, ModelEnsemble,
-    PromptComposer, QualityScorer, VotingStrategy,
+    ContextBudgeter, ConvergenceMonitor, ConvergenceVelocityTracker, IntelligenceEngine,
+    LatencyPredictor, ModelEnsemble, ParetoOptimizer, ParetoPoint, PromptComposer, QualityScorer,
+    VotingStrategy,
 };
 use crosstalk::types::conversation::{ConversationState, TaskCategory, Turn, TurnOutcome};
-use crosstalk::types::intelligence::{ModelProfile, PromptTemplate, RunningAverage};
+use crosstalk::types::intelligence::{ModelProfile, MutationStrategy, PromptTemplate, RunningAverage};
 use std::collections::HashMap;
 use tempfile::tempdir;
 
@@ -950,4 +951,177 @@ fn select_template_returns_none_for_unmatched_category() {
     let templates = vec![make_template("t1", "...", vec![], TaskCategory::Research)];
     let selected = PromptComposer::select_template(&templates, TaskCategory::Architecture, false);
     assert!(selected.is_none());
+}
+
+// ── PromptTemplate mutation ───────────────────────────────────────────────────
+
+#[test]
+fn mutate_append_adds_suffix() {
+    let t = make_template("base", "Do {{task}}.", vec!["task".into()], TaskCategory::CodeGeneration);
+    let m = t.mutate(MutationStrategy::Append("Be concise.".into()));
+    assert!(m.template_text.contains("Be concise."));
+    assert!(m.template_text.contains("Do {{task}}."));
+    assert_eq!(m.version, t.version + 1);
+}
+
+#[test]
+fn mutate_trim_truncates_text() {
+    let t = make_template("base", "abcdefghij", vec![], TaskCategory::CodeGeneration);
+    let m = t.mutate(MutationStrategy::Trim(5));
+    assert_eq!(m.template_text, "abcde");
+}
+
+#[test]
+fn mutate_prefix_prepends_text() {
+    let t = make_template("base", "Do the task.", vec![], TaskCategory::Debugging);
+    let m = t.mutate(MutationStrategy::Prefix("You are an expert.".into()));
+    assert!(m.template_text.starts_with("You are an expert."));
+    assert!(m.template_text.contains("Do the task."));
+}
+
+#[test]
+fn mutate_inject_examples_adds_slot_once() {
+    let t = make_template("base", "Do {{task}}.", vec!["task".into()], TaskCategory::Testing);
+    let m = t.mutate(MutationStrategy::InjectExamples);
+    assert!(m.template_text.contains("{{examples}}"));
+    assert!(m.variables.contains(&"examples".to_string()));
+    // Applying again should not duplicate the slot.
+    let m2 = m.mutate(MutationStrategy::InjectExamples);
+    let count = m2.template_text.matches("{{examples}}").count();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn mutate_does_not_modify_original() {
+    let t = make_template("orig", "original text", vec![], TaskCategory::Research);
+    let _m = t.mutate(MutationStrategy::Append("extra".into()));
+    assert_eq!(t.template_text, "original text");
+}
+
+#[test]
+fn record_performance_and_mean() {
+    let mut t = make_template("t", "x", vec![], TaskCategory::CodeGeneration);
+    assert!((t.mean_performance() - 0.5).abs() < 1e-9);
+    t.record_performance("turn-1".into(), 0.8);
+    t.record_performance("turn-2".into(), 0.6);
+    assert!((t.mean_performance() - 0.7).abs() < 1e-9);
+}
+
+// ── ConvergenceVelocityTracker ────────────────────────────────────────────────
+
+#[test]
+fn velocity_tracker_initial_velocity_is_zero() {
+    let t = ConvergenceVelocityTracker::new(5);
+    assert_eq!(t.current_velocity(), 0.0);
+    assert_eq!(t.mean_velocity(), 0.0);
+}
+
+#[test]
+fn velocity_tracker_records_velocity_correctly() {
+    let mut t = ConvergenceVelocityTracker::new(10);
+    t.record(0.5);
+    t.record(0.6);
+    assert!((t.current_velocity() - 0.1).abs() < 1e-9);
+}
+
+#[test]
+fn velocity_tracker_detects_stall() {
+    let mut t = ConvergenceVelocityTracker::new(10);
+    t.record(0.5);
+    t.record(0.5001);
+    t.record(0.5002);
+    t.record(0.5003);
+    assert!(t.is_stalled(), "near-zero velocities should be detected as stalled");
+}
+
+#[test]
+fn velocity_tracker_not_stalled_with_progress() {
+    let mut t = ConvergenceVelocityTracker::new(10);
+    t.record(0.5);
+    t.record(0.6);
+    t.record(0.7);
+    t.record(0.8);
+    assert!(!t.is_stalled());
+}
+
+#[test]
+fn velocity_tracker_acceleration_sign() {
+    let mut t = ConvergenceVelocityTracker::new(10);
+    t.record(0.1);
+    t.record(0.2); // velocity = 0.1
+    t.record(0.4); // velocity = 0.2, acceleration = +0.1
+    assert!(t.acceleration() > 0.0);
+}
+
+#[test]
+fn velocity_tracker_predicts_turns_to_completion() {
+    let mut t = ConvergenceVelocityTracker::new(10);
+    t.record(0.0);
+    t.record(0.1);
+    t.record(0.2); // mean_velocity = 0.1
+    let eta = t.predict_turns_to_completion(0.2);
+    assert_eq!(eta, Some(8)); // ceil(0.8 / 0.1)
+}
+
+#[test]
+fn velocity_tracker_no_eta_when_stalled() {
+    let mut t = ConvergenceVelocityTracker::new(10);
+    t.record(0.5);
+    t.record(0.5);
+    assert!(t.predict_turns_to_completion(0.5).is_none());
+}
+
+// ── ParetoOptimizer ───────────────────────────────────────────────────────────
+
+#[test]
+fn pareto_frontier_excludes_dominated_points() {
+    let points = vec![
+        ParetoPoint { model_id: "a".into(), quality: 0.9, cost_tokens: 1000 },
+        ParetoPoint { model_id: "b".into(), quality: 0.7, cost_tokens: 1500 }, // dominated by a
+        ParetoPoint { model_id: "c".into(), quality: 0.6, cost_tokens: 500 },  // on frontier (cheaper)
+    ];
+    let frontier = ParetoOptimizer::compute_frontier(points);
+    let ids: Vec<&str> = frontier.iter().map(|p| p.model_id.as_str()).collect();
+    assert!(ids.contains(&"a"), "high quality model should be on frontier");
+    assert!(ids.contains(&"c"), "cheap model should be on frontier");
+    assert!(!ids.contains(&"b"), "dominated model should be excluded");
+}
+
+#[test]
+fn pareto_frontier_sorted_by_quality_descending() {
+    let points = vec![
+        ParetoPoint { model_id: "low".into(),  quality: 0.5, cost_tokens: 500 },
+        ParetoPoint { model_id: "high".into(), quality: 0.9, cost_tokens: 900 },
+        ParetoPoint { model_id: "mid".into(),  quality: 0.7, cost_tokens: 700 },
+    ];
+    let frontier = ParetoOptimizer::compute_frontier(points);
+    for w in frontier.windows(2) {
+        assert!(w[0].quality >= w[1].quality, "frontier must be sorted by quality descending");
+    }
+}
+
+#[test]
+fn pareto_select_returns_cheapest_qualifying_point() {
+    let frontier = vec![
+        ParetoPoint { model_id: "best".into(),   quality: 0.9, cost_tokens: 2000 },
+        ParetoPoint { model_id: "cheap".into(),  quality: 0.8, cost_tokens: 800 },
+        ParetoPoint { model_id: "mid".into(),    quality: 0.85, cost_tokens: 1200 },
+    ];
+    let selected = ParetoOptimizer::select(&frontier, 0.75, 1500).unwrap();
+    assert_eq!(selected.model_id, "cheap", "should prefer cheapest model that qualifies");
+}
+
+#[test]
+fn pareto_select_returns_none_when_no_candidate_qualifies() {
+    let frontier = vec![
+        ParetoPoint { model_id: "a".into(), quality: 0.5, cost_tokens: 3000 },
+    ];
+    assert!(ParetoOptimizer::select(&frontier, 0.9, 2000).is_none());
+}
+
+#[test]
+fn pareto_single_point_is_on_frontier() {
+    let points = vec![ParetoPoint { model_id: "only".into(), quality: 0.7, cost_tokens: 1000 }];
+    let frontier = ParetoOptimizer::compute_frontier(points);
+    assert_eq!(frontier.len(), 1);
 }

@@ -982,3 +982,117 @@ async fn memory_store_new_defaults_to_384() {
     let store = MemoryStore::new(dir.path().to_str().unwrap());
     assert_eq!(store.embedding_dim, 384);
 }
+
+// ── DecayCalibrator ───────────────────────────────────────────────────────────
+
+#[test]
+fn decay_calibrator_default_rate_is_001() {
+    use crosstalk::engines::memory::DecayCalibrator;
+    let cal = DecayCalibrator::new();
+    assert!((cal.decay_rate() - 0.01).abs() < 1e-9);
+}
+
+#[test]
+fn decay_calibrator_no_calibration_below_min_samples() {
+    use crosstalk::engines::memory::DecayCalibrator;
+    let mut cal = DecayCalibrator::new();
+    for i in 0..9 {
+        cal.record_useful_turn(i as f64);
+    }
+    cal.calibrate();
+    assert!((cal.decay_rate() - 0.01).abs() < 1e-9, "should not change below 10 samples");
+}
+
+#[test]
+fn decay_calibrator_mle_sets_rate_from_mean_age() {
+    use crosstalk::engines::memory::DecayCalibrator;
+    let mut cal = DecayCalibrator::new();
+    // 10 observations all at 100 hours → mean = 100 → lambda = 0.01
+    for _ in 0..10 {
+        cal.record_useful_turn(100.0);
+    }
+    cal.calibrate();
+    assert!((cal.decay_rate() - 0.01).abs() < 1e-6);
+}
+
+#[test]
+fn decay_calibrator_young_turns_yield_higher_rate() {
+    use crosstalk::engines::memory::DecayCalibrator;
+    let mut cal = DecayCalibrator::new();
+    // mean age = 5h → lambda = 0.2 (clamped to 0.1)
+    for _ in 0..10 {
+        cal.record_useful_turn(5.0);
+    }
+    cal.calibrate();
+    assert!(cal.decay_rate() > 0.01, "recent-biased useful turns should raise decay rate");
+}
+
+#[test]
+fn decay_calibrator_rate_is_clamped() {
+    use crosstalk::engines::memory::DecayCalibrator;
+    let mut cal = DecayCalibrator::new();
+    // age = 0.001h → lambda would be 1000, but clamped to 0.1
+    for _ in 0..10 {
+        cal.record_useful_turn(0.001);
+    }
+    cal.calibrate();
+    assert!(cal.decay_rate() <= 0.1);
+    assert!(cal.decay_rate() >= 0.001);
+}
+
+// ── SemanticClusterer::select_k ───────────────────────────────────────────────
+
+#[test]
+fn select_k_single_turn_returns_one() {
+    let turns = vec![make_turn(0, "hello world", TurnOutcome::Unknown)];
+    let k = SemanticClusterer::select_k(&turns, None);
+    assert_eq!(k, 1);
+}
+
+#[test]
+fn select_k_empty_returns_one() {
+    let k = SemanticClusterer::select_k(&[], None);
+    assert_eq!(k, 1);
+}
+
+#[test]
+fn select_k_respects_max_k_cap() {
+    let turns: Vec<Turn> = (0..20)
+        .map(|i| make_turn(i, &format!("turn {i}"), TurnOutcome::Unknown))
+        .collect();
+    let k = SemanticClusterer::select_k(&turns, Some(3));
+    assert!(k <= 3, "k={k} should not exceed max_k=3");
+    assert!(k >= 1);
+}
+
+#[test]
+fn select_k_returns_value_in_valid_range() {
+    let turns: Vec<Turn> = (0..10)
+        .map(|i| make_turn(i, &format!("content {i}"), TurnOutcome::Unknown))
+        .collect();
+    let k = SemanticClusterer::select_k(&turns, None);
+    assert!(k >= 1);
+    assert!(k <= turns.len());
+}
+
+// ── ContextDistiller::distill_with_decay ──────────────────────────────────────
+
+#[test]
+fn distill_with_decay_zero_rate_weights_all_equally() {
+    let mut sigma = ConversationState::new("test-decay");
+    for i in 0u32..5 {
+        sigma.turns.push(make_turn(i, &format!("content {i}"), TurnOutcome::Unknown));
+    }
+    let out = ContextDistiller::distill_with_decay(&sigma, 4096, 0.0);
+    assert!(out.contains("content 0"));
+    assert!(out.contains("content 4"));
+}
+
+#[test]
+fn distill_default_delegates_to_distill_with_decay() {
+    let mut sigma = ConversationState::new("decay-delegate");
+    sigma.turns.push(make_turn(0, "hello", TurnOutcome::Unknown));
+    let a = ContextDistiller::distill(&sigma, 4096);
+    let b = ContextDistiller::distill_with_decay(&sigma, 4096, 0.01);
+    assert_eq!(a, b);
+}
