@@ -1,12 +1,15 @@
-use crosstalk::agent_trait::PromptAgent;
-use crosstalk::orchestrator::Orchestrator;
-use crosstalk::state::StateManager;
-use crosstalk::types::{self, ControlSignal, ConversationState, StreamEvent};
-use crosstalk::ui::CrosstalkUI;
-use crosstalk::factory::ModelFactory;
-use tokio::sync::mpsc;
+use crosstalk::core::agent_trait::PromptAgent;
+use crosstalk::core::factory::ModelFactory;
+use crosstalk::core::orchestrator::Orchestrator;
+use crosstalk::core::state::StateManager;
+use crosstalk::types::conversation::{
+    ConversationState, TaskCategory, Turn, TurnOutcome, TurnStructure,
+};
+use crosstalk::types::events::{ControlSignal, StreamEvent};
+use crosstalk::ui::tui::CrosstalkUI;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 use clap::Parser;
 
@@ -52,16 +55,16 @@ async fn main() -> anyhow::Result<()> {
 
     {
         let mut s = sigma.lock().await;
-        s.turns.push(types::Turn {
+        s.turns.push(Turn {
             index: 0,
             model_id: "User".to_string(),
             content: args.task,
             timestamp: ConversationState::now(),
             diffs: vec![],
             certainty: Some(1.0),
-            outcome: types::TurnOutcome::Unknown,
-            task_category: Some(types::TaskCategory::Research),
-            structure: Some(types::TurnStructure::FreeForm),
+            outcome: TurnOutcome::Unknown,
+            task_category: Some(TaskCategory::Research),
+            structure: Some(TurnStructure::FreeForm),
             signature: vec![],
         });
     }

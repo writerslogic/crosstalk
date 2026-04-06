@@ -1,14 +1,15 @@
-use crosstalk::agent_trait::PromptAgent;
-use crosstalk::orchestrator::Orchestrator;
-use crosstalk::state::StateManager;
-use crosstalk::types::{ControlSignal, ConversationState, StreamEvent};
+use crosstalk::core::agent_trait::PromptAgent;
+use crosstalk::core::orchestrator::Orchestrator;
+use crosstalk::core::state::StateManager;
+use crosstalk::types::conversation::ConversationState;
+use crosstalk::types::events::{ControlSignal, StreamEvent};
 use futures::Stream;
 use rig::completion::PromptError;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tempfile::tempdir;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 struct MockAgent {
     name: String,
@@ -30,19 +31,29 @@ impl PromptAgent for MockAgent {
     fn stream_prompt<'a>(
         &'a self,
         _prompt: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Pin<Box<dyn Stream<Item = Result<String, anyhow::Error>> + Send + 'a>>, anyhow::Error>> + Send + 'a>> {
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Pin<Box<dyn Stream<Item = Result<String, anyhow::Error>> + Send + 'a>>,
+                        anyhow::Error,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
         let r = self.response.clone();
         Box::pin(async move {
             let stream = futures::stream::once(async move { Ok(r) });
-            Ok(Box::pin(stream) as Pin<Box<dyn Stream<Item = Result<String, anyhow::Error>> + Send>>)
+            Ok(Box::pin(stream)
+                as Pin<
+                    Box<dyn Stream<Item = Result<String, anyhow::Error>> + Send>,
+                >)
         })
     }
 }
 
-fn make_orchestrator(
-    manager: StateManager,
-    agents: Vec<Box<dyn PromptAgent>>,
-) -> Orchestrator {
+fn make_orchestrator(manager: StateManager, agents: Vec<Box<dyn PromptAgent>>) -> Orchestrator {
     let (event_tx, _event_rx) = mpsc::channel::<StreamEvent>(1000);
     let (_control_tx, control_rx) = mpsc::channel::<ControlSignal>(100);
     Orchestrator::new(manager, agents, event_tx, control_rx)
@@ -105,7 +116,10 @@ async fn test_orchestrator_rewind_restores_state() {
     let omicron = make_orchestrator(manager, vec![agent]);
     let sigma = make_sigma("test-session");
 
-    omicron.run_turn(sigma.clone()).await.expect("turn 1 failed");
+    omicron
+        .run_turn(sigma.clone())
+        .await
+        .expect("turn 1 failed");
     assert_eq!(sigma.lock().await.iteration_index, 1);
 
     let rewound = omicron.rewind(0).expect("rewind failed");
@@ -150,10 +164,16 @@ async fn test_orchestrator_rejects_invalid_ast() {
     omicron.run_turn(sigma.clone()).await.expect("turn failed");
 
     let s = sigma.lock().await;
-    assert!(s.artifacts.is_empty(), "invalid AST artifact should be rejected");
+    assert!(
+        s.artifacts.is_empty(),
+        "invalid AST artifact should be rejected"
+    );
     // After rollback, turns may be empty or the turn may exist with empty diffs
     if !s.turns.is_empty() {
-        assert!(s.turns[0].diffs.is_empty(), "no diffs should be recorded for rejected artifacts");
+        assert!(
+            s.turns[0].diffs.is_empty(),
+            "no diffs should be recorded for rejected artifacts"
+        );
     }
 }
 

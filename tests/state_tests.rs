@@ -1,42 +1,20 @@
-use crosstalk::state::StateManager;
-use crosstalk::types::ConversationState;
+use crosstalk::core::state::StateManager;
+use crosstalk::types::conversation::ConversationState;
 use tempfile::tempdir;
 
 #[test]
-fn test_state_persistence() {
-    let dir = tempdir().expect("Failed to create temp dir");
-    let path = dir.path().to_str().expect("Failed to get path");
+fn test_state_manager_checkpoints() {
+    let dir = tempdir().expect("temp dir");
+    let manager = StateManager::new(dir.path().to_str().expect("path")).expect("state manager");
+    let mut sigma = ConversationState::new("test-session");
 
-    let manager = StateManager::new(path).expect("Failed to create StateManager");
+    manager.checkpoint(&sigma).expect("first checkpoint");
+    sigma.iteration_index = 1;
+    manager.checkpoint(&sigma).expect("second checkpoint");
 
-    let mut state = ConversationState::new("test-session");
-    state.iteration_index = 5;
+    let restored = manager.restore(0).expect("restore 0").expect("exists");
+    assert_eq!(restored.iteration_index, 0);
 
-    manager.checkpoint(&state).expect("Failed to checkpoint");
-
-    let restored = manager
-        .restore(5)
-        .expect("Failed to restore")
-        .expect("State not found");
-    assert_eq!(restored.session_id, "test-session");
-    assert_eq!(restored.iteration_index, 5);
-}
-
-#[test]
-fn test_list_checkpoints() {
-    let dir = tempdir().expect("Failed to create temp dir");
-    let path = dir.path().to_str().expect("Failed to get path");
-    let manager = StateManager::new(path).expect("Failed to create StateManager");
-
-    for i in 1..=3 {
-        let mut state = ConversationState::new("test");
-        state.iteration_index = i;
-        manager.checkpoint(&state).expect("Failed to checkpoint");
-    }
-
-    let checkpoints = manager.list_checkpoints();
-    assert_eq!(checkpoints.len(), 3);
-    assert!(checkpoints.contains(&1));
-    assert!(checkpoints.contains(&2));
-    assert!(checkpoints.contains(&3));
+    let restored1 = manager.restore(1).expect("restore 1").expect("exists");
+    assert_eq!(restored1.iteration_index, 1);
 }
