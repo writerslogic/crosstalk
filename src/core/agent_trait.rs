@@ -4,7 +4,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 type StreamResult<'a> = Pin<Box<dyn Stream<Item = Result<String, anyhow::Error>> + Send + 'a>>;
-type StreamFuture<'a> = Pin<Box<dyn Future<Output = Result<StreamResult<'a>, anyhow::Error>> + Send + 'a>>;
+type StreamFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<StreamResult<'a>, anyhow::Error>> + Send + 'a>>;
 
 pub trait PromptAgent: Send + Sync {
     fn name(&self) -> &str;

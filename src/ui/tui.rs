@@ -96,85 +96,80 @@ impl CrosstalkUI {
                 && key.kind == KeyEventKind::Press
             {
                 match self.mode {
-                            UIMode::Normal => match key.code {
-                                KeyCode::Char('q') => {
-                                    let _ = self.control_tx.send(ControlSignal::Shutdown).await;
-                                    break;
-                                }
-                                KeyCode::Char('i')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    self.mode = UIMode::Insert;
-                                    let _ = self.control_tx.send(ControlSignal::Pause).await;
-                                }
-                                KeyCode::Char('p') => {
-                                    self.mode = UIMode::Playback;
-                                    self.playback_index = sigma.iteration_index;
-                                }
-                                KeyCode::Char('s')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    let _ = self.capture_to_svg(&sigma);
-                                }
-                                KeyCode::Tab => {
-                                    self.active_pane = match self.active_pane {
-                                        FocusedPane::GhostStream => FocusedPane::Artifacts,
-                                        FocusedPane::Artifacts => FocusedPane::History,
-                                        FocusedPane::History => FocusedPane::GhostStream,
-                                    };
-                                }
-                                _ => {}
-                            },
-                            UIMode::Playback => match key.code {
-                                KeyCode::Esc | KeyCode::Char('q') => {
-                                    self.mode = UIMode::Normal;
-                                }
-                                KeyCode::Left | KeyCode::Char(',') => {
-                                    if self.playback_index > 0 {
-                                        self.playback_index -= 1;
-                                        let _ = self
-                                            .control_tx
-                                            .send(ControlSignal::Rewind(self.playback_index))
-                                            .await;
-                                    }
-                                }
-                                KeyCode::Right | KeyCode::Char('.') => {
-                                    if self.playback_index < sigma.iteration_index {
-                                        self.playback_index += 1;
-                                        let _ = self
-                                            .control_tx
-                                            .send(ControlSignal::Rewind(self.playback_index))
-                                            .await;
-                                    }
-                                }
-                                _ => {}
-                            },
-                            UIMode::Insert => match key.code {
-                                KeyCode::Enter => {
-                                    let content = std::mem::take(&mut self.input_buffer);
-                                    let _ =
-                                        self.control_tx.send(ControlSignal::Inject(content)).await;
-                                    let _ = self.control_tx.send(ControlSignal::Resume).await;
-                                    self.mode = UIMode::Normal;
-                                }
-                                KeyCode::Char(c) => {
-                                    self.input_buffer.push(c);
-                                }
-                                KeyCode::Backspace => {
-                                    self.input_buffer.pop();
-                                }
-                                KeyCode::Esc => {
-                                    self.mode = UIMode::Normal;
-                                    let _ = self.control_tx.send(ControlSignal::Resume).await;
-                                }
-                                _ => {}
-                            },
-                            UIMode::Rewind => {
-                                if key.code == KeyCode::Esc {
-                                    self.mode = UIMode::Normal;
-                                    let _ = self.control_tx.send(ControlSignal::Resume).await;
-                                }
+                    UIMode::Normal => match key.code {
+                        KeyCode::Char('q') => {
+                            let _ = self.control_tx.send(ControlSignal::Shutdown).await;
+                            break;
+                        }
+                        KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            self.mode = UIMode::Insert;
+                            let _ = self.control_tx.send(ControlSignal::Pause).await;
+                        }
+                        KeyCode::Char('p') => {
+                            self.mode = UIMode::Playback;
+                            self.playback_index = sigma.iteration_index;
+                        }
+                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let _ = self.capture_to_svg(&sigma);
+                        }
+                        KeyCode::Tab => {
+                            self.active_pane = match self.active_pane {
+                                FocusedPane::GhostStream => FocusedPane::Artifacts,
+                                FocusedPane::Artifacts => FocusedPane::History,
+                                FocusedPane::History => FocusedPane::GhostStream,
+                            };
+                        }
+                        _ => {}
+                    },
+                    UIMode::Playback => match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            self.mode = UIMode::Normal;
+                        }
+                        KeyCode::Left | KeyCode::Char(',') => {
+                            if self.playback_index > 0 {
+                                self.playback_index -= 1;
+                                let _ = self
+                                    .control_tx
+                                    .send(ControlSignal::Rewind(self.playback_index))
+                                    .await;
                             }
+                        }
+                        KeyCode::Right | KeyCode::Char('.') => {
+                            if self.playback_index < sigma.iteration_index {
+                                self.playback_index += 1;
+                                let _ = self
+                                    .control_tx
+                                    .send(ControlSignal::Rewind(self.playback_index))
+                                    .await;
+                            }
+                        }
+                        _ => {}
+                    },
+                    UIMode::Insert => match key.code {
+                        KeyCode::Enter => {
+                            let content = std::mem::take(&mut self.input_buffer);
+                            let _ = self.control_tx.send(ControlSignal::Inject(content)).await;
+                            let _ = self.control_tx.send(ControlSignal::Resume).await;
+                            self.mode = UIMode::Normal;
+                        }
+                        KeyCode::Char(c) => {
+                            self.input_buffer.push(c);
+                        }
+                        KeyCode::Backspace => {
+                            self.input_buffer.pop();
+                        }
+                        KeyCode::Esc => {
+                            self.mode = UIMode::Normal;
+                            let _ = self.control_tx.send(ControlSignal::Resume).await;
+                        }
+                        _ => {}
+                    },
+                    UIMode::Rewind => {
+                        if key.code == KeyCode::Esc {
+                            self.mode = UIMode::Normal;
+                            let _ = self.control_tx.send(ControlSignal::Resume).await;
+                        }
+                    }
                 }
             }
         }

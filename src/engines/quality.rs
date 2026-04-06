@@ -132,7 +132,8 @@ impl QualityEngine {
             for line in artifact.content.lines() {
                 if line.trim().starts_with("use ") || line.trim().starts_with("mod ") {
                     for other_name in artifacts.keys() {
-                        if name != other_name && line.contains(other_name.trim_end_matches(".rs"))
+                        if name != other_name
+                            && line.contains(other_name.trim_end_matches(".rs"))
                             && let Some(&other_idx) = nodes.get(other_name)
                         {
                             graph.add_edge(idx, other_idx, ());
