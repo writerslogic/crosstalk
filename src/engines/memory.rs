@@ -71,6 +71,18 @@ fn normalize_vector(vec: &[f32]) -> Vec<f32> {
     }
 }
 
+fn outcome_weight(outcome: &TurnOutcome) -> f64 {
+    match outcome {
+        TurnOutcome::TestsPassed => 2.0,
+        TurnOutcome::Compiled => 1.5,
+        TurnOutcome::AdvancedConvergence => 1.8,
+        TurnOutcome::RolledBack => 0.3,
+        TurnOutcome::Rejected => 0.2,
+        TurnOutcome::Stalled => 0.5,
+        TurnOutcome::Unknown => 1.0,
+    }
+}
+
 pub struct MemoryStore {
     uri: String,
     conn: Option<Connection>,
@@ -289,6 +301,47 @@ impl MemoryStore {
         scored_records.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let results: Vec<(MemoryRecord, f32)> = scored_records.into_iter().take(k).collect();
         Ok(results)
+    }
+
+    pub async fn query_weighted(
+        &self,
+        table_name: &str,
+        query_text: &str,
+        top_k: usize,
+    ) -> Result<Vec<(MemoryRecord, f64)>> {
+        let query_embedding = embed_text(query_text);
+        let scored_records = self
+            .query_nearest(table_name, query_embedding.clone(), top_k * 2)
+            .await?;
+
+        let mut weighted_results = Vec::new();
+        for (record, similarity) in scored_records {
+            let weight = record
+                .outcome
+                .as_ref()
+                .map(|o| {
+                    if o.tests_passed {
+                        outcome_weight(&TurnOutcome::TestsPassed)
+                    } else if o.compiled {
+                        outcome_weight(&TurnOutcome::Compiled)
+                    } else if o.was_rolled_back {
+                        outcome_weight(&TurnOutcome::RolledBack)
+                    } else {
+                        outcome_weight(&TurnOutcome::Unknown)
+                    }
+                })
+                .unwrap_or_else(|| outcome_weight(&TurnOutcome::Unknown));
+
+            let weighted_score = (similarity as f64) * weight;
+            weighted_results.push((record, weighted_score));
+        }
+
+        weighted_results.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        Ok(weighted_results.into_iter().take(top_k).collect())
     }
 }
 
