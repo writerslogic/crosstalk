@@ -78,6 +78,8 @@ fn test_detect_regression() {
             task_category: Some(TaskCategory::CodeGeneration),
             structure: None,
             signature: vec![],
+
+            surprise_signal: None,
         };
         recent_turns.push(turn);
     }
@@ -123,6 +125,8 @@ fn test_no_regression_when_above_threshold() {
             task_category: Some(TaskCategory::CodeGeneration),
             structure: None,
             signature: vec![],
+
+            surprise_signal: None,
         };
         recent_turns.push(turn);
     }

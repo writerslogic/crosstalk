@@ -271,6 +271,8 @@ fn test_update_profile_with_latency() {
         task_category: Some(TaskCategory::CodeGeneration),
         structure: None,
         signature: vec![],
+
+        surprise_signal: None,
     };
 
     let quality_score = QualityScorer::score(&turn, &ConversationState::new("test"));

@@ -26,13 +26,15 @@ fn test_hash_chain_10_consecutive() {
             task_category: None,
             structure: None,
             signature: vec![],
+
+            surprise_signal: None,
         });
 
         let prev_hash = hashes[i];
         let current_hash = HashChain::compute(&state, &prev_hash).expect("Hash computation failed");
 
         // Verify the hash is valid
-        assert!(HashChain::verify(&state, &prev_hash, &current_hash));
+        assert!(HashChain::verify(&state, &prev_hash, &current_hash).expect("verify failed"));
 
         // Verify each hash differs from the previous one
         assert_ne!(
@@ -75,17 +77,19 @@ fn test_hash_chain_genesis() {
         task_category: None,
         structure: None,
         signature: vec![],
+
+        surprise_signal: None,
     });
 
     let genesis_prev_hash = [0u8; 32];
     let genesis_hash = HashChain::compute(&state, &genesis_prev_hash).expect("Hash computation failed");
 
     // Verify the genesis hash was computed with [0u8; 32]
-    assert!(HashChain::verify(&state, &genesis_prev_hash, &genesis_hash));
+    assert!(HashChain::verify(&state, &genesis_prev_hash, &genesis_hash).expect("verify failed"));
 
     // Verify it would fail with a different previous hash
     let wrong_hash = [1u8; 32];
-    assert!(!HashChain::verify(&state, &wrong_hash, &genesis_hash));
+    assert!(!HashChain::verify(&state, &wrong_hash, &genesis_hash).expect("verify failed"));
 }
 
 /// Test 3: Create two nearly identical artifact contents (>95% cosine similarity)
@@ -177,6 +181,8 @@ fn test_invariant_checker_monotonic_indices() {
             task_category: None,
             structure: None,
             signature: vec![],
+
+            surprise_signal: None,
         });
     }
 
@@ -206,6 +212,8 @@ fn test_invariant_checker_detects_orphan() {
         task_category: None,
         structure: None,
         signature: vec![],
+
+        surprise_signal: None,
     });
 
     let result = InvariantChecker::check_all(&state);
@@ -296,6 +304,8 @@ fn test_violation_rollback() {
         task_category: None,
         structure: None,
         signature: vec![],
+
+        surprise_signal: None,
     });
 
     // Verify initial state is valid
@@ -317,6 +327,8 @@ fn test_violation_rollback() {
         task_category: None,
         structure: None,
         signature: vec![],
+
+        surprise_signal: None,
     });
 
     // Verify invalid state fails

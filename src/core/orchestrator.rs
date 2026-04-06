@@ -7,7 +7,10 @@ use crate::engines::consensus::{
     CertaintyAnalyzer, InfluenceWeightManager, KalmanConvergence, NashSolver,
 };
 use crate::engines::diff::DiffEngine;
-use crate::engines::intelligence::{IntelligenceEngine, QualityScorer};
+use crate::engines::intelligence::{
+    IntelligenceEngine, PromptComposer, QualityScorer, RegressionFeedbackHandler,
+};
+use crate::types::intelligence::PromptTemplate;
 use crate::engines::linter::LinterGuard;
 use crate::engines::memory::MemoryStore;
 use crate::engines::planning::PlanningEngine;
@@ -16,6 +19,7 @@ use crate::engines::quality::{QualityEngine, RegressionDetector};
 use crate::engines::reasoning::{FallacyDetector, ReasoningEngine};
 use crate::engines::release::ConvergenceReport;
 use crate::engines::sandbox::{SandboxManager, SandboxResult};
+use crate::engines::surprise::SurpriseEngine;
 use crate::engines::security::{SecretScanner, TurnSigner};
 use crate::engines::self_improvement::SelfImprovementEngine;
 use crate::engines::simulation::MonteCarloRunner;
@@ -37,7 +41,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::sync::mpsc;
 
 pub struct Orchestrator {
@@ -62,6 +66,8 @@ pub struct Orchestrator {
     pub viz: Mutex<GodView>,
     pub auditor_tx: Option<mpsc::Sender<ConversationState>>,
     pub audit_rx: Mutex<mpsc::Receiver<AuditAlert>>,
+    pub surprise_engine: Mutex<SurpriseEngine>,
+    pub template_cache: Arc<RwLock<HashMap<String, PromptTemplate>>>,
 }
 
 impl Orchestrator {
@@ -110,6 +116,36 @@ impl Orchestrator {
             viz: Mutex::new(GodView::new()),
             auditor_tx,
             audit_rx: Mutex::new(alert_rx),
+            surprise_engine: Mutex::new(SurpriseEngine::new()),
+            template_cache: Arc::new(RwLock::new({
+                let mut m = HashMap::new();
+                m.insert(
+                    "base".to_string(),
+                    PromptTemplate {
+                        id: "base".to_string(),
+                        version: 1,
+                        template_text: "Analyze and improve the codebase collaboratively."
+                            .to_string(),
+                        task_category: TaskCategory::CodeGeneration,
+                        variables: vec!["context".to_string()],
+                        performance_history: vec![],
+                    },
+                );
+                m.insert(
+                    "corrective".to_string(),
+                    PromptTemplate {
+                        id: "corrective".to_string(),
+                        version: 1,
+                        template_text:
+                            "Quality regression detected. Prioritize correctness."
+                                .to_string(),
+                        task_category: TaskCategory::CodeGeneration,
+                        variables: vec!["baseline".to_string(), "recent".to_string()],
+                        performance_history: vec![],
+                    },
+                );
+                m
+            })),
         }
     }
 
@@ -389,16 +425,20 @@ impl Orchestrator {
             let volatility = 0.1;
             let certainty = CertaintyAnalyzer::compute(&response, volatility);
 
-            let actual_success = match turn_outcome {
-                TurnOutcome::Compiled | TurnOutcome::TestsPassed => 1.0,
-                _ => 0.0,
+            let surprise = {
+                let mut se = self.surprise_engine.lock().await;
+                se.record_prediction(&agent_id, certainty);
+                let s = se.compute_surprise(&agent_id, turn_outcome);
+                if s > 0.5 {
+                    let _ = self.event_tx.send(StreamEvent::TokenReceived(format!(
+                        "[sandbox] High Surprise detected: {:.2}", s
+                    ))).await;
+                }
+                let current_w = sigma.agent_weights.get(&agent_id).copied().unwrap_or(1.0);
+                let new_w = se.calibrate_weight(&agent_id, current_w);
+                sigma.agent_weights.insert(agent_id.clone(), new_w);
+                s
             };
-            let surprise = (actual_success - certainty).abs();
-            if surprise > 0.5 {
-                let _ = self.event_tx.send(StreamEvent::TokenReceived(format!(
-                    "[sandbox] High Surprise detected: {:.2}", surprise
-                ))).await;
-            }
 
             let mut turn = Turn {
                 index: sigma.iteration_index,
@@ -414,6 +454,7 @@ impl Orchestrator {
                     &agent_id,
                 )),
                 signature: vec![],
+                surprise_signal: Some(surprise),
             };
 
             let serialized = serde_json::to_vec(&turn)?;

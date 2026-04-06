@@ -17,4 +17,5 @@ pub mod self_improvement;
 pub mod simulation;
 pub mod swarm;
 pub mod validation;
+pub mod surprise;
 pub mod verification;

@@ -66,6 +66,8 @@ async fn main() -> anyhow::Result<()> {
             task_category: Some(TaskCategory::Research),
             structure: Some(TurnStructure::FreeForm),
             signature: vec![],
+
+            surprise_signal: None,
         });
     }
 

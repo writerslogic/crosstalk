@@ -96,7 +96,7 @@ async fn test_monte_carlo_trials() {
         diff_text: String::new(),
     };
 
-    let probability = runner
+    let (probability, _variance) = runner
         .predict(&artifact, &diff, 100)
         .await
         .expect("predict failed");
@@ -104,8 +104,7 @@ async fn test_monte_carlo_trials() {
     // Probability should be between 0.0 and 1.0
     assert!(
         probability >= 0.0 && probability <= 1.0,
-        "Probability {} should be in [0.0, 1.0]",
-        probability
+        "Probability {probability} should be in [0.0, 1.0]"
     );
 }
 
@@ -132,23 +131,17 @@ async fn test_monte_carlo_variance() {
     };
 
     // Run prediction twice with same config
-    let result1 = runner
+    let (result1, _) = runner
         .predict(&artifact, &diff, 100)
         .await
         .expect("predict failed");
-    let result2 = runner
+    let (result2, _) = runner
         .predict(&artifact, &diff, 100)
         .await
         .expect("predict failed");
 
-    // Both should be valid probabilities
     assert!(result1 >= 0.0 && result1 <= 1.0);
     assert!(result2 >= 0.0 && result2 <= 1.0);
-
-    // Results should be stochastic (likely different, but allow for small chance of equality)
-    // With 100 trials and 95% success rate, probability of getting exact same result twice is low
-    // However, due to randomness, we accept both identical and different results
-    // The key is that they're both valid probabilities
     assert!(result1.is_finite(), "result1 should be finite");
     assert!(result2.is_finite(), "result2 should be finite");
 }

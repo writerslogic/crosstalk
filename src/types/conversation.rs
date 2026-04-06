@@ -50,6 +50,8 @@ pub struct Turn {
     pub structure: Option<TurnStructure>,
     #[serde(default)]
     pub signature: Vec<u8>,
+    #[serde(default)]
+    pub surprise_signal: Option<f64>,
 }
 
 fn default_outcome() -> TurnOutcome {

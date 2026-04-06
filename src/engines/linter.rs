@@ -96,10 +96,18 @@ impl LinterGuard {
             return Ok(ArtifactLintReport { diagnostics: diags, passed, skipped: false });
         }
 
-        // Write to a temp file and invoke rustc --edition 2021 --emit=metadata
+        const MAX_ARTIFACT_BYTES: usize = 512 * 1024;
+        if artifact.content.len() > MAX_ARTIFACT_BYTES {
+            return Err(anyhow!("Artifact too large to lint ({} bytes)", artifact.content.len()));
+        }
+
+        let uid = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
         let dir = std::env::temp_dir().join("crosstalk-linter");
         tokio::fs::create_dir_all(&dir).await?;
-        let src = dir.join("artifact_check.rs");
+        let src = dir.join(format!("artifact_{uid}.rs"));
         tokio::fs::write(&src, &artifact.content).await?;
 
         let rustc = Command::new("rustc")
@@ -109,7 +117,7 @@ impl LinterGuard {
                 "--emit=metadata",
                 "--error-format=json",
                 "-A",
-                "unused",        // don't block on unused in snippets
+                "unused",
                 src.to_str().unwrap_or("artifact_check.rs"),
             ])
             .stdout(Stdio::piped())

@@ -18,6 +18,8 @@ fn test_turn_serialization() {
         task_category: None,
         structure: None,
         signature: vec![],
+
+        surprise_signal: None,
     };
 
     let serialized = serde_json::to_string(&turn).unwrap();
@@ -40,6 +42,8 @@ fn test_conversation_state_serialization() {
         task_category: None,
         structure: None,
         signature: vec![],
+
+        surprise_signal: None,
     });
 
     let serialized = serde_json::to_string(&state).unwrap();

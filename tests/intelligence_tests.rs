@@ -29,6 +29,8 @@ fn make_turn(
         task_category: category,
         structure: None,
         signature: vec![],
+
+        surprise_signal: None,
     }
 }
 

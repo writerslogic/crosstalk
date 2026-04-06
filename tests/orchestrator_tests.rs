@@ -1,6 +1,7 @@
 use crosstalk::core::agent_trait::PromptAgent;
 use crosstalk::core::orchestrator::Orchestrator;
 use crosstalk::core::state::StateManager;
+use crosstalk::engines::surprise::SurpriseEngine;
 use crosstalk::engines::verification::HashChain;
 use crosstalk::types::conversation::{ConversationState, Turn, TurnOutcome};
 use crosstalk::types::events::{ControlSignal, StreamEvent};
@@ -250,6 +251,8 @@ async fn test_audit_alert_on_hash_mismatch() {
         task_category: None,
         structure: None,
         signature: vec![],
+
+        surprise_signal: None,
     });
     // Correct hash from zero prev
     state.state_hash = HashChain::compute(&state, &[0u8; 32]).expect("hash");
@@ -313,4 +316,128 @@ async fn test_audit_rx_nonblocking_after_turn() {
     // After a turn with a valid hash chain, audit_rx should still be empty
     let mut rx = omicron.audit_rx.lock().await;
     assert!(rx.try_recv().is_err(), "no spurious audit alerts on valid turn");
+}
+
+// ── SurpriseEngine unit tests ──────────────────────────────────────────────
+
+#[test]
+fn test_surprise_engine_record_and_compute_high_surprise() {
+    let mut se = SurpriseEngine::new();
+    se.record_prediction("model-a", 0.9);
+    let surprise = se.compute_surprise("model-a", TurnOutcome::Unknown);
+    // predicted 0.9, actual 0.0 → surprise ≈ 0.9
+    assert!((surprise - 0.9).abs() < 1e-9);
+}
+
+#[test]
+fn test_surprise_engine_low_surprise_on_correct_prediction() {
+    let mut se = SurpriseEngine::new();
+    se.record_prediction("model-b", 0.95);
+    let surprise = se.compute_surprise("model-b", TurnOutcome::Compiled);
+    // predicted 0.95, actual 1.0 → surprise = 0.05
+    assert!((surprise - 0.05).abs() < 1e-9);
+}
+
+#[test]
+fn test_surprise_engine_no_prior_prediction_defaults_to_half() {
+    let mut se = SurpriseEngine::new();
+    let surprise = se.compute_surprise("model-c", TurnOutcome::Compiled);
+    // no prediction → default 0.5, actual 1.0 → surprise = 0.5
+    assert!((surprise - 0.5).abs() < 1e-9);
+}
+
+#[test]
+fn test_surprise_history_accumulates() {
+    let mut se = SurpriseEngine::new();
+    se.record_prediction("m", 0.8);
+    se.compute_surprise("m", TurnOutcome::Unknown);
+    se.record_prediction("m", 0.2);
+    se.compute_surprise("m", TurnOutcome::Compiled);
+    assert_eq!(se.surprise_history("m").len(), 2);
+}
+
+#[test]
+fn test_calibrate_weight_decreases_after_3_high_surprises() {
+    let mut se = SurpriseEngine::new();
+    for _ in 0..3 {
+        se.record_prediction("m", 0.9);
+        se.compute_surprise("m", TurnOutcome::Unknown); // surprise = 0.9 each time
+    }
+    let new_w = se.calibrate_weight("m", 1.0);
+    assert!((new_w - 0.8).abs() < 1e-9, "weight should drop to 0.8, got {new_w}");
+}
+
+#[test]
+fn test_calibrate_weight_increases_after_5_low_surprises() {
+    let mut se = SurpriseEngine::new();
+    for _ in 0..5 {
+        se.record_prediction("m", 0.95);
+        se.compute_surprise("m", TurnOutcome::TestsPassed); // surprise = 0.05 < 0.1
+    }
+    let new_w = se.calibrate_weight("m", 1.0);
+    assert!((new_w - 1.1).abs() < 1e-9, "weight should rise to 1.1, got {new_w}");
+}
+
+#[test]
+fn test_calibrate_weight_clamped_at_lower_bound() {
+    let mut se = SurpriseEngine::new();
+    for _ in 0..3 {
+        se.record_prediction("m", 0.9);
+        se.compute_surprise("m", TurnOutcome::Unknown);
+    }
+    let new_w = se.calibrate_weight("m", 0.5); // already at lower bound
+    assert!(new_w >= 0.5, "weight must not drop below 0.5");
+}
+
+#[test]
+fn test_calibrate_weight_clamped_at_upper_bound() {
+    let mut se = SurpriseEngine::new();
+    for _ in 0..5 {
+        se.record_prediction("m", 0.95);
+        se.compute_surprise("m", TurnOutcome::TestsPassed);
+    }
+    let new_w = se.calibrate_weight("m", 2.0); // already at upper bound
+    assert!(new_w <= 2.0, "weight must not exceed 2.0");
+}
+
+#[test]
+fn test_surprise_signal_stored_in_turn_after_run() {
+    // SurpriseEngine.compute_surprise returns a value in [0.0, 1.0]
+    let mut se = SurpriseEngine::new();
+    se.record_prediction("m", 0.7);
+    let s = se.compute_surprise("m", TurnOutcome::Compiled);
+    assert!(s >= 0.0 && s <= 1.0);
+}
+
+#[tokio::test]
+async fn test_orchestrator_surprise_engine_accessible() {
+    let dir = tempdir().expect("temp dir");
+    let manager = StateManager::new(dir.path().to_str().expect("path")).expect("state manager");
+    let agent: Box<dyn PromptAgent> = Box::new(MockAgent {
+        name: "MockModel".to_string(),
+        response: "Hello world".to_string(),
+    });
+    let omicron = make_orchestrator(manager, vec![agent]);
+    let se = omicron.surprise_engine.lock().await;
+    // No turns yet — history should be empty for any model
+    assert!(se.surprise_history("MockModel").is_empty());
+}
+
+#[tokio::test]
+async fn test_orchestrator_records_surprise_after_turn() {
+    let dir = tempdir().expect("temp dir");
+    let manager = StateManager::new(dir.path().to_str().expect("path")).expect("state manager");
+    let agent: Box<dyn PromptAgent> = Box::new(MockAgent {
+        name: "SurpModel".to_string(),
+        response: "Some response without code".to_string(),
+    });
+    let omicron = make_orchestrator(manager, vec![agent]);
+    let sigma = make_sigma("surp-session");
+
+    omicron.run_turn(sigma.clone()).await.expect("turn failed");
+
+    let se = omicron.surprise_engine.lock().await;
+    assert_eq!(se.surprise_history("SurpModel").len(), 1);
+    let surprise = se.surprise_history("SurpModel")[0];
+    assert!(surprise >= 0.0 && surprise <= 1.0);
 }
