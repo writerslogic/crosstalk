@@ -1,8 +1,8 @@
 use crosstalk::engines::proof::ProofManager;
+use crosstalk::engines::quality::ArtifactMetrics;
 use crosstalk::engines::verification::{HashChain, InvariantChecker, TautologyFilter};
 use crosstalk::types::artifact::{Artifact, ArtifactDiff, ProofAttachment};
 use crosstalk::types::conversation::{ConversationState, Turn, TurnOutcome};
-use crosstalk::engines::quality::ArtifactMetrics;
 use std::collections::HashMap;
 
 /// Test 1: Create 10 ConversationState snapshots and verify hash chain integrity
@@ -35,7 +35,11 @@ fn test_hash_chain_10_consecutive() {
         assert!(HashChain::verify(&state, &prev_hash, &current_hash));
 
         // Verify each hash differs from the previous one
-        assert_ne!(current_hash, prev_hash, "Hash at iteration {} must differ from previous", i);
+        assert_ne!(
+            current_hash, prev_hash,
+            "Hash at iteration {} must differ from previous",
+            i
+        );
 
         hashes.push(current_hash);
     }
@@ -46,7 +50,11 @@ fn test_hash_chain_10_consecutive() {
     // Verify all hashes are unique
     for i in 0..hashes.len() {
         for j in i + 1..hashes.len() {
-            assert_ne!(hashes[i], hashes[j], "Hash {} and {} should be unique", i, j);
+            assert_ne!(
+                hashes[i], hashes[j],
+                "Hash {} and {} should be unique",
+                i, j
+            );
         }
     }
 }
@@ -84,8 +92,10 @@ fn test_hash_chain_genesis() {
 /// and verify is_tautological() returns true
 #[test]
 fn test_tautology_filter_detects_repetition() {
-    let base_content = "This is a very important function that does something critical and important";
-    let similar_content = "This is a very important function that does something critical and important";
+    let base_content =
+        "This is a very important function that does something critical and important";
+    let similar_content =
+        "This is a very important function that does something critical and important";
 
     let history = vec![base_content.to_string()];
 
@@ -129,8 +139,10 @@ fn test_tautology_filter_allows_novel() {
     );
 
     // Test with completely different topics
-    let history = vec!["The sun rises in the east".to_string(),
-                       "Cats are independent animals".to_string()];
+    let history = vec![
+        "The sun rises in the east".to_string(),
+        "Cats are independent animals".to_string(),
+    ];
     let novel = "Programming requires abstract thinking skills";
 
     assert!(
@@ -232,10 +244,7 @@ fn test_proof_attachment_round_trip() {
     };
 
     // Generate proof attachment
-    let properties = vec![
-        "returns_non_zero".to_string(),
-        "pure_function".to_string(),
-    ];
+    let properties = vec!["returns_non_zero".to_string(), "pure_function".to_string()];
     let proof = ProofManager::generate_proof(&artifact, properties.clone());
 
     // Store original hash
@@ -327,7 +336,8 @@ fn test_violation_rollback() {
 
     // Verify state matches original valid state
     assert_eq!(
-        invalid_state.turns.len(), valid_state.turns.len(),
+        invalid_state.turns.len(),
+        valid_state.turns.len(),
         "Rollback should restore original turn count"
     );
     assert_eq!(
