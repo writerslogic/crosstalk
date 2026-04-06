@@ -513,10 +513,10 @@ fn self_code_modifier_rejects_protected_file() {
 
 #[test]
 fn self_code_modifier_applies_known_pattern() {
-    let content = "let v = items.collect::<Vec<_>>().iter().count();";
+    let content = r#"let x = foo().unwrap_or_else(|_| panic!());"#;
     let result = SelfCodeModifier::propose_improvement("src/utils.rs", content).unwrap();
-    assert!(result.contains(".iter().count()"));
-    assert!(!result.contains("collect::<Vec<_>>()"));
+    assert!(result.contains(".unwrap()"));
+    assert!(!result.contains("unwrap_or_else(|_| panic!())"));
 }
 
 #[test]
