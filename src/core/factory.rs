@@ -149,13 +149,11 @@ impl ModelFactory {
                     break;
                 }
             }
-            if !found {
-                if env::var("OPENROUTER_API_KEY").is_err() {
-                    return Err(anyhow!(
-                        "Environment Variable OPENROUTER_API_KEY is not set for unknown model {}",
-                        m
-                    ));
-                }
+            if !found && env::var("OPENROUTER_API_KEY").is_err() {
+                return Err(anyhow!(
+                    "Environment Variable OPENROUTER_API_KEY is not set for unknown model {}",
+                    m
+                ));
             }
         }
 
@@ -167,7 +165,7 @@ impl ModelFactory {
             "SEMANTIC_SCHOLAR_API_KEY",
         ];
         for key in tool_keys {
-            if let Ok(_) = env::var(key) {
+            if env::var(key).is_ok() {
                 println!("[factory] Tool key recognized: {}", key);
             }
         }

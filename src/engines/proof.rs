@@ -30,7 +30,7 @@ impl ProofManager {
     #[must_use]
     pub fn to_lean4(attachment: &ProofAttachment) -> String {
         let props = attachment.proven_properties.join(", ");
-        let safe_name = attachment.artifact_name.replace('.', "_").replace('-', "_");
+        let safe_name = attachment.artifact_name.replace(['.', '-'], "_");
         format!(
             "-- Proof for {}\ntheorem artifact_{}_integrity : True := by\n  -- Verified properties: {}\n  -- Proof Hash: {}\n  trivial\n",
             attachment.artifact_name, safe_name, props, attachment.proof_hash

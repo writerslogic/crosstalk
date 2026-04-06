@@ -48,12 +48,11 @@ impl AstValidator {
             if matches!(
                 kind,
                 "function_item" | "struct_item" | "impl_item" | "enum_item"
-            ) {
-                if let Some(name) = Self::get_node_name(child, content) {
-                    let id = format!("{}:{}", kind, name);
-                    if let Ok(text) = child.utf8_text(content.as_bytes()) {
-                        nodes.insert(id, text.to_string());
-                    }
+            ) && let Some(name) = Self::get_node_name(child, content)
+            {
+                let id = format!("{}:{}", kind, name);
+                if let Ok(text) = child.utf8_text(content.as_bytes()) {
+                    nodes.insert(id, text.to_string());
                 }
             }
         }
@@ -84,10 +83,9 @@ impl AstValidator {
                     if let Some(body) = child.child_by_field_name("body") {
                         let start = child.start_byte();
                         let end = body.start_byte();
-                        if let Ok(sig) = std::str::from_utf8(&content.as_bytes()[start..end]) {
-                            skeleton.push_str(sig.trim_end());
-                            skeleton.push_str(" { ... }\n");
-                        }
+                        let sig = &content[start..end];
+                        skeleton.push_str(sig.trim_end());
+                        skeleton.push_str(" { ... }\n");
                     }
                 }
                 "struct_item" | "enum_item" | "trait_item" => {
@@ -103,29 +101,25 @@ impl AstValidator {
                     if let Some(body) = child.child_by_field_name("body") {
                         let start = child.start_byte();
                         let end = body.start_byte();
-                        if let Ok(header) = std::str::from_utf8(&content.as_bytes()[start..end]) {
-                            impl_text.push_str(header.trim_end());
-                            impl_text.push_str(" {\n");
+                        let header = &content[start..end];
+                        impl_text.push_str(header.trim_end());
+                        impl_text.push_str(" {\n");
 
-                            // Extract signatures of methods inside the impl
-                            let mut inner_cursor = body.walk();
-                            for method in body.children(&mut inner_cursor) {
-                                if method.kind() == "function_item" {
-                                    if let Some(m_body) = method.child_by_field_name("body") {
-                                        let m_start = method.start_byte();
-                                        let m_end = m_body.start_byte();
-                                        if let Ok(m_sig) =
-                                            std::str::from_utf8(&content.as_bytes()[m_start..m_end])
-                                        {
-                                            impl_text.push_str("    ");
-                                            impl_text.push_str(m_sig.trim_end());
-                                            impl_text.push_str(" { ... }\n");
-                                        }
-                                    }
-                                }
+                        // Extract signatures of methods inside the impl
+                        let mut inner_cursor = body.walk();
+                        for method in body.children(&mut inner_cursor) {
+                            if method.kind() == "function_item"
+                                && let Some(m_body) = method.child_by_field_name("body")
+                            {
+                                let m_start = method.start_byte();
+                                let m_end = m_body.start_byte();
+                                let m_sig = &content[m_start..m_end];
+                                impl_text.push_str("    ");
+                                impl_text.push_str(m_sig.trim_end());
+                                impl_text.push_str(" { ... }\n");
                             }
-                            impl_text.push_str("}\n");
                         }
+                        impl_text.push_str("}\n");
                     }
                     skeleton.push_str(&impl_text);
                 }

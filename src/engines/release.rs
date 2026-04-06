@@ -7,7 +7,6 @@ use std::io;
 pub struct ReleaseManager;
 
 impl ReleaseManager {
-    #[must_use]
     pub fn run_stability_audit(sigma: &ConversationState) -> Result<()> {
         println!(
             "Starting stability audit for session {}...",
@@ -15,7 +14,7 @@ impl ReleaseManager {
         );
 
         // Verify CPOP hash chain integrity as a stability check
-        if !CpopVerifier::verify_history(&[sigma.clone()]) {
+        if !CpopVerifier::verify_history(std::slice::from_ref(sigma)) {
             return Err(anyhow!(
                 "Stability audit failed: Hash chain integrity compromised"
             ));

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+#[derive(Default)]
 pub struct IntelligenceEngine {
     pub profiles: HashMap<String, ModelProfile>,
     pub templates: Vec<PromptTemplate>,
@@ -15,11 +16,7 @@ pub struct IntelligenceEngine {
 impl IntelligenceEngine {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            profiles: HashMap::new(),
-            templates: vec![],
-            storage_path: None,
-        }
+        Self::default()
     }
 
     pub fn with_storage(path: &str) -> Self {
@@ -30,16 +27,16 @@ impl IntelligenceEngine {
     }
 
     pub fn load_profiles(&mut self) -> Result<()> {
-        if let Some(path) = &self.storage_path {
-            if Path::new(path).exists() {
-                let content = fs::read_to_string(path)?;
-                let data: serde_json::Value = serde_json::from_str(&content)?;
-                if let Some(profiles) = data.get("profiles") {
-                    self.profiles = serde_json::from_value(profiles.clone())?;
-                }
-                if let Some(templates) = data.get("templates") {
-                    self.templates = serde_json::from_value(templates.clone())?;
-                }
+        if let Some(path) = &self.storage_path
+            && Path::new(path).exists()
+        {
+            let content = fs::read_to_string(path)?;
+            let data: serde_json::Value = serde_json::from_str(&content)?;
+            if let Some(profiles) = data.get("profiles") {
+                self.profiles = serde_json::from_value(profiles.clone())?;
+            }
+            if let Some(templates) = data.get("templates") {
+                self.templates = serde_json::from_value(templates.clone())?;
             }
         }
         Ok(())

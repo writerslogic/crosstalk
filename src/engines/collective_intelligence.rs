@@ -4,6 +4,7 @@ use crate::types::memory::TransferableLesson;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+#[derive(Default)]
 pub struct CollectiveIntelligenceEngine {
     pub profiles: HashMap<String, AgentProfile>,
 }
@@ -11,9 +12,7 @@ pub struct CollectiveIntelligenceEngine {
 impl CollectiveIntelligenceEngine {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            profiles: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn update_specialization(&mut self, turn: &Turn) {

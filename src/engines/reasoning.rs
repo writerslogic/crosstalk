@@ -81,7 +81,7 @@ impl FallacyDetector {
 
     fn detect_circular_reasoning(content: &str) -> Option<FallacyReport> {
         let sentences: Vec<&str> = content
-            .split(|c| c == '.' || c == '?' || c == '!' || c == '\n')
+            .split(['.', '?', '!', '\n'])
             .map(|s| s.trim())
             .filter(|s| s.len() > 15)
             .collect();
@@ -201,10 +201,10 @@ impl SynthesisEngine {
             let base_val = base_blocks.get(&key);
             let mut changes = vec![];
             for blocks in &version_blocks_list {
-                if let Some(v_val) = blocks.get(&key) {
-                    if Some(v_val) != base_val {
-                        changes.push(v_val);
-                    }
+                if let Some(v_val) = blocks.get(&key)
+                    && Some(v_val) != base_val
+                {
+                    changes.push(v_val);
                 }
             }
 

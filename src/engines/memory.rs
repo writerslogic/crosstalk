@@ -202,8 +202,8 @@ impl MemoryStore {
                     .downcast_ref::<arrow_array::Float32Array>()
                     .ok_or_else(|| anyhow!("Vector value cast failed"))?;
                 let mut embedding = vec![0.0; vec_f32.len()];
-                for j in 0..vec_f32.len() {
-                    embedding[j] = vec_f32.value(j);
+                for (j, val) in embedding.iter_mut().enumerate() {
+                    *val = vec_f32.value(j);
                 }
 
                 records.push(MemoryRecord {

@@ -324,15 +324,14 @@ impl Orchestrator {
                         .artifacts
                         .get(&name)
                         .and_then(|a| a.ast_versions.get(&node_id))
+                        && history.len() >= 3
                     {
-                        if history.len() >= 3 {
-                            let v1 = &history[history.len() - 1].1;
-                            let v2 = &history[history.len() - 2].1;
-                            let v3 = &history[history.len() - 3].1;
-                            if v1 == v3 && v1 != v2 {
-                                let matrix = [[(0.8, 0.2), (0.1, 0.1)], [(0.1, 0.1), (0.2, 0.8)]];
-                                let _eq = NashSolver::solve_2x2_pure(&matrix);
-                            }
+                        let v1 = &history[history.len() - 1].1;
+                        let v2 = &history[history.len() - 2].1;
+                        let v3 = &history[history.len() - 3].1;
+                        if v1 == v3 && v1 != v2 {
+                            let matrix = [[(0.8, 0.2), (0.1, 0.1)], [(0.1, 0.1), (0.2, 0.8)]];
+                            let _eq = NashSolver::solve_2x2_pure(&matrix);
                         }
                     }
 
@@ -492,7 +491,7 @@ impl Orchestrator {
                 p.push_str("\nMost Recent Δα:\n");
                 p.push_str(&last_diff.diff_text);
             }
-            p.push_str("\n");
+            p.push('\n');
         }
         p.push_str("\nRecent History (Last 5 turns):\n");
         for t in sigma.turns.iter().rev().take(5).rev() {

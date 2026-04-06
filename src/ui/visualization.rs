@@ -1,6 +1,7 @@
 use crate::types::conversation::ConversationState;
 use anyhow::Result;
 
+#[derive(Default)]
 pub struct GodView {
     // wgpu handles would go here
     pub frame_count: u64,
@@ -8,7 +9,7 @@ pub struct GodView {
 
 impl GodView {
     pub fn new() -> Self {
-        Self { frame_count: 0 }
+        Self::default()
     }
 
     pub async fn render_frame(&mut self, _sigma: &ConversationState) -> Result<()> {
@@ -38,13 +39,19 @@ pub struct Edge {
     pub strength: f32,
 }
 
-impl ForceDirectedGraph {
-    pub fn new() -> Self {
+impl Default for ForceDirectedGraph {
+    fn default() -> Self {
         Self {
             nodes: vec![],
             edges: vec![],
             k: 10.0,
         }
+    }
+}
+
+impl ForceDirectedGraph {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn compute_layout_step(&mut self) {
@@ -101,7 +108,7 @@ impl LatentMapper {
         let mut out = [0.0; 3];
         let sqrt3 = 3.0f32.sqrt();
 
-        for j in 0..3 {
+        for (j, out_elem) in out.iter_mut().enumerate() {
             let mut sum = 0.0;
             for (i, &val) in embedding.iter().enumerate() {
                 // Deterministic pseudo-random number based on (i, j)
@@ -114,7 +121,7 @@ impl LatentMapper {
                 sum += val * r;
             }
             // Projection: x' = 1/sqrt(k) * x * R, k = 3
-            out[j] = sum / sqrt3;
+            *out_elem = sum / sqrt3;
         }
         out
     }

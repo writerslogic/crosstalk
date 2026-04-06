@@ -93,12 +93,11 @@ impl ContextPruner {
             if count >= 5 {
                 break;
             }
-            if let Some(ref root) = sigma.goal_tree.root {
-                if let Some(node) = Self::find_node(root, &goal.id) {
-                    if let Some(turn_idx) = node.assigned_turn {
-                        critical_turn_indices.insert(turn_idx);
-                    }
-                }
+            if let Some(ref root) = sigma.goal_tree.root
+                && let Some(node) = Self::find_node(root, &goal.id)
+                && let Some(turn_idx) = node.assigned_turn
+            {
+                critical_turn_indices.insert(turn_idx);
             }
             count += 1;
         }

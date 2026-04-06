@@ -91,10 +91,11 @@ impl CrosstalkUI {
             self.render(&sigma)?;
 
             // 3. Handle Input
-            if event::poll(Duration::from_millis(16))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        match self.mode {
+            if event::poll(Duration::from_millis(16))?
+                && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                match self.mode {
                             UIMode::Normal => match key.code {
                                 KeyCode::Char('q') => {
                                     let _ = self.control_tx.send(ControlSignal::Shutdown).await;
@@ -168,15 +169,12 @@ impl CrosstalkUI {
                                 }
                                 _ => {}
                             },
-                            UIMode::Rewind => match key.code {
-                                KeyCode::Esc => {
+                            UIMode::Rewind => {
+                                if key.code == KeyCode::Esc {
                                     self.mode = UIMode::Normal;
                                     let _ = self.control_tx.send(ControlSignal::Resume).await;
                                 }
-                                _ => {}
-                            },
-                        }
-                    }
+                            }
                 }
             }
         }

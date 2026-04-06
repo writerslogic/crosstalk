@@ -33,15 +33,14 @@ pub enum PermissionTier {
     Full,
 }
 
+#[derive(Default)]
 pub struct PermissionManager {
     pub tiers: HashMap<String, PermissionTier>,
 }
 
 impl PermissionManager {
     pub fn new() -> Self {
-        Self {
-            tiers: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn check(&self, agent_id: &str, tool_name: &str, args: &serde_json::Value) -> bool {

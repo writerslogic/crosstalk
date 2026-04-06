@@ -121,6 +121,7 @@ impl FallbackChain {
     }
 }
 
+#[derive(Default)]
 pub struct InferenceCache {
     pub entries: HashMap<String, (String, f64)>, // hash -> (response, quality)
     pub hits: u64,
@@ -129,11 +130,7 @@ pub struct InferenceCache {
 
 impl InferenceCache {
     pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-            hits: 0,
-            misses: 0,
-        }
+        Self::default()
     }
 
     pub fn get(&mut self, prompt: &str, model_id: &str) -> Option<String> {
@@ -153,15 +150,14 @@ impl InferenceCache {
     }
 }
 
+#[derive(Default)]
 pub struct RateLimitManager {
     pub backoffs: HashMap<String, u32>, // model_id -> consecutive_429s
 }
 
 impl RateLimitManager {
     pub fn new() -> Self {
-        Self {
-            backoffs: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn get_delay(&self, model_id: &str) -> Duration {
