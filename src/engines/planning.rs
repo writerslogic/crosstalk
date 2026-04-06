@@ -1,8 +1,9 @@
 use crate::types::conversation::{ConversationState, Turn};
-use crate::types::planning::{GoalNode, GoalStatus, GoalTree, GoalTreeAnalysis, Milestone};
+use crate::types::planning::{GoalNode, GoalStatus, GoalTree, Milestone, SessionManifest};
 use anyhow::{anyhow, Result};
 use petgraph::algo::toposort;
 use petgraph::graph::DiGraph;
+use sha2::{Digest, Sha256};
 use sled::Db;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -311,15 +312,16 @@ impl MilestoneDetector {
         let now = ConversationState::now();
 
         // Root goal completed
-        if let Some(root) = &sigma.goal_tree.root {
-            if root.status == GoalStatus::Complete && prev_ratio < 1.0 {
-                return Some(Milestone {
-                    id: format!("root-complete-{now}"),
-                    title: format!("Root goal '{}' completed", root.title),
-                    triggered_at: now,
-                    completion_ratio: ratio,
-                });
-            }
+        if let Some(root) = &sigma.goal_tree.root
+            && root.status == GoalStatus::Complete
+            && prev_ratio < 1.0
+        {
+            return Some(Milestone {
+                id: format!("root-complete-{now}"),
+                title: format!("Root goal '{}' completed", root.title),
+                triggered_at: now,
+                completion_ratio: ratio,
+            });
         }
 
         // Crossed 50% threshold
@@ -389,6 +391,93 @@ impl SessionManager {
         let tree = self.db.open_tree(Self::TREE_NAME)?;
         tree.remove(session_id.as_bytes())?;
         Ok(())
+    }
+
+    pub fn save_with_checksum(
+        &self,
+        session_id: &str,
+        state: &ConversationState,
+    ) -> Result<[u8; 32]> {
+        let bytes = serde_json::to_vec(state)?;
+        let checksum: [u8; 32] = Sha256::digest(&bytes).into();
+        let tree = self.db.open_tree(Self::TREE_NAME)?;
+        tree.insert(session_id.as_bytes(), bytes)?;
+        let ck_key = format!("{session_id}:checksum");
+        tree.insert(ck_key.as_bytes(), checksum.as_slice())?;
+        self.db.flush()?;
+        Ok(checksum)
+    }
+
+    pub fn load_with_checksum(
+        &self,
+        session_id: &str,
+        expected: &[u8; 32],
+    ) -> Result<ConversationState> {
+        let tree = self.db.open_tree(Self::TREE_NAME)?;
+        let bytes = tree
+            .get(session_id.as_bytes())?
+            .ok_or_else(|| anyhow!("Session '{session_id}' not found"))?;
+        let actual: [u8; 32] = Sha256::digest(&bytes).into();
+        if &actual != expected {
+            return Err(anyhow!("Checksum mismatch for session '{session_id}'"));
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    pub fn save_manifest(&self, manifest: &SessionManifest) -> Result<()> {
+        let tree = self.db.open_tree("meta")?;
+        let bytes = serde_json::to_vec(manifest)?;
+        tree.insert(manifest.author.as_bytes(), bytes)?;
+        self.db.flush()?;
+        Ok(())
+    }
+
+    pub fn load_manifest(&self, author: &str) -> Result<SessionManifest> {
+        let tree = self.db.open_tree("meta")?;
+        let bytes = tree
+            .get(author.as_bytes())?
+            .ok_or_else(|| anyhow!("Manifest for '{author}' not found"))?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+}
+
+pub struct BranchRegistry {
+    db: Db,
+}
+
+impl BranchRegistry {
+    const TREE_NAME: &'static str = "branches";
+
+    pub fn new(path: &str) -> Result<Self> {
+        let db = sled::open(path)?;
+        Ok(Self { db })
+    }
+
+    pub fn register(&self, branch_id: &str, parent_id: &str) -> Result<()> {
+        let tree = self.db.open_tree(Self::TREE_NAME)?;
+        tree.insert(branch_id.as_bytes(), parent_id.as_bytes())?;
+        self.db.flush()?;
+        Ok(())
+    }
+
+    pub fn parent_of(&self, branch_id: &str) -> Result<Option<String>> {
+        let tree = self.db.open_tree(Self::TREE_NAME)?;
+        match tree.get(branch_id.as_bytes())? {
+            Some(v) => Ok(Some(String::from_utf8(v.to_vec())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_children(&self, parent_id: &str) -> Result<Vec<String>> {
+        let tree = self.db.open_tree(Self::TREE_NAME)?;
+        let mut children = Vec::new();
+        for item in tree.iter() {
+            let (k, v) = item?;
+            if v.as_ref() == parent_id.as_bytes() {
+                children.push(String::from_utf8(k.to_vec())?);
+            }
+        }
+        Ok(children)
     }
 }
 

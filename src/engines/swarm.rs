@@ -258,13 +258,13 @@ impl TaskDecomposer {
             return vec![];
         }
         let sentences: Vec<&str> = description
-            .split(|c| c == '.' || c == '\n')
+            .split(['.', '\n'])
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .collect();
 
         let n = n_tracks.min(sentences.len()).max(1);
-        let chunk = (sentences.len() + n - 1) / n;
+        let chunk = sentences.len().div_ceil(n);
 
         sentences
             .chunks(chunk)

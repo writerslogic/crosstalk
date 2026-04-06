@@ -1,4 +1,12 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetMode {
+    Normal,
+    CostReduction,
+    Emergency,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct TokenUsage {
@@ -22,4 +30,70 @@ pub struct BudgetLedger {
     pub session_budget: f64,
     pub spent: f64,
     pub entries: Vec<CostEntry>,
+}
+
+impl BudgetLedger {
+    #[must_use]
+    pub fn remaining(&self) -> f64 {
+        self.session_budget - self.spent
+    }
+
+    #[must_use]
+    pub fn burn_rate(&self) -> f64 {
+        if self.entries.is_empty() {
+            return 0.0;
+        }
+        self.spent / self.entries.len() as f64
+    }
+
+    #[must_use]
+    pub fn mode(&self) -> BudgetMode {
+        let pct = if self.session_budget > 0.0 {
+            self.remaining() / self.session_budget
+        } else {
+            0.0
+        };
+        if pct < 0.05 {
+            BudgetMode::Emergency
+        } else if pct < 0.20 {
+            BudgetMode::CostReduction
+        } else {
+            BudgetMode::Normal
+        }
+    }
+
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!(
+            "budget={:.4} spent={:.4} remaining={:.4} burn_rate={:.6} mode={:?}",
+            self.session_budget,
+            self.spent,
+            self.remaining(),
+            self.burn_rate(),
+            self.mode()
+        )
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ModelCapabilityMatrix {
+    pub scores: HashMap<String, HashMap<String, f64>>,
+}
+
+impl ModelCapabilityMatrix {
+    #[must_use]
+    pub fn score(&self, model_id: &str, capability: &str) -> f64 {
+        self.scores
+            .get(model_id)
+            .and_then(|caps| caps.get(capability))
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    pub fn register(&mut self, model_id: &str, capability: &str, score: f64) {
+        self.scores
+            .entry(model_id.to_string())
+            .or_default()
+            .insert(capability.to_string(), score.clamp(0.0, 1.0));
+    }
 }

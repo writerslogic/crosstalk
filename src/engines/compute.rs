@@ -1,10 +1,12 @@
-use crate::types::compute::CostEntry;
+use crate::types::compute::{BudgetMode, CostEntry};
 use crate::types::conversation::ConversationState;
 use anyhow::Result;
+use rand::Rng;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use sysinfo::System;
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 
 #[derive(Debug, Clone)]
 pub struct ResourceEvent {
@@ -14,11 +16,57 @@ pub struct ResourceEvent {
     pub alert: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Urgency {
+    RealTime,
+    Interactive,
+    Batch,
+}
+
+struct ResourceMonitorActor {
+    #[allow(dead_code)]
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl ResourceMonitorActor {
+    fn spawn(tx: broadcast::Sender<ResourceEvent>, interval_secs: u64) -> Self {
+        let handle = tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(Duration::from_secs(interval_secs));
+            let mut sys = System::new_all();
+            loop {
+                ticker.tick().await;
+                sys.refresh_all();
+                let rss_mb = sys.used_memory() / 1024 / 1024;
+                let cpu_load = sys.global_cpu_usage();
+                let disks = sysinfo::Disks::new_with_refreshed_list();
+                let disk_free_gb = disks
+                    .iter()
+                    .map(|d| d.available_space())
+                    .sum::<u64>()
+                    / 1024
+                    / 1024
+                    / 1024;
+                let alert = if cpu_load > 90.0 {
+                    Some("CPU Critical".to_string())
+                } else if rss_mb > 16_000 {
+                    Some("Memory Critical".to_string())
+                } else {
+                    None
+                };
+                let _ = tx.send(ResourceEvent { rss_mb, cpu_load, disk_free_gb, alert });
+            }
+        });
+        Self { handle }
+    }
+}
+
 pub struct ComputeManager {
     sys: System,
     resource_tx: broadcast::Sender<ResourceEvent>,
     pub cache: InferenceCache,
     pub rate_limits: RateLimitManager,
+    monitor: Option<ResourceMonitorActor>,
 }
 
 impl ComputeManager {
@@ -29,17 +77,21 @@ impl ComputeManager {
             resource_tx: tx,
             cache: InferenceCache::new(),
             rate_limits: RateLimitManager::new(),
+            monitor: None,
         }
     }
 
-    pub fn manage_budget(sigma: &mut ConversationState, entry: CostEntry) {
+    pub fn start_background_monitor(&mut self, interval_secs: u64) {
+        self.monitor = Some(ResourceMonitorActor::spawn(
+            self.resource_tx.clone(),
+            interval_secs,
+        ));
+    }
+
+    pub fn manage_budget(sigma: &mut ConversationState, entry: CostEntry) -> BudgetMode {
         sigma.budget.spent += entry.cost_usd;
         sigma.budget.entries.push(entry);
-
-        let remaining = sigma.budget.session_budget - sigma.budget.spent;
-        if remaining < sigma.budget.session_budget * 0.2 {
-            println!("[compute] Warning: Budget < 20% remaining. Cost-reduction mode active.");
-        }
+        sigma.budget.mode()
     }
 
     pub fn monitor_resources(&mut self) -> ResourceEvent {
@@ -50,26 +102,27 @@ impl ComputeManager {
         let disk_free_gb =
             disks.iter().map(|d| d.available_space()).sum::<u64>() / 1024 / 1024 / 1024;
 
-        let mut alert = None;
-        if cpu_load > 90.0 {
-            alert = Some("CPU Critical".to_string());
-        }
-        if rss_mb > 16000 {
-            alert = Some("Memory Critical".to_string());
-        }
-
-        let event = ResourceEvent {
-            rss_mb,
-            cpu_load,
-            disk_free_gb,
-            alert,
+        let alert = if cpu_load > 90.0 {
+            Some("CPU Critical".to_string())
+        } else if rss_mb > 16000 {
+            Some("Memory Critical".to_string())
+        } else {
+            None
         };
+
+        let event = ResourceEvent { rss_mb, cpu_load, disk_free_gb, alert };
         let _ = self.resource_tx.send(event.clone());
         event
     }
 
     pub fn resource_subscriber(&self) -> broadcast::Receiver<ResourceEvent> {
         self.resource_tx.subscribe()
+    }
+}
+
+impl Default for ComputeManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -85,28 +138,21 @@ impl ParallelInference {
         F: FnMut(String, String) -> Fut,
         Fut: std::future::Future<Output = Result<String>> + Send + 'static,
     {
-        let mut set: tokio::task::JoinSet<(String, Result<String>)> = tokio::task::JoinSet::new();
+        let mut set: tokio::task::JoinSet<(String, Result<String>)> =
+            tokio::task::JoinSet::new();
 
         for model in models {
             let fut = f(prompt.clone(), model.clone());
-            set.spawn(async move {
-                let res = fut.await;
-                (model, res)
-            });
+            set.spawn(async move { (model, fut.await) });
         }
 
         let mut results = Vec::new();
         while let Some(res) = set.join_next().await {
             match res {
-                Ok((model, output)) => {
-                    results.push((model, output?));
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!("Task join error: {:?}", e));
-                }
+                Ok((model, output)) => results.push((model, output?)),
+                Err(e) => return Err(anyhow::anyhow!("Task join error: {:?}", e)),
             }
         }
-
         Ok(results)
     }
 }
@@ -123,7 +169,7 @@ impl FallbackChain {
 
 #[derive(Default)]
 pub struct InferenceCache {
-    pub entries: HashMap<String, (String, f64)>, // hash -> (response, quality)
+    pub entries: HashMap<String, (String, f64)>,
     pub hits: u64,
     pub misses: u64,
 }
@@ -134,7 +180,7 @@ impl InferenceCache {
     }
 
     pub fn get(&mut self, prompt: &str, model_id: &str) -> Option<String> {
-        let key = format!("{}:{}", prompt, model_id); // Simple key for now
+        let key = format!("{}:{}", prompt, model_id);
         if let Some((res, _)) = self.entries.get(&key) {
             self.hits += 1;
             Some(res.clone())
@@ -148,11 +194,17 @@ impl InferenceCache {
         let key = format!("{}:{}", prompt, model_id);
         self.entries.insert(key, (response, quality));
     }
+
+    #[must_use]
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 { 0.0 } else { self.hits as f64 / total as f64 }
+    }
 }
 
 #[derive(Default)]
 pub struct RateLimitManager {
-    pub backoffs: HashMap<String, u32>, // model_id -> consecutive_429s
+    pub backoffs: HashMap<String, u32>,
 }
 
 impl RateLimitManager {
@@ -161,11 +213,14 @@ impl RateLimitManager {
     }
 
     pub fn get_delay(&self, model_id: &str) -> Duration {
-        let attempts = self.backoffs.get(model_id).unwrap_or(&0);
-        if *attempts == 0 {
+        let attempts = self.backoffs.get(model_id).copied().unwrap_or(0);
+        if attempts == 0 {
             return Duration::ZERO;
         }
-        Duration::from_secs(2u64.pow(*attempts).min(60))
+        let base_secs = 2u64.pow(attempts).min(60) as f64;
+        let jitter: f64 = rand::rng().random_range(-0.25..=0.25);
+        let secs = (base_secs * (1.0 + jitter)).max(0.1);
+        Duration::from_secs_f64(secs)
     }
 
     pub fn report_success(&mut self, model_id: &str) {
@@ -173,13 +228,63 @@ impl RateLimitManager {
     }
 
     pub fn report_429(&mut self, model_id: &str) {
-        let entry = self.backoffs.entry(model_id.to_string()).or_insert(0);
-        *entry += 1;
+        *self.backoffs.entry(model_id.to_string()).or_insert(0) += 1;
     }
 }
 
-impl Default for ComputeManager {
+pub struct LatencyRouter {
+    pub thresholds_ms: HashMap<String, u64>,
+}
+
+impl LatencyRouter {
+    pub fn new() -> Self {
+        Self { thresholds_ms: HashMap::new() }
+    }
+
+    pub fn record(&mut self, model_id: &str, latency_ms: u64) {
+        let entry = self.thresholds_ms.entry(model_id.to_string()).or_insert(0);
+        *entry = (*entry).max(latency_ms);
+    }
+
+    #[must_use]
+    pub fn filter<'a>(&self, candidates: &'a [String], urgency: Urgency) -> Vec<&'a String> {
+        let limit_ms: u64 = match urgency {
+            Urgency::RealTime => 500,
+            Urgency::Interactive => 3_000,
+            Urgency::Batch => u64::MAX,
+        };
+        candidates
+            .iter()
+            .filter(|id| self.thresholds_ms.get(*id).copied().unwrap_or(0) <= limit_ms)
+            .collect()
+    }
+}
+
+impl Default for LatencyRouter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub struct BatchScheduler {
+    semaphore: Arc<Semaphore>,
+    pub max_concurrent: usize,
+}
+
+impl BatchScheduler {
+    pub fn new(max_concurrent: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            max_concurrent,
+        }
+    }
+
+    pub async fn acquire(&self) -> tokio::sync::SemaphorePermit<'_> {
+        self.semaphore.acquire().await.expect("semaphore closed")
+    }
+
+    #[must_use]
+    pub fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
     }
 }

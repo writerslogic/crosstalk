@@ -16,7 +16,7 @@ pub enum TurnOutcome {
     Unknown,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TurnStructure {
     FreeForm,
     StepByStep,

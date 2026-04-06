@@ -1,5 +1,5 @@
 use crate::types::artifact::ArtifactDiff;
-use crate::types::conversation::{TaskCategory, Turn, TurnStructure};
+use crate::types::conversation::{ConversationState, TaskCategory, Turn, TurnStructure};
 use crate::types::security::FallacyReport;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -87,13 +87,46 @@ impl ReasoningScorer {
     #[must_use]
     pub fn score(turn: &Turn) -> f64 {
         let signals = ReasoningEngine::extract_signals(&turn.content);
-        let mut score: f64 = 0.5;
+        let fallacies = FallacyDetector::scan(&turn.content);
+        let assumptions = AssumptionExtractor::extract(&turn.content);
 
-        if !signals.decisions.is_empty() { score += 0.2; }
-        if !signals.code_blocks.is_empty() { score += 0.1; }
-        if signals.questions.len() > 3 { score -= 0.1; }
+        // Dimension 1: signal richness (0.0..=0.30)
+        let signal_score = {
+            let d = if signals.decisions.is_empty() { 0.0 } else { 0.15 };
+            let q = if signals.questions.len() <= 3 { 0.05 } else { 0.0 };
+            let c = if signals.code_blocks.is_empty() { 0.0 } else { 0.10 };
+            d + q + c
+        };
 
-        score.clamp(0.0, 1.0)
+        // Dimension 2: evidence anchoring proxy (0.0..=0.25)
+        let evidence_score = {
+            let has_code_ref =
+                turn.content.contains("```") || turn.content.contains("line ");
+            let has_citation =
+                turn.content.contains("http") || turn.content.contains("doi:");
+            let density = (has_code_ref as u8 + has_citation as u8) as f64 * 0.125;
+            let word_count = turn.content.split_whitespace().count();
+            let length_bonus = (word_count as f64 / 200.0).min(1.0) * 0.05;
+            (density + length_bonus).min(0.25)
+        };
+
+        // Dimension 3: structural coherence (0.0..=0.25)
+        let structure_score = match turn.structure {
+            Some(TurnStructure::StepByStep) | Some(TurnStructure::HypothesisTest) => 0.25,
+            Some(TurnStructure::ProsCons) | Some(TurnStructure::CodeFirst) => 0.15,
+            _ => 0.10,
+        };
+
+        // Dimension 4: fallacy penalty (max 0.20)
+        let fallacy_penalty = (fallacies.len() as f64 * 0.05).min(0.20);
+
+        let assumption_bonus =
+            (assumptions.len() as f64 * 0.025).min(0.05);
+
+        let base = 0.30;
+        (base + signal_score + evidence_score + structure_score + assumption_bonus
+            - fallacy_penalty)
+            .clamp(0.0, 1.0)
     }
 }
 
@@ -110,22 +143,71 @@ impl FallacyDetector {
     pub fn scan(content: &str) -> Vec<FallacyReport> {
         let mut reports = vec![];
 
-        if let Some(report) = Self::detect_circular_reasoning(content) {
-            reports.push(report);
+        if let Some(r) = Self::detect_circular_reasoning(content) {
+            reports.push(r);
         }
-
-        if content.contains("documentation") || content.contains("Documentation") {
-            let content_lower = content.to_lowercase();
-            if content_lower.contains("as the documentation says") && !content.contains("```") {
-                reports.push(FallacyReport {
-                    fallacy_type: "AppealToAuthority".to_string(),
-                    evidence_span: "as the documentation says".to_string(),
-                    confidence: 0.8,
-                });
-            }
+        if let Some(r) = Self::detect_appeal_to_authority(content) {
+            reports.push(r);
+        }
+        if let Some(r) = Self::detect_false_dichotomy(content) {
+            reports.push(r);
+        }
+        if let Some(r) = Self::detect_straw_man(content) {
+            reports.push(r);
         }
 
         reports
+    }
+
+    fn detect_appeal_to_authority(content: &str) -> Option<FallacyReport> {
+        let lower = content.to_lowercase();
+        if lower.contains("as the documentation says") && !content.contains("```") {
+            return Some(FallacyReport {
+                fallacy_type: "AppealToAuthority".to_string(),
+                evidence_span: "as the documentation says".to_string(),
+                confidence: 0.8,
+            });
+        }
+        None
+    }
+
+    fn detect_false_dichotomy(content: &str) -> Option<FallacyReport> {
+        let lower = content.to_lowercase();
+        let markers = [
+            "either...or",
+            "only two options",
+            "must choose between",
+            "only two choices",
+            "there are only two",
+        ];
+        let span = markers.iter().find(|&&m| lower.contains(m))?;
+        Some(FallacyReport {
+            fallacy_type: "FalseDichotomy".to_string(),
+            evidence_span: span.to_string(),
+            confidence: 0.75,
+        })
+    }
+
+    fn detect_straw_man(content: &str) -> Option<FallacyReport> {
+        let lower = content.to_lowercase();
+        let setups = ["they claim", "their argument is", "they believe", "their position is"];
+        let dismissals = [
+            "is absurd",
+            "is ridiculous",
+            "is clearly wrong",
+            "is obviously false",
+        ];
+        let has_setup = setups.iter().any(|&s| lower.contains(s));
+        let has_dismissal = dismissals.iter().any(|&d| lower.contains(d));
+        if has_setup && has_dismissal {
+            Some(FallacyReport {
+                fallacy_type: "StrawMan".to_string(),
+                evidence_span: "exaggerated attribution followed by dismissal".to_string(),
+                confidence: 0.70,
+            })
+        } else {
+            None
+        }
     }
 
     /// Upgraded from $O(N^2)$ to $O(N)$ using a semantic hash-binning approach.
@@ -175,6 +257,300 @@ impl FallacyDetector {
             hasher.write(word.to_ascii_lowercase().as_bytes());
         }
         hasher.finish()
+    }
+}
+
+// =====================================================================
+// STRUCTURE SELECTOR & STRATEGY MIXER
+// =====================================================================
+
+#[derive(Debug, Clone)]
+pub struct StrategyRecord {
+    pub task: TaskCategory,
+    pub agent_id: String,
+    pub structure: TurnStructure,
+    pub quality_score: f64,
+    pub timestamp: u64,
+}
+
+pub struct StrategyMixer {
+    pub history: Vec<StrategyRecord>,
+}
+
+impl StrategyMixer {
+    pub fn new() -> Self {
+        Self { history: Vec::new() }
+    }
+
+    pub fn record(&mut self, rec: StrategyRecord) {
+        self.history.push(rec);
+    }
+
+    #[must_use]
+    pub fn blend(&self, task: TaskCategory) -> Vec<(TurnStructure, f64)> {
+        let mut acc: HashMap<TurnStructure, (f64, u32)> = HashMap::new();
+        for r in self.history.iter().filter(|r| r.task == task) {
+            let e = acc.entry(r.structure).or_default();
+            e.0 += r.quality_score;
+            e.1 += 1;
+        }
+        let mut out: Vec<(TurnStructure, f64)> = acc
+            .into_iter()
+            .map(|(s, (sum, n))| (s, sum / n as f64))
+            .collect();
+        out.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        out
+    }
+}
+
+impl Default for StrategyMixer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct StructureSelector {
+    mixer: StrategyMixer,
+}
+
+impl StructureSelector {
+    pub fn new() -> Self {
+        Self { mixer: StrategyMixer::new() }
+    }
+
+    pub fn record_outcome(
+        &mut self,
+        task: TaskCategory,
+        agent_id: &str,
+        structure: TurnStructure,
+        quality: f64,
+    ) {
+        self.mixer.record(StrategyRecord {
+            task,
+            agent_id: agent_id.to_string(),
+            structure,
+            quality_score: quality,
+            timestamp: ConversationState::now(),
+        });
+    }
+
+    #[must_use]
+    pub fn recommend(&self, task: TaskCategory, _agent_id: &str) -> TurnStructure {
+        self.mixer
+            .blend(task)
+            .first()
+            .map(|(s, _)| *s)
+            .unwrap_or(TurnStructure::FreeForm)
+    }
+}
+
+impl Default for StructureSelector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =====================================================================
+// EVIDENCE ANCHORING
+// =====================================================================
+
+#[derive(Debug, Clone)]
+pub enum EvidenceAnchor {
+    CodeRef { file: String, line: u32 },
+    Citation { source: String, quote: String },
+    DataPoint { label: String, value: f64 },
+}
+
+#[derive(Debug, Clone)]
+pub struct AnchoredClaim {
+    pub claim: String,
+    pub anchors: Vec<EvidenceAnchor>,
+    pub confidence: f64,
+}
+
+// =====================================================================
+// ASSUMPTION EXTRACTOR
+// =====================================================================
+
+pub struct AssumptionExtractor;
+
+impl AssumptionExtractor {
+    #[must_use]
+    pub fn extract(content: &str) -> Vec<String> {
+        let markers = [
+            "assume",
+            "assuming",
+            "we take for granted",
+            "it is assumed",
+            "presuppose",
+            "given that",
+        ];
+        content
+            .split(['.', '\n', '!'])
+            .map(str::trim)
+            .filter(|s| {
+                let lower = s.to_lowercase();
+                markers.iter().any(|&m| lower.contains(m))
+            })
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+}
+
+// =====================================================================
+// CROSS EXAMINER
+// =====================================================================
+
+pub struct CrossExaminer;
+
+impl CrossExaminer {
+    #[must_use]
+    pub fn generate_questions(argument: &str) -> Vec<String> {
+        let mut questions = Vec::new();
+
+        for word in argument.split_whitespace() {
+            let stripped = word.trim_matches(|c: char| !c.is_alphabetic());
+            if stripped.len() > 4 && stripped == stripped.to_uppercase() {
+                questions.push(format!(
+                    "How is \"{}\" defined in this context?",
+                    stripped
+                ));
+            }
+        }
+
+        let lower = argument.to_lowercase();
+        if lower.contains("causes")
+            || lower.contains("leads to")
+            || lower.contains("results in")
+        {
+            questions
+                .push("What evidence supports this causal relationship?".to_string());
+        }
+
+        if lower.contains("always") || lower.contains("never") || lower.contains("all ") {
+            questions
+                .push("Are there documented counterexamples to this universal claim?".to_string());
+        }
+
+        if questions.is_empty() {
+            questions.push("What is the primary evidence for this claim?".to_string());
+        }
+
+        questions
+    }
+}
+
+// =====================================================================
+// ARGUMENT GRAPH & PARSER
+// =====================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArgumentNodeType {
+    Premise,
+    Conclusion,
+    Rebuttal,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArgumentNode {
+    pub id: usize,
+    pub claim: String,
+    pub node_type: ArgumentNodeType,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ArgumentGraph {
+    pub nodes: Vec<ArgumentNode>,
+    pub edges: Vec<(usize, usize)>,
+}
+
+pub struct ArgumentParser;
+
+impl ArgumentParser {
+    #[must_use]
+    pub fn parse(text: &str) -> ArgumentGraph {
+        let mut graph = ArgumentGraph::default();
+        let mut id = 0usize;
+
+        for line in text.lines() {
+            let trimmed = line.trim();
+            let lower = trimmed.to_lowercase();
+            let node_type = if lower.starts_with("premise:") || lower.starts_with("- ") {
+                ArgumentNodeType::Premise
+            } else if lower.starts_with("conclusion:") || lower.starts_with("therefore") {
+                ArgumentNodeType::Conclusion
+            } else if lower.starts_with("however") || lower.starts_with("rebuttal:") {
+                ArgumentNodeType::Rebuttal
+            } else {
+                continue;
+            };
+
+            graph.nodes.push(ArgumentNode {
+                id,
+                claim: trimmed.to_string(),
+                node_type,
+            });
+            if id > 0 {
+                graph.edges.push((id - 1, id));
+            }
+            id += 1;
+        }
+
+        graph
+    }
+}
+
+// =====================================================================
+// REPORT GENERATOR
+// =====================================================================
+
+pub struct ReportGenerator;
+
+impl ReportGenerator {
+    #[must_use]
+    pub fn generate(
+        signals: &ExtractedSignals,
+        fallacies: &[FallacyReport],
+        assumptions: &[String],
+        score: f64,
+    ) -> String {
+        let mut out = String::with_capacity(512);
+        out.push_str("## Reasoning Report\n\n");
+        out.push_str(&format!("**Overall Score**: {:.2}\n\n", score));
+
+        out.push_str("### Decisions\n");
+        if signals.decisions.is_empty() {
+            out.push_str("- None recorded\n");
+        } else {
+            for d in &signals.decisions {
+                out.push_str(&format!("- {}\n", d));
+            }
+        }
+
+        out.push_str("\n### Detected Fallacies\n");
+        if fallacies.is_empty() {
+            out.push_str("- None detected\n");
+        } else {
+            for f in fallacies {
+                out.push_str(&format!(
+                    "- **{}** (conf: {:.0}%): {}\n",
+                    f.fallacy_type,
+                    f.confidence * 100.0,
+                    f.evidence_span
+                ));
+            }
+        }
+
+        out.push_str("\n### Assumptions\n");
+        if assumptions.is_empty() {
+            out.push_str("- None identified\n");
+        } else {
+            for a in assumptions {
+                out.push_str(&format!("- {}\n", a));
+            }
+        }
+
+        out
     }
 }
 
