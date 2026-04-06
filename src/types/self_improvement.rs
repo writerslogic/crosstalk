@@ -76,11 +76,13 @@ impl StrategyEntry {
     /// Squared Euclidean distance to a query feature vector.
     #[must_use]
     pub fn distance_sq(&self, query: &[f64]) -> f64 {
-        let len = self.task_features.len().min(query.len());
-        self.task_features[..len]
-            .iter()
-            .zip(&query[..len])
-            .map(|(a, b)| (a - b).powi(2))
+        let len = self.task_features.len().max(query.len());
+        (0..len)
+            .map(|i| {
+                let a = self.task_features.get(i).copied().unwrap_or(0.0);
+                let b = query.get(i).copied().unwrap_or(0.0);
+                (a - b).powi(2)
+            })
             .sum()
     }
 }

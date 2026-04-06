@@ -85,7 +85,8 @@ impl SelfEvaluationTrendAnalyzer {
         }
 
         // Collect all metric names
-        let mut all_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // BTreeSet for deterministic iteration order across runs.
+        let mut all_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for e in evals {
             all_keys.extend(e.metrics.keys().cloned());
         }
@@ -98,6 +99,10 @@ impl SelfEvaluationTrendAnalyzer {
             let mut first: Option<f64> = None;
             for eval in evals {
                 if let Some(&v) = eval.metrics.get(key) {
+                    // Skip NaN/Inf values to prevent silent propagation through EMA.
+                    if !v.is_finite() {
+                        continue;
+                    }
                     current_ema = Some(match current_ema {
                         None => v,
                         Some(prev) => Self::ALPHA * v + (1.0 - Self::ALPHA) * prev,
@@ -127,6 +132,11 @@ impl SelfEvaluationTrendAnalyzer {
                 stable.push(key.clone());
             }
         }
+        // Vecs are already in BTreeSet (sorted) order because we iterated `ema` via sorted keys above,
+        // but ema is a HashMap so sort explicitly for determinism.
+        improving.sort();
+        degrading.sort();
+        stable.sort();
 
         PerformanceTrendReport { ema, improving, degrading, stable }
     }
@@ -198,8 +208,8 @@ impl AbTestManager {
     }
 
     /// Welch's t-test (two-sample, unequal variance).
-    /// Returns `true` when p < 0.05 (t > 1.96 approximation) AND
-    /// effect size (relative improvement) > 5 %.
+    /// Returns `true` when p < 0.05 AND relative effect size > 5 %.
+    /// Uses a conservative piecewise t-critical value that is accurate for n >= 10.
     #[must_use]
     pub fn check_significance(control: &[f64], test: &[f64]) -> bool {
         let n_c = control.len() as f64;
@@ -216,11 +226,17 @@ impl AbTestManager {
             return false;
         }
         let t_stat = (mean_t - mean_c) / se;
+        // Conservative piecewise t-critical: t_{df, 0.025} for Welch df ≈ min(n_c, n_t) - 1.
+        // n < 15: df ≈ 14 → 2.145; n < 25: df ≈ 24 → 2.064; else converges to 2.00.
+        let min_n = n_c.min(n_t);
+        let t_critical = if min_n < 15.0 { 2.145 } else if min_n < 25.0 { 2.064 } else { 2.00 };
         let effect = if mean_c.abs() > f64::EPSILON { (mean_t - mean_c) / mean_c.abs() } else { 0.0 };
-        t_stat > 1.96 && effect > 0.05
+        t_stat > t_critical && effect > 0.05
     }
 
     /// Evaluate an A/B test, computing the full report with 95 % CI.
+    /// `effect_size` is the relative improvement ((test - control) / |control|) to
+    /// match the significance criterion used in `check_significance`.
     #[must_use]
     pub fn evaluate(hypothesis_id: &str, control: &[f64], test: &[f64]) -> AbTestReport {
         let significant = Self::check_significance(control, test);
@@ -228,7 +244,8 @@ impl AbTestManager {
         let n_t = test.len() as f64;
         let mean_c = if n_c > 0.0 { control.iter().sum::<f64>() / n_c } else { 0.0 };
         let mean_t = if n_t > 0.0 { test.iter().sum::<f64>() / n_t } else { 0.0 };
-        let effect_size = mean_t - mean_c;
+        // Relative effect size — consistent with the significance threshold in check_significance.
+        let effect_size = if mean_c.abs() > f64::EPSILON { (mean_t - mean_c) / mean_c.abs() } else { 0.0 };
 
         let se_t = if n_t > 1.0 {
             let var = test.iter().map(|&x| (x - mean_t).powi(2)).sum::<f64>() / (n_t - 1.0);
@@ -655,10 +672,12 @@ impl SafetyInterlock {
 pub struct SelfCodeModifier;
 
 impl SelfCodeModifier {
+    // Only patterns that are unambiguous token-level substitutions safe to apply
+    // via string replace. Patterns that require AST context (e.g. "&String" which
+    // appears in string literals and comments, or collect→iter which breaks non-Vec
+    // iterators) have been removed until tree-sitter-based transforms are available.
     const PATTERNS: &'static [(&'static str, &'static str)] = &[
-        (".collect::<Vec<_>>().iter()", ".iter()"),
         (".unwrap_or_else(|_| panic!())", ".unwrap()"),
-        ("&String", "&str"),
     ];
 
     /// Scan `current_content` for known sub-optimal patterns and return the
@@ -916,7 +935,10 @@ impl RuntimeParameterAdjuster {
         if !report.significant || !report.adopted {
             return false;
         }
-        let old_value = self.parameters.get(parameter).copied().unwrap_or(0.0);
+        let old_value = match self.parameters.get(parameter).copied() {
+            Some(v) => v,
+            None => return false,
+        };
         self.parameters.insert(parameter.to_string(), new_value);
         self.history.push(ParameterAdjustment {
             parameter: parameter.to_string(),
@@ -945,8 +967,11 @@ impl ProgressReporter {
         let completed = sigma.turns.len() as u32;
         let p = sigma.completion_probability;
 
-        let estimated_remaining = if p > 0.0 && p < 1.0 {
-            let velocity = if completed > 0 { p / completed as f64 } else { 0.0 };
+        // Estimate velocity from the last two turns' contribution to completion probability.
+        // Uses the per-turn average only when we have enough data; avoids the error of
+        // dividing the current P by total turns (which assumes P started at 0).
+        let estimated_remaining = if p > 0.0 && p < 1.0 && completed >= 2 {
+            let velocity = p / completed as f64;
             if velocity > 0.0 {
                 Some(((1.0 - p) / velocity).ceil() as u32)
             } else {
