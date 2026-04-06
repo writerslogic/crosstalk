@@ -94,17 +94,52 @@ impl IntelligenceEngine {
 
     pub fn detect_regression(
         &self,
-        agent_id: &str,
-        category: TaskCategory,
+        model_id: &str,
+        recent_turns: &[Turn],
     ) -> Option<RegressionAlert> {
-        let profile = self.profiles.get(agent_id)?;
-        let avg = profile.task_scores.get(&category)?;
-
-        if avg.count < 10 {
+        if recent_turns.is_empty() {
             return None;
         }
 
-        let _threshold = avg.mean - 2.0 * avg.stddev();
+        let profile = self.profiles.get(model_id)?;
+
+        let mut recent_quality_sum = 0.0;
+        let mut valid_turns = 0;
+        for turn in recent_turns {
+            if turn.model_id == model_id {
+                let score = QualityScorer::score(turn, &ConversationState::new("temp"));
+                recent_quality_sum += score;
+                valid_turns += 1;
+            }
+        }
+
+        if valid_turns == 0 {
+            return None;
+        }
+
+        let recent_avg = recent_quality_sum / valid_turns as f64;
+
+        let baseline = if profile.task_scores.is_empty() {
+            0.5
+        } else {
+            let mut baseline_sum = 0.0;
+            for (_, avg) in &profile.task_scores {
+                baseline_sum += avg.mean;
+            }
+            baseline_sum / profile.task_scores.len() as f64
+        };
+
+        if recent_avg < baseline * 0.9 {
+            let alert = RegressionAlert {
+                agent_id: model_id.to_string(),
+                task_category: TaskCategory::CodeGeneration,
+                baseline_mean: baseline,
+                recent_mean: recent_avg,
+                severity: (baseline - recent_avg) / baseline,
+                timestamp: ConversationState::now(),
+            };
+            return Some(alert);
+        }
 
         None
     }
@@ -331,9 +366,18 @@ impl ContextBudgeter {
             return vec![available_tokens / n; segments.len()];
         }
 
-        segments
+        let mut allocation: Vec<usize> = segments
             .iter()
             .map(|s| (s.1 * available_tokens) / total_weight)
-            .collect()
+            .collect();
+
+        let allocated_total: usize = allocation.iter().sum();
+        let remainder = available_tokens - allocated_total;
+        if remainder > 0 && !allocation.is_empty() {
+            let last_idx = allocation.len() - 1;
+            allocation[last_idx] += remainder;
+        }
+
+        allocation
     }
 }

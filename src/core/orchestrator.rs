@@ -261,7 +261,7 @@ impl Orchestrator {
                             &new_content,
                             current_artifact.version,
                         );
-                        let p_fail = self.mc_runner.predict(current_artifact, &delta, 10).await;
+                        let p_fail = self.mc_runner.predict(current_artifact, &delta, 10).await.unwrap_or(0.5);
                         if p_fail > 0.5 {
                             all_valid = false;
                             turn_outcome = TurnOutcome::RolledBack;
@@ -401,6 +401,23 @@ impl Orchestrator {
             {
                 let mut intell = self.intelligence.lock().await;
                 intell.update_profile(&turn, QualityScorer::score(&turn, &sigma));
+
+                let recent_turns: Vec<Turn> = sigma
+                    .turns
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                if let Some(alert) = intell.detect_regression(&agent_id, &recent_turns) {
+                    println!(
+                        "[intelligence] Regression detected for {}: {:.2} -> {:.2}",
+                        alert.agent_id, alert.baseline_mean, alert.recent_mean
+                    );
+                }
             }
 
             {
@@ -444,7 +461,7 @@ impl Orchestrator {
 
             InvariantChecker::check_all(&sigma)?;
             self.state_manager.checkpoint(&sigma)?;
-            self.swarm.broadcast_turn(turn.clone());
+            let _ = self.swarm.broadcast_turn(turn.clone());
 
             if let Some(ref auditor_tx) = self.auditor_tx {
                 let _ = auditor_tx.send(sigma.clone()).await;
