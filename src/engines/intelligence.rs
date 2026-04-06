@@ -63,6 +63,7 @@ impl IntelligenceEngine {
                 task_scores: HashMap::new(),
                 total_turns: 0,
                 last_updated: ConversationState::now(),
+                latency_ms: Default::default(),
             });
 
         if let Some(cat) = turn.task_category {
@@ -75,6 +76,19 @@ impl IntelligenceEngine {
         profile.total_turns += 1;
         profile.last_updated = ConversationState::now();
 
+        let _ = self.save_all();
+    }
+
+    pub fn update_profile_with_latency(
+        &mut self,
+        turn: &Turn,
+        quality_score: f64,
+        latency_ms: u64,
+    ) {
+        self.update_profile(turn, quality_score);
+        if let Some(profile) = self.profiles.get_mut(&turn.model_id) {
+            profile.latency_ms.update(latency_ms as f64);
+        }
         let _ = self.save_all();
     }
 
@@ -117,6 +131,113 @@ impl IntelligenceEngine {
             }
         }
         best_model
+    }
+
+    pub fn route_task_constrained(
+        &self,
+        category: TaskCategory,
+        available_models: &[String],
+        budget: u32,
+        latency_ms: u64,
+        blacklist: &[String],
+    ) -> Result<String, String> {
+        if available_models.is_empty() {
+            return Err("No models available for routing".to_string());
+        }
+
+        let estimated_tokens = Self::estimate_tokens(category);
+        if estimated_tokens > budget {
+            return Err(format!(
+                "Estimated tokens {} exceeds budget {}",
+                estimated_tokens, budget
+            ));
+        }
+
+        let mut candidates: Vec<(String, f64)> = Vec::new();
+
+        for model_id in available_models {
+            if blacklist.contains(model_id) {
+                continue;
+            }
+
+            if let Some(profile) = self.profiles.get(model_id) {
+                if profile.latency_ms.mean > latency_ms as f64 {
+                    continue;
+                }
+
+                let score = profile
+                    .task_scores
+                    .get(&category)
+                    .map(|ra| ra.mean)
+                    .unwrap_or(0.5);
+
+                candidates.push((model_id.clone(), score));
+            }
+        }
+
+        if candidates.is_empty() {
+            let diagnostics = self.generate_routing_diagnostics(
+                category,
+                available_models,
+                budget,
+                latency_ms,
+                blacklist,
+            );
+            return Err(format!("No models satisfy constraints. {}", diagnostics));
+        }
+
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(candidates[0].0.clone())
+    }
+
+    fn generate_routing_diagnostics(
+        &self,
+        category: TaskCategory,
+        available_models: &[String],
+        budget: u32,
+        latency_ms: u64,
+        blacklist: &[String],
+    ) -> String {
+        let estimated_tokens = Self::estimate_tokens(category);
+        let mut diagnostics = format!(
+            "Task category: {:?}, Estimated tokens: {}, Budget: {}, Latency limit: {}ms. ",
+            category, estimated_tokens, budget, latency_ms
+        );
+
+        diagnostics.push_str("Models: ");
+        for model_id in available_models {
+            if blacklist.contains(model_id) {
+                diagnostics.push_str(&format!("{} (blacklisted), ", model_id));
+            } else if let Some(profile) = self.profiles.get(model_id) {
+                let latency_str = if profile.latency_ms.mean > latency_ms as f64 {
+                    format!("{}ms > limit", profile.latency_ms.mean as u64)
+                } else {
+                    format!("{}ms OK", profile.latency_ms.mean as u64)
+                };
+                let quality = profile
+                    .task_scores
+                    .get(&category)
+                    .map(|ra| ra.mean)
+                    .unwrap_or(0.5);
+                diagnostics.push_str(&format!("{} (quality: {:.2}, latency: {}), ", model_id, quality, latency_str));
+            } else {
+                diagnostics.push_str(&format!("{} (no profile), ", model_id));
+            }
+        }
+
+        diagnostics
+    }
+
+    #[must_use]
+    pub fn estimate_tokens(category: TaskCategory) -> u32 {
+        match category {
+            TaskCategory::CodeGeneration => 2000,
+            TaskCategory::Debugging => 1500,
+            TaskCategory::Architecture => 2500,
+            TaskCategory::Refactoring => 1800,
+            TaskCategory::Research => 2200,
+            TaskCategory::Testing => 1500,
+        }
     }
 }
 

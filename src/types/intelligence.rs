@@ -32,6 +32,8 @@ pub struct ModelProfile {
     pub task_scores: HashMap<TaskCategory, RunningAverage>,
     pub total_turns: u32,
     pub last_updated: u64,
+    #[serde(default)]
+    pub latency_ms: RunningAverage,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -52,7 +54,7 @@ pub struct PromptTemplate {
     pub performance_history: Vec<(String, f64)>, // (session_id, quality_score)
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct RegressionAlert {
     pub agent_id: String,
     pub task_category: TaskCategory,
