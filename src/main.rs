@@ -79,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Orchestrator task
     let sigma_orch = Arc::clone(&sigma);
+    let app_orch = Arc::clone(&app);
     let iterations = args.iterations;
     tokio::spawn(async move {
         let mut i = 0u32;
@@ -88,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
         }
+        app_orch.lock().await.shutdown = true;
     });
 
     // Event loop task (keyboard + stream events)
@@ -114,10 +116,11 @@ async fn main() -> anyhow::Result<()> {
     let mut tick = tokio::time::interval(Duration::from_millis(16));
     loop {
         tick.tick().await;
-        let app_guard = app.lock().await;
+        let mut app_guard = app.lock().await;
         if app_guard.shutdown {
             break;
         }
+        app_guard.tick_fps();
         terminal.draw(|f| render::draw(f, &app_guard))?;
     }
 
