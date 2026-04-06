@@ -10,7 +10,66 @@ use lancedb::connect;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::Table;
+use sha2::{Sha256, Digest};
 use std::sync::Arc;
+
+const EMBEDDING_DIM: usize = 384;
+
+fn embed_text(text: &str) -> Vec<f32> {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    let hash = hasher.finalize();
+    let hash_bytes = hash.as_slice();
+
+    let mut embedding = Vec::with_capacity(EMBEDDING_DIM);
+    for i in 0..EMBEDDING_DIM {
+        let byte_idx = i % 32;
+        let cycle = i / 32;
+        let seed = u32::from_le_bytes([
+            hash_bytes[byte_idx],
+            hash_bytes[(byte_idx + 1) % 32],
+            hash_bytes[(byte_idx + 2) % 32],
+            hash_bytes[(byte_idx + 3) % 32],
+        ]);
+        let shifted = seed.wrapping_mul(2654435761).wrapping_add(cycle as u32);
+        let normalized = ((shifted as f32) / (u32::MAX as f32)) * 2.0 - 1.0;
+        embedding.push(normalized);
+    }
+
+    normalize_vector(&embedding)
+}
+
+fn cosine_similarity(vec_a: &[f32], vec_b: &[f32]) -> f32 {
+    if vec_a.len() != vec_b.len() || vec_a.is_empty() {
+        return 0.0;
+    }
+
+    let mut dot_product = 0.0;
+    let mut norm_a = 0.0;
+    let mut norm_b = 0.0;
+
+    for (a, b) in vec_a.iter().zip(vec_b.iter()) {
+        dot_product += a * b;
+        norm_a += a * a;
+        norm_b += b * b;
+    }
+
+    let denominator = (norm_a * norm_b).sqrt();
+    if denominator == 0.0 {
+        0.0
+    } else {
+        dot_product / denominator
+    }
+}
+
+fn normalize_vector(vec: &[f32]) -> Vec<f32> {
+    let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm == 0.0 {
+        vec.to_vec()
+    } else {
+        vec.iter().map(|x| x / norm).collect()
+    }
+}
 
 pub struct MemoryStore {
     uri: String,
@@ -63,11 +122,18 @@ impl MemoryStore {
         }
     }
 
-    pub async fn insert(&self, table_name: &str, records: Vec<MemoryRecord>) -> Result<()> {
+    pub async fn insert(&self, table_name: &str, mut records: Vec<MemoryRecord>) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
-        let dim = records[0].embedding.len();
+
+        for record in &mut records {
+            if record.embedding.is_empty() || record.embedding.iter().all(|&x| x == 0.0) {
+                record.embedding = embed_text(&record.content_hash);
+            }
+        }
+
+        let dim = EMBEDDING_DIM;
         let table = self.get_or_create_table(table_name, dim).await?;
 
         let turn_ids = UInt32Array::from(records.iter().map(|r| r.turn_id).collect::<Vec<_>>());
@@ -142,19 +208,19 @@ impl MemoryStore {
     pub async fn query_nearest(
         &self,
         table_name: &str,
-        vector: Vec<f32>,
+        query_vector: Vec<f32>,
         k: usize,
-    ) -> Result<Vec<MemoryRecord>> {
-        let table = self.get_or_create_table(table_name, vector.len()).await?;
+    ) -> Result<Vec<(MemoryRecord, f32)>> {
+        let table = self.get_or_create_table(table_name, EMBEDDING_DIM).await?;
 
-        let query = table.vector_search(vector)?.limit(k);
+        let query = table.vector_search(query_vector.clone())?.limit(k * 2);
 
         let mut stream = query
             .execute()
             .await
             .map_err(|e| anyhow!("Search failed: {:?}", e))?;
 
-        let mut records = Vec::new();
+        let mut scored_records = Vec::new();
         while let Some(batch_res) = stream.next().await {
             let batch = batch_res.map_err(|e| anyhow!("Batch retrieval failed: {:?}", e))?;
 
@@ -206,7 +272,8 @@ impl MemoryStore {
                     *val = vec_f32.value(j);
                 }
 
-                records.push(MemoryRecord {
+                let similarity = cosine_similarity(&query_vector, &embedding);
+                let record = MemoryRecord {
                     turn_id: turn_ids.value(i),
                     session_id: session_ids.value(i).to_string(),
                     embedding,
@@ -214,10 +281,14 @@ impl MemoryStore {
                     timestamp: timestamps.value(i),
                     metadata_json: metadata.value(i).to_string(),
                     outcome: None,
-                });
+                };
+                scored_records.push((record, similarity));
             }
         }
-        Ok(records)
+
+        scored_records.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let results: Vec<(MemoryRecord, f32)> = scored_records.into_iter().take(k).collect();
+        Ok(results)
     }
 }
 
@@ -301,5 +372,85 @@ impl ContextDistiller {
         }
 
         distilled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_embed_text_produces_384_dims() {
+        let embedding = embed_text("hello world");
+        assert_eq!(embedding.len(), EMBEDDING_DIM);
+        assert_eq!(embedding.len(), 384);
+    }
+
+    #[test]
+    fn test_embed_text_normalized() {
+        let embedding = embed_text("test string");
+        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 0.001, "Vector should be normalized to unit length");
+    }
+
+    #[test]
+    fn test_embed_text_deterministic() {
+        let text = "deterministic test";
+        let embedding1 = embed_text(text);
+        let embedding2 = embed_text(text);
+        assert_eq!(embedding1, embedding2);
+    }
+
+    #[test]
+    fn test_cosine_similarity_identical_vectors() {
+        let vec = vec![1.0, 0.0, 0.0];
+        let sim = cosine_similarity(&vec, &vec);
+        assert!((sim - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cosine_similarity_orthogonal() {
+        let vec_a = vec![1.0, 0.0, 0.0];
+        let vec_b = vec![0.0, 1.0, 0.0];
+        let sim = cosine_similarity(&vec_a, &vec_b);
+        assert!(sim.abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cosine_similarity_similar_texts() {
+        let text1 = "the quick brown fox";
+        let text2 = "the quick brown fox";
+        let emb1 = embed_text(text1);
+        let emb2 = embed_text(text2);
+        let sim = cosine_similarity(&emb1, &emb2);
+        assert!(
+            sim > 0.99,
+            "Identical texts should have similarity > 0.99, got {}",
+            sim
+        );
+    }
+
+    #[test]
+    fn test_cosine_similarity_different_texts() {
+        let text1 = "the quick brown fox jumps";
+        let text2 = "completely different words here";
+        let emb1 = embed_text(text1);
+        let emb2 = embed_text(text2);
+        let sim = cosine_similarity(&emb1, &emb2);
+        assert!(
+            sim < 0.5,
+            "Different texts should have lower similarity, got {}",
+            sim
+        );
+    }
+
+    #[test]
+    fn test_normalize_vector() {
+        let vec = vec![3.0, 4.0];
+        let normalized = normalize_vector(&vec);
+        let norm: f32 = normalized.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 0.001);
+        assert!((normalized[0] - 0.6).abs() < 0.001);
+        assert!((normalized[1] - 0.8).abs() < 0.001);
     }
 }

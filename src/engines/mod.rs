@@ -4,6 +4,7 @@ pub mod compute;
 pub mod consensus;
 pub mod diff;
 pub mod intelligence;
+pub mod linter;
 pub mod memory;
 pub mod planning;
 pub mod proof;

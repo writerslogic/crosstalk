@@ -20,7 +20,7 @@ use crate::engines::self_improvement::SelfImprovementEngine;
 use crate::engines::simulation::MonteCarloRunner;
 use crate::engines::swarm::SwarmController;
 use crate::engines::validation::AstValidator;
-use crate::engines::verification::{HashChain, InvariantChecker, TautologyFilter};
+use crate::engines::verification::{ContinuousAuditor, HashChain, InvariantChecker, TautologyFilter};
 use crate::mcp::bridge::ToolDiscovery;
 use crate::mcp::gateway::McpGateway;
 use crate::types::artifact::Artifact;
@@ -59,6 +59,7 @@ pub struct Orchestrator {
     pub analytics: AnalyticsEngine,
     pub collective: Mutex<CollectiveIntelligenceEngine>,
     pub viz: Mutex<GodView>,
+    auditor_tx: Option<mpsc::Sender<ConversationState>>,
 }
 
 impl Orchestrator {
@@ -74,6 +75,8 @@ impl Orchestrator {
         for tool in tools {
             mcp_gateway.register_tool(tool);
         }
+
+        let auditor_tx = Some(ContinuousAuditor::spawn());
 
         Self {
             agents,
@@ -96,6 +99,7 @@ impl Orchestrator {
             analytics: AnalyticsEngine,
             collective: Mutex::new(CollectiveIntelligenceEngine::new()),
             viz: Mutex::new(GodView::new()),
+            auditor_tx,
         }
     }
 
@@ -424,6 +428,10 @@ impl Orchestrator {
             InvariantChecker::check_all(&sigma)?;
             self.state_manager.checkpoint(&sigma)?;
             self.swarm.broadcast_turn(turn.clone());
+
+            if let Some(ref auditor_tx) = self.auditor_tx {
+                let _ = auditor_tx.send(sigma.clone()).await;
+            }
 
             if let Some(ref mut root) = sigma.goal_tree.root {
                 PlanningEngine::update_goal_status(root);
