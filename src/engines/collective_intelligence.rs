@@ -224,3 +224,246 @@ impl Default for MetaStrategyOptimizer {
         Self::new()
     }
 }
+
+// ── SkillProgressionTracker ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default)]
+pub struct SkillRecord {
+    pub agent_id: String,
+    pub task_type: String,
+    pub score_history: Vec<f64>,
+}
+
+impl SkillRecord {
+    /// Linear regression slope over `score_history` as improvement rate.
+    #[must_use]
+    pub fn improvement_rate(&self) -> f64 {
+        let n = self.score_history.len();
+        if n < 2 {
+            return 0.0;
+        }
+        let n_f = n as f64;
+        let sum_x: f64 = (0..n).map(|i| i as f64).sum();
+        let sum_y: f64 = self.score_history.iter().sum();
+        let sum_xy: f64 = self.score_history.iter().enumerate().map(|(i, y)| i as f64 * y).sum();
+        let sum_xx: f64 = (0..n).map(|i| (i * i) as f64).sum();
+        let denom = n_f * sum_xx - sum_x * sum_x;
+        if denom == 0.0 { 0.0 } else { (n_f * sum_xy - sum_x * sum_y) / denom }
+    }
+
+    #[must_use]
+    pub fn is_plateauing(&self) -> bool {
+        self.score_history.len() >= 5 && self.improvement_rate().abs() < 0.005
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SkillProgressionTracker {
+    pub records: HashMap<(String, String), SkillRecord>, // (agent_id, task_type)
+}
+
+impl SkillProgressionTracker {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&mut self, agent_id: &str, task_type: &str, score: f64) {
+        let key = (agent_id.to_string(), task_type.to_string());
+        let rec = self.records.entry(key).or_insert_with(|| SkillRecord {
+            agent_id: agent_id.to_string(),
+            task_type: task_type.to_string(),
+            score_history: vec![],
+        });
+        rec.score_history.push(score);
+    }
+
+    #[must_use]
+    pub fn get(&self, agent_id: &str, task_type: &str) -> Option<&SkillRecord> {
+        self.records.get(&(agent_id.to_string(), task_type.to_string()))
+    }
+}
+
+// ── CapabilityGapScanner ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct CapabilityGap {
+    pub task_type: String,
+    pub best_score: f64,
+    pub threshold: f64,
+}
+
+pub struct CapabilityGapScanner;
+
+impl CapabilityGapScanner {
+    const DEFAULT_THRESHOLD: f64 = 0.6;
+
+    /// Find task types where the best agent's score falls below `threshold`.
+    #[must_use]
+    pub fn scan(
+        profiles: &HashMap<String, AgentProfile>,
+        threshold: f64,
+    ) -> Vec<CapabilityGap> {
+        let mut best_per_task: HashMap<String, f64> = HashMap::new();
+        for profile in profiles.values() {
+            for (cat, &score) in &profile.capabilities {
+                let key = format!("{cat:?}");
+                let entry = best_per_task.entry(key).or_insert(0.0);
+                if score > *entry {
+                    *entry = score;
+                }
+            }
+        }
+        best_per_task
+            .into_iter()
+            .filter(|(_, best)| *best < threshold)
+            .map(|(task_type, best_score)| CapabilityGap {
+                task_type,
+                best_score,
+                threshold,
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn scan_default(profiles: &HashMap<String, AgentProfile>) -> Vec<CapabilityGap> {
+        Self::scan(profiles, Self::DEFAULT_THRESHOLD)
+    }
+}
+
+// ── ReviewerCalibrator ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default)]
+pub struct ReviewerCalibrator {
+    /// (reviewer_id) -> (true_positives, false_positives, false_negatives)
+    stats: HashMap<String, (u32, u32, u32)>,
+}
+
+impl ReviewerCalibrator {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a review outcome.
+    /// `flagged` = reviewer flagged an issue; `real_issue` = issue was genuine.
+    pub fn record(&mut self, reviewer_id: &str, flagged: bool, real_issue: bool) {
+        let (tp, fp, fn_) = self.stats.entry(reviewer_id.to_string()).or_insert((0, 0, 0));
+        match (flagged, real_issue) {
+            (true, true) => *tp += 1,
+            (true, false) => *fp += 1,
+            (false, true) => *fn_ += 1,
+            (false, false) => {}
+        }
+    }
+
+    #[must_use]
+    pub fn precision(&self, reviewer_id: &str) -> f64 {
+        let Some(&(tp, fp, _)) = self.stats.get(reviewer_id) else { return 0.0 };
+        let denom = tp + fp;
+        if denom == 0 { 0.0 } else { tp as f64 / denom as f64 }
+    }
+
+    #[must_use]
+    pub fn recall(&self, reviewer_id: &str) -> f64 {
+        let Some(&(tp, _, fn_)) = self.stats.get(reviewer_id) else { return 0.0 };
+        let denom = tp + fn_;
+        if denom == 0 { 0.0 } else { tp as f64 / denom as f64 }
+    }
+}
+
+// ── UCB1ProtocolSelector ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ProtocolArm {
+    pub name: String,
+    pub total_reward: f64,
+    pub trials: u32,
+}
+
+impl ProtocolArm {
+    fn ucb1(&self, total_trials: u32) -> f64 {
+        if self.trials == 0 {
+            return f64::INFINITY;
+        }
+        let avg = self.total_reward / self.trials as f64;
+        let exploration = (2.0 * (total_trials as f64).ln() / self.trials as f64).sqrt();
+        avg + exploration
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UCB1ProtocolSelector {
+    pub arms: Vec<ProtocolArm>,
+    pub total_trials: u32,
+}
+
+impl UCB1ProtocolSelector {
+    #[must_use]
+    pub fn new(protocol_names: &[&str]) -> Self {
+        Self {
+            arms: protocol_names
+                .iter()
+                .map(|n| ProtocolArm { name: n.to_string(), total_reward: 0.0, trials: 0 })
+                .collect(),
+            total_trials: 0,
+        }
+    }
+
+    /// Select the arm with the highest UCB1 score.
+    #[must_use]
+    pub fn select(&self) -> Option<&str> {
+        self.arms
+            .iter()
+            .max_by(|a, b| a.ucb1(self.total_trials).total_cmp(&b.ucb1(self.total_trials)))
+            .map(|a| a.name.as_str())
+    }
+
+    /// Record the reward for a protocol after a session.
+    pub fn update(&mut self, protocol_name: &str, reward: f64) {
+        if let Some(arm) = self.arms.iter_mut().find(|a| a.name == protocol_name) {
+            arm.total_reward += reward;
+            arm.trials += 1;
+        }
+        self.total_trials += 1;
+    }
+}
+
+// ── RoleSequenceRecorder ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct RoleSequence {
+    pub task_type: String,
+    pub agent_order: Vec<(String, String)>, // (agent_id, role)
+    pub outcome_quality: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RoleSequenceRecorder {
+    pub sequences: Vec<RoleSequence>,
+}
+
+impl RoleSequenceRecorder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&mut self, task_type: &str, agent_order: Vec<(String, String)>, quality: f64) {
+        self.sequences.push(RoleSequence {
+            task_type: task_type.to_string(),
+            agent_order,
+            outcome_quality: quality,
+        });
+    }
+
+    /// Return the agent ordering with the highest mean quality for a given task type.
+    #[must_use]
+    pub fn best_ordering(&self, task_type: &str) -> Option<&Vec<(String, String)>> {
+        self.sequences
+            .iter()
+            .filter(|s| s.task_type == task_type)
+            .max_by(|a, b| a.outcome_quality.total_cmp(&b.outcome_quality))
+            .map(|s| &s.agent_order)
+    }
+}
