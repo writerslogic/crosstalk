@@ -18,6 +18,11 @@ async fn test_mcp_list_tools() {
         input_schema: serde_json::json!({}),
     });
 
+    gateway
+        .permissions
+        .tiers
+        .insert("agent_1".to_string(), PermissionTier::Full);
+
     let res = gateway.handle_tools_list("agent_1");
     let tools = res["tools"].as_array().unwrap();
     assert!(tools.iter().any(|t| t["name"] == "test_tool"));
