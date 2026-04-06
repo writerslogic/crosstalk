@@ -61,7 +61,7 @@ impl PromptTemplate {
         for var in &self.variables {
             let placeholder = format!("{{{{{}}}}}", var);
             let value = vars.get(var.as_str())
-                .ok_or_else(|| anyhow!("Missing template variable: {}", var))?;
+                .ok_or_else(|| anyhow!("Missing template variable '{}'; available: [{}]", var, vars.keys().cloned().collect::<Vec<_>>().join(", ")))?;
             out = out.replace(&placeholder, value);
         }
         Ok(out)

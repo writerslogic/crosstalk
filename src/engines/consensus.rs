@@ -91,25 +91,28 @@ impl NashSolver {
             });
         }
 
+        // Round 0 proposals as starting point for convergence tracking.
+        let mut prev_resolutions: Vec<String> = proposals.iter().map(|(_, p)| p.to_string()).collect();
+
         // Rounds 1..max_rounds: each agent critiques others
         for round in 1..max_rounds {
-            let prev_proposals: Vec<String> = proposals.iter().map(|(_, p)| p.to_string()).collect();
-            let all_same = prev_proposals.windows(2).all(|w| w[0] == w[1]);
+            let all_same = prev_resolutions.windows(2).all(|w| w[0] == w[1]);
             if all_same {
-                // Nash equilibrium: mark last round as accepted and stop
                 for r in rounds.iter_mut().filter(|r| r.round_index == round as u32 - 1) {
                     r.accepted = true;
                 }
                 break;
             }
 
+            let mut current_resolutions = Vec::new();
             for (i, (agent_id, proposal)) in proposals.iter().enumerate() {
-                let others: Vec<&str> = prev_proposals
+                let others: Vec<&str> = prev_resolutions
                     .iter()
                     .enumerate()
                     .filter(|(j, _)| *j != i)
                     .map(|(_, p)| p.as_str())
                     .collect();
+                current_resolutions.push(proposal.to_string());
                 let critique = if others.is_empty() {
                     String::new()
                 } else {
@@ -123,6 +126,7 @@ impl NashSolver {
                     accepted: false,
                 });
             }
+            prev_resolutions = current_resolutions;
         }
 
         rounds
@@ -155,14 +159,14 @@ impl NashSolver {
                 }
                 weights
                     .into_iter()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
                     .map(|(t, _)| t.to_string())
                     .unwrap_or_default()
             }
             ResolutionStrategy::ExpertDeference => proposals
                 .iter()
                 .max_by(|(_, a, _), (_, b, _)| {
-                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                    a.total_cmp(b)
                 })
                 .map(|(_, _, t)| t.to_string())
                 .unwrap_or_default(),

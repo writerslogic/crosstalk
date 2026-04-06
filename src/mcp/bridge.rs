@@ -242,8 +242,12 @@ impl GitBridge {
 
     pub fn log(args: &HashMap<String, String>) -> Vec<String> {
         let mut cli = vec!["log".to_string()];
-        if let Some(n) = args.get("n") {
-            cli.extend([format!("-{n}")]);
+        if let Some(n) = args.get("n")
+            && let Ok(count) = n.parse::<u32>()
+            && count > 0
+            && count <= 10_000
+        {
+            cli.push(format!("-{count}"));
         }
         if args.get("oneline").map(|v| v == "true").unwrap_or(false) {
             cli.push("--oneline".to_string());

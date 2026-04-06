@@ -151,6 +151,13 @@ fn batch_to_records(batch: &RecordBatch, dim: usize) -> Result<Vec<MemoryRecord>
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| anyhow!("type error: vector float elements"))?;
+            if float_vals.len() < dim {
+                return Err(anyhow!(
+                    "embedding dimension mismatch: expected {}, got {}",
+                    dim,
+                    float_vals.len()
+                ));
+            }
             let embedding: Vec<f32> = (0..dim).map(|j| float_vals.value(j)).collect();
             Ok(MemoryRecord {
                 turn_id: turn_ids.value(i),
@@ -280,7 +287,7 @@ impl MemoryStore {
         let timestamps = UInt64Array::from_iter_values(records.iter().map(|r| r.timestamp));
         let metadata = StringArray::from_iter_values(records.iter().map(|r| &r.metadata_json));
 
-        let flattened: Vec<f32> = records.iter().flat_map(|r| r.embedding.clone()).collect();
+        let flattened: Vec<f32> = records.iter().flat_map(|r| r.embedding.iter().copied()).collect();
         let vector_values = Arc::new(Float32Array::from(flattened));
         let field = Arc::new(Field::new("item", DataType::Float32, true));
         let vector_array =

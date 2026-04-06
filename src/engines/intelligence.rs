@@ -42,8 +42,10 @@ impl CheckpointService {
                         });
                         if let Ok(content) = serde_json::to_string_pretty(&data) {
                             let temp_path = format!("{}.tmp", path);
-                            if fs::write(&temp_path, content).await.is_ok() {
-                                let _ = fs::rename(&temp_path, &path).await;
+                            if fs::write(&temp_path, &content).await.is_ok()
+                                && fs::rename(&temp_path, &path).await.is_err()
+                            {
+                                let _ = fs::remove_file(&temp_path).await;
                             }
                         }
                     }
