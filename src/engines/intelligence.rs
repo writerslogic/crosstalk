@@ -1,8 +1,8 @@
 use crate::types::conversation::{ConversationState, TaskCategory, Turn, TurnOutcome};
 use crate::types::intelligence::{ModelProfile, PromptTemplate, RegressionAlert};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::{mpsc, RwLock};
@@ -14,8 +14,11 @@ pub struct IntelligenceEngine {
     /// Templates rarely change at runtime, RwLock optimizes for heavy concurrent reads
     pub templates: Arc<RwLock<Vec<PromptTemplate>>>,
     pub storage_path: Option<String>,
+    pub latency_predictor: LatencyPredictor,
     /// Background channel for non-blocking disk writes
     flush_tx: Option<mpsc::Sender<()>>,
+    /// Retained so panics in the actor surface as JoinErrors rather than being silently dropped
+    checkpoint_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl IntelligenceEngine {
@@ -25,7 +28,9 @@ impl IntelligenceEngine {
             profiles: Arc::new(DashMap::new()),
             templates: Arc::new(RwLock::new(Vec::new())),
             storage_path: None,
+            latency_predictor: LatencyPredictor::new(),
             flush_tx: None,
+            checkpoint_handle: None,
         }
     }
 
@@ -35,7 +40,9 @@ impl IntelligenceEngine {
             profiles: Arc::new(DashMap::new()),
             templates: Arc::new(RwLock::new(Vec::new())),
             storage_path: Some(path.to_string()),
+            latency_predictor: LatencyPredictor::new(),
             flush_tx: None,
+            checkpoint_handle: None,
         };
 
         engine.load_profiles().await?;
@@ -75,7 +82,7 @@ impl IntelligenceEngine {
             let profiles_ref = Arc::clone(&self.profiles);
             let templates_ref = Arc::clone(&self.templates);
 
-            tokio::spawn(async move {
+            self.checkpoint_handle = Some(tokio::spawn(async move {
                 let mut ticker = interval(Duration::from_secs(5)); // Debounce window
 
                 loop {
@@ -107,7 +114,7 @@ impl IntelligenceEngine {
                         else => break,
                     }
                 }
-            });
+            }));
         }
     }
 
@@ -133,8 +140,9 @@ impl IntelligenceEngine {
 
     pub fn update_profile_with_latency(&self, turn: &Turn, quality_score: f64, latency_ms: u64) {
         self.update_profile(turn, quality_score);
+        self.latency_predictor.record(&turn.model_id, latency_ms);
         if let Some(mut profile) = self.profiles.get_mut(&turn.model_id) {
-            profile.latency_ms.update(latency_ms as f64);
+            profile.latency_ms.update(self.latency_predictor.predict_latency(&turn.model_id) as f64);
         }
     }
 
@@ -143,6 +151,11 @@ impl IntelligenceEngine {
         if let Some(tx) = &self.flush_tx {
             let _ = tx.try_send(()); // try_send ignores if the channel is full (already queued)
         }
+    }
+
+    pub fn save_all(&self) -> Result<()> {
+        self.trigger_save();
+        Ok(())
     }
 
     pub fn detect_regression(&self, model_id: &str, recent_turns: &[Turn]) -> Option<RegressionAlert> {
@@ -203,7 +216,9 @@ impl IntelligenceEngine {
             if blacklist.contains(model_id) { continue; }
 
             if let Some(profile) = self.profiles.get(model_id) {
-                if profile.latency_ms.mean > latency_ms as f64 { continue; }
+                let predicted = self.latency_predictor.predict_latency(model_id);
+                let effective_latency = if predicted > 0 { predicted as f64 } else { profile.latency_ms.mean };
+                if effective_latency > latency_ms as f64 { continue; }
 
                 let score = profile.task_scores.get(&category).map_or(0.5, |ra| ra.mean);
 
@@ -255,6 +270,29 @@ impl IntelligenceEngine {
         }
     }
 
+    pub fn route_task(&self, category: TaskCategory, available_models: &[String]) -> String {
+        if available_models.is_empty() {
+            return String::new();
+        }
+        let mut best_model = available_models[0].clone();
+        let mut best_score = -1.0;
+
+        for model_id in available_models {
+            if let Some(profile) = self.profiles.get(model_id) {
+                let score = profile
+                    .task_scores
+                    .get(&category)
+                    .map(|ra| ra.mean)
+                    .unwrap_or(0.5);
+                if score > best_score {
+                    best_score = score;
+                    best_model = model_id.clone();
+                }
+            }
+        }
+        best_model
+    }
+
     #[must_use]
     pub fn estimate_tokens(category: TaskCategory) -> u32 {
         match category {
@@ -297,5 +335,211 @@ impl QualityScorer {
         }
 
         score.max(0.0).min(1.0)
+    }
+}
+
+pub struct ConvergenceMonitor;
+
+impl ConvergenceMonitor {
+    pub fn should_continue(sigma: &ConversationState) -> bool {
+        if sigma.turns.len() < 3 {
+            return true;
+        }
+
+        let recent_p: Vec<f64> = sigma
+            .turns
+            .iter()
+            .rev()
+            .take(3)
+            .map(|_| sigma.completion_probability)
+            .collect();
+        let velocity = recent_p[0] - recent_p[recent_p.len() - 1];
+
+        if sigma.completion_probability > 0.98 {
+            return false;
+        }
+        if velocity < 0.01 && sigma.turns.len() > 10 {
+            return false;
+        }
+
+        true
+    }
+}
+
+pub struct ContextBudgeter;
+
+impl ContextBudgeter {
+    #[must_use]
+    pub fn allocate(available_tokens: usize, segments: &[(&str, usize)]) -> Vec<usize> {
+        let total_weight: usize = segments.iter().map(|s| s.1).sum();
+        if total_weight == 0 {
+            let n = segments.len().max(1);
+            return vec![available_tokens / n; segments.len()];
+        }
+
+        let mut allocation: Vec<usize> = segments
+            .iter()
+            .map(|s| (s.1 * available_tokens) / total_weight)
+            .collect();
+
+        let allocated_total: usize = allocation.iter().sum();
+        let remainder = available_tokens - allocated_total;
+        if remainder > 0 && !allocation.is_empty() {
+            let last_idx = allocation.len() - 1;
+            allocation[last_idx] += remainder;
+        }
+
+        allocation
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum VotingStrategy {
+    Majority,
+    WeightedConsensus,
+    MaxConfidence,
+}
+
+pub struct ModelEnsemble {
+    pub models: Vec<String>,
+    pub voting_strategy: VotingStrategy,
+    scores: DashMap<String, f64>,
+}
+
+impl ModelEnsemble {
+    pub fn new(models: Vec<String>, voting_strategy: VotingStrategy) -> Self {
+        Self {
+            models,
+            voting_strategy,
+            scores: DashMap::new(),
+        }
+    }
+
+    pub fn update_scores(&self, engine: &IntelligenceEngine, category: TaskCategory) {
+        for model_id in &self.models {
+            let score = engine
+                .profiles
+                .get(model_id)
+                .map(|p| p.task_scores.get(&category).map_or(0.5, |ra| ra.mean))
+                .unwrap_or(0.5);
+            self.scores.insert(model_id.clone(), score);
+        }
+    }
+
+    pub fn route_ensemble(
+        &self,
+        category: TaskCategory,
+        available: &[String],
+    ) -> Result<Vec<(String, f64)>> {
+        let candidates: Vec<(String, f64)> = available
+            .iter()
+            .filter(|m| self.models.contains(m))
+            .map(|m| (m.clone(), self.scores.get(m).map(|s| *s).unwrap_or(0.5)))
+            .collect();
+
+        if candidates.is_empty() {
+            return Err(anyhow!("No ensemble candidates available for {:?}", category));
+        }
+
+        if Self::is_safety_critical(category) {
+            let high_confidence = candidates
+                .iter()
+                .filter(|(_, s)| *s > 0.8)
+                .count();
+            if high_confidence < 3 {
+                return Err(anyhow!(
+                    "Safety-critical task requires 3 models with confidence > 0.8, got {}",
+                    high_confidence
+                ));
+            }
+        }
+
+        let mut ranked: Vec<(String, f64)> = match self.voting_strategy {
+            VotingStrategy::MaxConfidence => candidates,
+            VotingStrategy::Majority => candidates
+                .into_iter()
+                .filter(|(_, s)| *s >= 0.5)
+                .collect(),
+            VotingStrategy::WeightedConsensus => {
+                let total: f64 = candidates.iter().map(|(_, s)| s).sum();
+                if total == 0.0 {
+                    candidates
+                } else {
+                    candidates.into_iter().map(|(m, s)| (m, s / total)).collect()
+                }
+            }
+        };
+
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(ranked)
+    }
+
+    pub fn route_ensemble_with_fallback(
+        &self,
+        category: TaskCategory,
+        available: &[String],
+        fallback: &str,
+    ) -> Vec<(String, f64)> {
+        match self.route_ensemble(category, available) {
+            Ok(candidates) if !candidates.is_empty() => candidates,
+            _ => vec![(fallback.to_string(), 0.5)],
+        }
+    }
+
+    fn is_safety_critical(category: TaskCategory) -> bool {
+        matches!(category, TaskCategory::Architecture)
+    }
+}
+
+pub struct LatencyPredictor {
+    history: DashMap<String, VecDeque<u64>>,
+    ema: DashMap<String, f64>,
+}
+
+impl LatencyPredictor {
+    const ALPHA: f64 = 0.3;
+    const WINDOW: usize = 20;
+
+    pub fn new() -> Self {
+        Self {
+            history: DashMap::new(),
+            ema: DashMap::new(),
+        }
+    }
+
+    pub fn record(&self, model_id: &str, latency_ms: u64) {
+        let mut hist = self.history.entry(model_id.to_string()).or_default();
+        if hist.len() >= Self::WINDOW {
+            hist.pop_front();
+        }
+        hist.push_back(latency_ms);
+        drop(hist);
+
+        let sample = latency_ms as f64;
+        let mut ema = self.ema.entry(model_id.to_string()).or_insert(sample);
+        *ema = Self::ALPHA * sample + (1.0 - Self::ALPHA) * *ema;
+    }
+
+    pub fn predict_latency(&self, model_id: &str) -> u64 {
+        self.ema.get(model_id).map(|v| *v as u64).unwrap_or(0)
+    }
+
+    pub fn is_high_variance(&self, model_id: &str) -> bool {
+        let hist = match self.history.get(model_id) {
+            Some(h) => h,
+            None => return false,
+        };
+        if hist.len() < 2 {
+            return false;
+        }
+        let mean = hist.iter().sum::<u64>() as f64 / hist.len() as f64;
+        if mean == 0.0 {
+            return false;
+        }
+        let variance = hist.iter().map(|&x| {
+            let d = x as f64 - mean;
+            d * d
+        }).sum::<f64>() / hist.len() as f64;
+        variance.sqrt() > mean * 0.5
     }
 }

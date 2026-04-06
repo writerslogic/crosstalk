@@ -1,5 +1,6 @@
 use crosstalk::engines::intelligence::{
-    ContextBudgeter, ConvergenceMonitor, IntelligenceEngine, QualityScorer,
+    ContextBudgeter, ConvergenceMonitor, IntelligenceEngine, LatencyPredictor, ModelEnsemble,
+    QualityScorer, VotingStrategy,
 };
 use crosstalk::types::conversation::{ConversationState, TaskCategory, Turn, TurnOutcome};
 use crosstalk::types::intelligence::{ModelProfile, RunningAverage};
@@ -390,20 +391,23 @@ fn test_model_profile_update() {
     // Update profile
     engine.update_profile(&turn1, 0.65);
 
-    // Verify profile was created
-    let profile = engine.profiles.get("model-c").expect("profile missing");
-    assert_eq!(profile.model_id, "model-c");
-    assert_eq!(profile.total_turns, 1);
+    // Verify profile was created — block ensures the DashMap read guard is dropped
+    // before the next write-locking update_profile call.
+    {
+        let profile = engine.profiles.get("model-c").expect("profile missing");
+        assert_eq!(profile.model_id, "model-c");
+        assert_eq!(profile.total_turns, 1);
 
-    let task_score = profile
-        .task_scores
-        .get(&TaskCategory::CodeGeneration)
-        .expect("task score missing");
-    assert!(
-        (task_score.mean - 0.65).abs() < 0.01,
-        "mean should be ~0.65, got {}",
-        task_score.mean
-    );
+        let task_score = profile
+            .task_scores
+            .get(&TaskCategory::CodeGeneration)
+            .expect("task score missing");
+        assert!(
+            (task_score.mean - 0.65).abs() < 0.01,
+            "mean should be ~0.65, got {}",
+            task_score.mean
+        );
+    }
 
     // Add second turn
     let turn2 = make_turn(
@@ -604,52 +608,254 @@ fn test_route_task_unknown_models() {
 // Additional test: profile persistence
 // ============================================================================
 
-#[test]
-fn test_profile_persistence() {
+#[tokio::test]
+async fn test_profile_persistence() {
     let dir = tempdir().expect("temp dir");
     let path = dir.path().join("profiles.json");
     let path_str = path.to_str().expect("path");
 
-    // Create engine and add profile
-    {
-        let mut engine = IntelligenceEngine::with_storage(path_str);
+    // Write a profile directly to disk to simulate a prior session's saved state.
+    let mut ra = RunningAverage::default();
+    ra.update(0.85);
+    let mut task_scores = HashMap::new();
+    task_scores.insert(TaskCategory::Architecture, ra);
+    let profile = ModelProfile {
+        model_id: "persistent-model".to_string(),
+        task_scores,
+        total_turns: 1,
+        last_updated: 0,
+        latency_ms: RunningAverage::default(),
+    };
+    let mut profiles_map = HashMap::new();
+    profiles_map.insert("persistent-model".to_string(), profile);
+    let data = serde_json::json!({ "profiles": profiles_map, "templates": [] });
+    std::fs::write(path_str, serde_json::to_string_pretty(&data).unwrap()).unwrap();
 
-        let turn = make_turn(
-            1,
-            "persistent-model",
-            "content",
-            TurnOutcome::TestsPassed,
-            Some(TaskCategory::Architecture),
-        );
+    // Load engine from storage and verify profiles are loaded from disk.
+    let engine = IntelligenceEngine::with_storage(path_str).await.expect("engine init");
 
-        engine.update_profile(&turn, 0.85);
-        engine.save_all().expect("save failed");
+    let profile = engine
+        .profiles
+        .get("persistent-model")
+        .expect("profile should load from disk");
+    assert_eq!(profile.total_turns, 1);
 
-        let profile = engine
-            .profiles
-            .get("persistent-model")
-            .expect("profile missing");
-        assert_eq!(profile.total_turns, 1);
+    let task_score = profile
+        .task_scores
+        .get(&TaskCategory::Architecture)
+        .expect("task score should load from disk");
+    assert!(
+        (task_score.mean - 0.85).abs() < 0.01,
+        "score should load from disk, got {}",
+        task_score.mean
+    );
+}
+
+fn make_engine_with_scores(models: &[(&str, f64)], category: TaskCategory) -> IntelligenceEngine {
+    let engine = IntelligenceEngine::new();
+    for (model_id, score) in models {
+        let mut profile = make_profile(model_id);
+        let mut ra = RunningAverage::default();
+        ra.update(*score);
+        profile.task_scores.insert(category, ra);
+        engine.profiles.insert(model_id.to_string(), profile);
+    }
+    engine
+}
+
+#[test]
+fn test_ensemble_max_confidence_ranking() {
+    let engine = make_engine_with_scores(
+        &[("a", 0.9), ("b", 0.6), ("c", 0.75)],
+        TaskCategory::CodeGeneration,
+    );
+    let ensemble = ModelEnsemble::new(
+        vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        VotingStrategy::MaxConfidence,
+    );
+    ensemble.update_scores(&engine, TaskCategory::CodeGeneration);
+    let available = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    let ranked = ensemble.route_ensemble(TaskCategory::CodeGeneration, &available).unwrap();
+    assert_eq!(ranked[0].0, "a");
+    assert!(ranked[0].1 > ranked[1].1);
+}
+
+#[test]
+fn test_ensemble_majority_filters_low_confidence() {
+    let engine = make_engine_with_scores(
+        &[("good", 0.8), ("bad", 0.3)],
+        TaskCategory::Debugging,
+    );
+    let ensemble = ModelEnsemble::new(
+        vec!["good".to_string(), "bad".to_string()],
+        VotingStrategy::Majority,
+    );
+    ensemble.update_scores(&engine, TaskCategory::Debugging);
+    let available = vec!["good".to_string(), "bad".to_string()];
+    let ranked = ensemble.route_ensemble(TaskCategory::Debugging, &available).unwrap();
+    assert!(ranked.iter().all(|(_, s)| *s >= 0.5), "Majority must filter low-confidence models");
+    assert!(!ranked.iter().any(|(m, _)| m == "bad"));
+}
+
+#[test]
+fn test_ensemble_weighted_consensus_sums_to_one() {
+    let engine = make_engine_with_scores(
+        &[("x", 0.4), ("y", 0.6)],
+        TaskCategory::Research,
+    );
+    let ensemble = ModelEnsemble::new(
+        vec!["x".to_string(), "y".to_string()],
+        VotingStrategy::WeightedConsensus,
+    );
+    ensemble.update_scores(&engine, TaskCategory::Research);
+    let available = vec!["x".to_string(), "y".to_string()];
+    let ranked = ensemble.route_ensemble(TaskCategory::Research, &available).unwrap();
+    let total: f64 = ranked.iter().map(|(_, s)| s).sum();
+    assert!((total - 1.0).abs() < 1e-9, "WeightedConsensus scores must sum to 1.0, got {}", total);
+}
+
+#[test]
+fn test_ensemble_safety_critical_fails_with_two_high_confidence() {
+    let engine = make_engine_with_scores(
+        &[("m1", 0.9), ("m2", 0.85), ("m3", 0.4)],
+        TaskCategory::Architecture,
+    );
+    let ensemble = ModelEnsemble::new(
+        vec!["m1".to_string(), "m2".to_string(), "m3".to_string()],
+        VotingStrategy::MaxConfidence,
+    );
+    ensemble.update_scores(&engine, TaskCategory::Architecture);
+    let available = vec!["m1".to_string(), "m2".to_string(), "m3".to_string()];
+    let result = ensemble.route_ensemble(TaskCategory::Architecture, &available);
+    assert!(result.is_err(), "Safety-critical task must fail with only 2 high-confidence models");
+}
+
+#[test]
+fn test_ensemble_safety_critical_passes_with_three_high_confidence() {
+    let engine = make_engine_with_scores(
+        &[("m1", 0.9), ("m2", 0.85), ("m3", 0.82)],
+        TaskCategory::Architecture,
+    );
+    let ensemble = ModelEnsemble::new(
+        vec!["m1".to_string(), "m2".to_string(), "m3".to_string()],
+        VotingStrategy::MaxConfidence,
+    );
+    ensemble.update_scores(&engine, TaskCategory::Architecture);
+    let available = vec!["m1".to_string(), "m2".to_string(), "m3".to_string()];
+    let result = ensemble.route_ensemble(TaskCategory::Architecture, &available);
+    assert!(result.is_ok(), "Safety-critical task must pass with 3 high-confidence models");
+    assert_eq!(result.unwrap().len(), 3);
+}
+
+#[test]
+fn test_ensemble_no_candidates_returns_error() {
+    let ensemble = ModelEnsemble::new(vec!["a".to_string()], VotingStrategy::MaxConfidence);
+    let result = ensemble.route_ensemble(TaskCategory::CodeGeneration, &[]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_ensemble_with_fallback_uses_primary() {
+    let engine = make_engine_with_scores(&[("primary", 0.8)], TaskCategory::Debugging);
+    let ensemble = ModelEnsemble::new(vec!["primary".to_string()], VotingStrategy::MaxConfidence);
+    ensemble.update_scores(&engine, TaskCategory::Debugging);
+    let available = vec!["primary".to_string()];
+    let result = ensemble.route_ensemble_with_fallback(TaskCategory::Debugging, &available, "backup");
+    assert_eq!(result[0].0, "primary");
+}
+
+#[test]
+fn test_ensemble_with_fallback_triggers_on_no_candidates() {
+    let ensemble = ModelEnsemble::new(vec!["a".to_string()], VotingStrategy::MaxConfidence);
+    let result = ensemble.route_ensemble_with_fallback(TaskCategory::CodeGeneration, &[], "backup");
+    assert_eq!(result[0].0, "backup");
+    assert_eq!(result[0].1, 0.5);
+}
+
+#[test]
+fn test_latency_predictor_ema_converges_within_10_turns() {
+    let predictor = LatencyPredictor::new();
+    let target = 200u64;
+    for _ in 0..10 {
+        predictor.record("model", target);
+    }
+    let predicted = predictor.predict_latency("model");
+    assert!(
+        (predicted as i64 - target as i64).abs() < 20,
+        "EMA should converge to ~{} within 10 turns, got {}",
+        target, predicted
+    );
+}
+
+#[test]
+fn test_latency_predictor_high_variance_flagged() {
+    let predictor = LatencyPredictor::new();
+    for i in 0..20 {
+        let latency = if i % 2 == 0 { 10u64 } else { 1000u64 };
+        predictor.record("noisy", latency);
+    }
+    assert!(predictor.is_high_variance("noisy"), "high-variance model should be flagged");
+}
+
+#[test]
+fn test_latency_predictor_stable_not_flagged() {
+    let predictor = LatencyPredictor::new();
+    for _ in 0..20 {
+        predictor.record("stable", 100);
+    }
+    assert!(!predictor.is_high_variance("stable"), "stable model must not be flagged as high-variance");
+}
+
+#[test]
+fn test_latency_predictor_predict_unknown_returns_zero() {
+    let predictor = LatencyPredictor::new();
+    assert_eq!(predictor.predict_latency("unknown"), 0);
+}
+
+#[test]
+fn test_engine_route_constrained_uses_predicted_latency() {
+    let engine = IntelligenceEngine::new();
+    let mut profile = make_profile("fast");
+    let mut ra = RunningAverage::default();
+    ra.update(0.9);
+    profile.task_scores.insert(TaskCategory::CodeGeneration, ra);
+    engine.profiles.insert("fast".to_string(), profile);
+
+    for _ in 0..10 {
+        engine.latency_predictor.record("fast", 50);
     }
 
-    // Reload engine and verify profile persists
-    {
-        let engine = IntelligenceEngine::with_storage(path_str);
+    let available = vec!["fast".to_string()];
+    let result = engine.route_task_constrained(
+        TaskCategory::CodeGeneration,
+        &available,
+        10000,
+        200,
+        &[],
+    );
+    assert_eq!(result.unwrap(), "fast");
+}
 
-        let profile = engine
-            .profiles
-            .get("persistent-model")
-            .expect("profile should persist");
-        assert_eq!(profile.total_turns, 1);
+#[test]
+fn test_engine_route_constrained_excludes_slow_predicted() {
+    let engine = IntelligenceEngine::new();
+    let mut profile = make_profile("slow");
+    let mut ra = RunningAverage::default();
+    ra.update(0.9);
+    profile.task_scores.insert(TaskCategory::CodeGeneration, ra);
+    engine.profiles.insert("slow".to_string(), profile);
 
-        let task_score = profile
-            .task_scores
-            .get(&TaskCategory::Architecture)
-            .expect("task score should persist");
-        assert!(
-            (task_score.mean - 0.85).abs() < 0.01,
-            "score should persist, got {}",
-            task_score.mean
-        );
+    for _ in 0..10 {
+        engine.latency_predictor.record("slow", 5000);
     }
+
+    let available = vec!["slow".to_string()];
+    let result = engine.route_task_constrained(
+        TaskCategory::CodeGeneration,
+        &available,
+        10000,
+        100,
+        &[],
+    );
+    assert!(result.is_err(), "model with predicted latency 5000ms should be excluded from 100ms budget");
 }

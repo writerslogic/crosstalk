@@ -21,7 +21,7 @@ use crate::engines::self_improvement::SelfImprovementEngine;
 use crate::engines::simulation::MonteCarloRunner;
 use crate::engines::swarm::SwarmController;
 use crate::engines::validation::AstValidator;
-use crate::engines::verification::{ContinuousAuditor, HashChain, InvariantChecker, TautologyFilter};
+use crate::engines::verification::{AuditAlert, ContinuousAuditor, HashChain, InvariantChecker, TautologyFilter};
 use crate::mcp::bridge::ToolDiscovery;
 use crate::mcp::gateway::McpGateway;
 use crate::types::artifact::Artifact;
@@ -60,7 +60,8 @@ pub struct Orchestrator {
     pub analytics: AnalyticsEngine,
     pub collective: Mutex<CollectiveIntelligenceEngine>,
     pub viz: Mutex<GodView>,
-    auditor_tx: Option<mpsc::Sender<ConversationState>>,
+    pub auditor_tx: Option<mpsc::Sender<ConversationState>>,
+    pub audit_rx: Mutex<mpsc::Receiver<AuditAlert>>,
 }
 
 impl Orchestrator {
@@ -77,7 +78,8 @@ impl Orchestrator {
             mcp_gateway.register_tool(tool);
         }
 
-        let auditor_tx = Some(ContinuousAuditor::spawn());
+        let (alert_tx, alert_rx) = mpsc::channel::<AuditAlert>(32);
+        let auditor_tx = Some(ContinuousAuditor::spawn(alert_tx));
 
         Self {
             agents,
@@ -87,7 +89,15 @@ impl Orchestrator {
             sandbox: SandboxManager::new().expect("Failed to init sandbox"),
             mc_runner: MonteCarloRunner::new().expect("Failed to init simulation"),
             mcp_gateway,
-            memory_store: MemoryStore::new("/tmp/crosstalk-memory"),
+            memory_store: MemoryStore::new(
+                &std::env::var("XDG_DATA_HOME")
+                    .map(|d| format!("{d}/crosstalk"))
+                    .unwrap_or_else(|_| {
+                        std::env::var("HOME")
+                            .map(|h| format!("{h}/.local/share/crosstalk"))
+                            .unwrap_or_else(|_| "/tmp/crosstalk-memory".to_string())
+                    }),
+            ),
             intelligence: Mutex::new(IntelligenceEngine::new()),
             compute: Mutex::new(ComputeManager::new()),
             reasoning: ReasoningEngine,
@@ -99,6 +109,7 @@ impl Orchestrator {
             collective: Mutex::new(CollectiveIntelligenceEngine::new()),
             viz: Mutex::new(GodView::new()),
             auditor_tx,
+            audit_rx: Mutex::new(alert_rx),
         }
     }
 
@@ -132,7 +143,6 @@ impl Orchestrator {
             (s.iteration_index, final_prompt, contents, model_id)
         };
 
-        println!("--- Turn {} | Model: {} ---", iteration_index, agent_id);
 
         let agent_idx = (iteration_index as usize) % self.agents.len();
         let agent = &self.agents[agent_idx];
@@ -224,7 +234,9 @@ impl Orchestrator {
             let mut all_valid = true;
             for (name, (lang, new_content)) in proposed_artifacts {
                 if let Err(e) = AstValidator::validate(&new_content, &lang) {
-                    println!("[diff] artifact \"{name}\" rejected: AST validation failed: {e}");
+                    let _ = self.event_tx.send(StreamEvent::TokenReceived(format!(
+                        "[diff] artifact \"{name}\" rejected: AST validation failed: {e}"
+                    ))).await;
                     all_valid = false;
                     turn_outcome = TurnOutcome::Rejected;
                     break;
@@ -232,7 +244,9 @@ impl Orchestrator {
 
                 let dups = QualityEngine::detect_duplication(&new_content, &sigma.artifacts);
                 if !dups.is_empty() {
-                    println!("[quality] duplication detected for \"{name}\": {:?}", dups);
+                    let _ = self.event_tx.send(StreamEvent::TokenReceived(format!(
+                        "[quality] duplication detected for \"{name}\": {:?}", dups
+                    ))).await;
                 }
 
                 let all_names: Vec<String> = sigma.artifacts.keys().cloned().collect();
@@ -259,7 +273,7 @@ impl Orchestrator {
                             &new_content,
                             current_artifact.version,
                         );
-                        let p_fail = self.mc_runner.predict(current_artifact, &delta, 10).await.unwrap_or(0.5);
+                        let p_fail = self.mc_runner.predict(current_artifact, &delta, 10).await.map(|(mean, _)| mean).unwrap_or(0.5);
                         if p_fail > 0.5 {
                             all_valid = false;
                             turn_outcome = TurnOutcome::RolledBack;
@@ -319,11 +333,18 @@ impl Orchestrator {
                                 stdout: new_content.clone(),
                                 stderr: String::new(),
                             };
-                            if let Err(e) = LinterGuard::check(&sandbox_result, "/tmp").await {
-                                all_valid = false;
-                                turn_outcome = TurnOutcome::Rejected;
-                                eprintln!("[linter] Rust code linting failed for \"{}\": {}", name, e);
-                                break;
+                            match LinterGuard::check(&sandbox_result, "/tmp").await {
+                                Ok(report) if !report.passed => {
+                                    all_valid = false;
+                                    turn_outcome = TurnOutcome::Rejected;
+                                    break;
+                                }
+                                Err(_) => {
+                                    all_valid = false;
+                                    turn_outcome = TurnOutcome::Rejected;
+                                    break;
+                                }
+                                _ => {}
                             }
                         }
 
@@ -374,7 +395,9 @@ impl Orchestrator {
             };
             let surprise = (actual_success - certainty).abs();
             if surprise > 0.5 {
-                println!("[sandbox] High Surprise detected: {:.2}", surprise);
+                let _ = self.event_tx.send(StreamEvent::TokenReceived(format!(
+                    "[sandbox] High Surprise detected: {:.2}", surprise
+                ))).await;
             }
 
             let mut turn = Turn {
@@ -393,7 +416,7 @@ impl Orchestrator {
                 signature: vec![],
             };
 
-            let serialized = serde_json::to_vec(&turn).unwrap();
+            let serialized = serde_json::to_vec(&turn)?;
             turn.signature = self.signer.sign(&serialized);
 
             {
@@ -411,10 +434,10 @@ impl Orchestrator {
                     .rev()
                     .collect();
                 if let Some(alert) = intell.detect_regression(&agent_id, &recent_turns) {
-                    println!(
+                    let _ = self.event_tx.send(StreamEvent::TokenReceived(format!(
                         "[intelligence] Regression detected for {}: {:.2} -> {:.2}",
                         alert.agent_id, alert.baseline_mean, alert.recent_mean
-                    );
+                    ))).await;
                 }
             }
 
@@ -484,14 +507,31 @@ impl Orchestrator {
                 .await;
             let _ = self.event_tx.send(StreamEvent::TurnComplete(turn)).await;
 
+            {
+                let mut audit_rx = self.audit_rx.lock().await;
+                while let Ok(alert) = audit_rx.try_recv() {
+                    let _ = self.event_tx.send(StreamEvent::TokenReceived(format!(
+                        "[audit] Hash mismatch at iteration {}: expected {:02x?}, got {:02x?}",
+                        alert.iteration_index, &alert.expected_hash[..4], &alert.actual_hash[..4]
+                    ))).await;
+                    if let Ok(Some(safe_state)) = self
+                        .state_manager
+                        .restore(alert.iteration_index.saturating_sub(1))
+                    {
+                        *sigma = safe_state;
+                    }
+                }
+            }
+
             let is_converged = sigma.completion_probability > 0.95;
             if is_converged {
                 let eval = SelfImprovementEngine::evaluate_session(&sigma);
-                println!("[self-improve] Session evaluation: {:?}", eval);
                 let report = AnalyticsEngine::generate_report(&sigma);
-                println!("[analytics] Session report: {:?}", report);
                 let exec_summary = ConvergenceReport::generate(&sigma);
-                println!("[release] Convergence Report:\n{}", exec_summary);
+                let _ = self.event_tx.send(StreamEvent::TokenReceived(format!(
+                    "[self-improve] {:?} | [analytics] {:?} | [release] {}",
+                    eval, report, exec_summary
+                ))).await;
             }
 
             Ok(is_converged)

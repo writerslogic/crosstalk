@@ -1,10 +1,12 @@
-use crosstalk::engines::verification::{ContinuousAuditor, HashChain};
+use crosstalk::engines::verification::{AuditAlert, ContinuousAuditor, HashChain};
 use crosstalk::types::conversation::{ConversationState, Turn, TurnOutcome};
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 #[tokio::test]
 async fn test_continuous_auditor_spawns_and_receives() {
-    let tx = ContinuousAuditor::spawn();
+    let (alert_tx, _alert_rx) = mpsc::channel::<AuditAlert>(32);
+    let tx = ContinuousAuditor::spawn(alert_tx);
 
     let mut state1 = ConversationState::new("audit-session");
     state1.iteration_index = 0;

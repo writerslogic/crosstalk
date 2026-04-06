@@ -6,6 +6,7 @@ pub struct McpTool {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
