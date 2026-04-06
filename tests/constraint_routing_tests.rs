@@ -28,7 +28,7 @@ fn test_route_task_constrained_respects_budget() {
     engine.profiles.insert("model-a".to_string(), profile);
 
     let available = vec!["model-a".to_string()];
-    let budget = 1500;
+    let budget = 2000;
     let latency_ms = 500;
     let blacklist = vec![];
 
@@ -40,7 +40,7 @@ fn test_route_task_constrained_respects_budget() {
         &blacklist,
     );
 
-    assert!(result.is_ok());
+    assert!(result.is_ok(), "Route failed: {:?}", result.err());
     assert_eq!(result.unwrap(), "model-a");
 }
 

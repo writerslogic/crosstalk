@@ -1,4 +1,4 @@
-use crosstalk::engines::sandbox::{SandboxConfig, SandboxManager, SandboxResult};
+use crosstalk::engines::sandbox::{SandboxConfig, SandboxManager};
 use crosstalk::engines::simulation::MonteCarloRunner;
 use crosstalk::engines::validation::AstValidator;
 use crosstalk::types::artifact::Artifact;
@@ -96,7 +96,10 @@ async fn test_monte_carlo_trials() {
         diff_text: String::new(),
     };
 
-    let probability = runner.predict(&artifact, &diff, 100).await;
+    let probability = runner
+        .predict(&artifact, &diff, 100)
+        .await
+        .expect("predict failed");
 
     // Probability should be between 0.0 and 1.0
     assert!(
@@ -129,8 +132,14 @@ async fn test_monte_carlo_variance() {
     };
 
     // Run prediction twice with same config
-    let result1 = runner.predict(&artifact, &diff, 100).await;
-    let result2 = runner.predict(&artifact, &diff, 100).await;
+    let result1 = runner
+        .predict(&artifact, &diff, 100)
+        .await
+        .expect("predict failed");
+    let result2 = runner
+        .predict(&artifact, &diff, 100)
+        .await
+        .expect("predict failed");
 
     // Both should be valid probabilities
     assert!(result1 >= 0.0 && result1 <= 1.0);
