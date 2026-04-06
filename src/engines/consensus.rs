@@ -29,19 +29,12 @@ impl ConsensusEngine {
 pub struct CertaintyAnalyzer;
 
 impl CertaintyAnalyzer {
-    /// Computes certainty score in [0.0, 1.0].
     pub fn compute(content: &str, volatility: f64) -> f64 {
         let hedging_terms = [
             "maybe", "perhaps", "i think", "possibly", "could be", "unsure", "not sure", "might",
         ];
         let strong_terms = [
-            "certainly",
-            "definitely",
-            "correct",
-            "fix",
-            "optimal",
-            "verified",
-            "must",
+            "certainly", "definitely", "correct", "fix", "optimal", "verified", "must",
         ];
 
         let content_lower = content.to_lowercase();
@@ -80,7 +73,6 @@ impl NashSolver {
             return rounds;
         }
 
-        // Round 0: collect initial proposals
         for (agent_id, proposal) in proposals {
             rounds.push(RefinementRound {
                 round_index: 0,
@@ -91,10 +83,9 @@ impl NashSolver {
             });
         }
 
-        // Round 0 proposals as starting point for convergence tracking.
-        let mut prev_resolutions: Vec<String> = proposals.iter().map(|(_, p)| p.to_string()).collect();
+        let mut prev_resolutions: Vec<String> =
+            proposals.iter().map(|(_, p)| p.to_string()).collect();
 
-        // Rounds 1..max_rounds: each agent critiques others
         for round in 1..max_rounds {
             let all_same = prev_resolutions.windows(2).all(|w| w[0] == w[1]);
             if all_same {
@@ -148,7 +139,7 @@ impl NashSolver {
                 }
                 counts
                     .into_iter()
-                    .max_by_key(|(_, c)| *c)
+                    .max_by(|(t1, c1), (t2, c2)| c1.cmp(c2).then_with(|| t1.cmp(t2)))
                     .map(|(t, _)| t.to_string())
                     .unwrap_or_default()
             }
@@ -165,9 +156,7 @@ impl NashSolver {
             }
             ResolutionStrategy::ExpertDeference => proposals
                 .iter()
-                .max_by(|(_, a, _), (_, b, _)| {
-                    a.total_cmp(b)
-                })
+                .max_by(|(_, a, _), (_, b, _)| a.total_cmp(b))
                 .map(|(_, _, t)| t.to_string())
                 .unwrap_or_default(),
             ResolutionStrategy::Mediation => {
@@ -211,28 +200,63 @@ impl NashSolver {
 }
 
 /// Kalman Filter for convergence estimation.
+///
+/// Tracks the completion probability `p_c` as a latent state, updating it
+/// with noisy measurements from each turn. Stores the last innovation
+/// (measurement residual) for diagnostics and exposes a `is_converged`
+/// predicate once posterior variance drops below a caller-supplied threshold.
 pub struct KalmanConvergence {
+    /// Posterior estimate of completion probability.
     pub p_c: f64,
+    /// Posterior error covariance (uncertainty in `p_c`).
     pub variance: f64,
+    /// Last measurement residual (measurement − prior prediction).
+    pub innovation: f64,
 }
 
 impl KalmanConvergence {
     #[must_use]
     pub fn new(initial_p: f64) -> Self {
         Self {
-            p_c: initial_p,
+            p_c: initial_p.clamp(0.0, 1.0),
             variance: 1.0,
+            innovation: 0.0,
         }
     }
 
+    /// Run one Kalman predict-update cycle with fixed process/measurement noise.
+    ///
+    /// Returns the updated `p_c` estimate.
     pub fn update(&mut self, measurement: f64) -> f64 {
-        let process_noise = 0.01;
-        let measurement_noise = 0.1;
-        self.variance += process_noise;
-        let kalman_gain = self.variance / (self.variance + measurement_noise);
-        self.p_c += kalman_gain * (measurement - self.p_c);
+        const PROCESS_NOISE: f64 = 0.01;
+        const MEASUREMENT_NOISE: f64 = 0.1;
+
+        // Predict step: propagate variance forward.
+        self.variance += PROCESS_NOISE;
+
+        // Update step.
+        let innovation_covariance = self.variance + MEASUREMENT_NOISE;
+        let kalman_gain = self.variance / innovation_covariance;
+        self.innovation = measurement - self.p_c;
+        self.p_c += kalman_gain * self.innovation;
         self.variance *= 1.0 - kalman_gain;
+
         self.p_c.clamp(0.0, 1.0)
+    }
+
+    /// Returns `true` once the posterior variance falls below `threshold`,
+    /// indicating the estimate has stabilised.
+    #[must_use]
+    pub fn is_converged(&self, threshold: f64) -> bool {
+        self.variance < threshold
+    }
+
+    /// 95 % confidence interval around the current `p_c` estimate.
+    /// Interval is clamped to [0, 1].
+    #[must_use]
+    pub fn confidence_interval(&self) -> (f64, f64) {
+        let half_width = 1.96 * self.variance.sqrt();
+        ((self.p_c - half_width).max(0.0), (self.p_c + half_width).min(1.0))
     }
 }
 
@@ -240,45 +264,165 @@ impl KalmanConvergence {
 pub struct InfluenceWeightManager;
 
 impl InfluenceWeightManager {
+    /// Compute weights using a flat average of certainty × outcome factor.
+    /// Delegates to `calculate_weights_with_recency` with a 0.9 decay factor.
     #[must_use]
     pub fn calculate_weights(sigma: &ConversationState) -> HashMap<String, f64> {
-        let mut weights = HashMap::new();
+        Self::calculate_weights_with_recency(sigma, 0.9)
+    }
+
+    /// Compute weights with exponential recency decay and surprise calibration.
+    ///
+    /// `decay ∈ (0, 1]`: weight for a turn `k` steps ago = `decay^k`.
+    /// A `surprise_signal` close to 1.0 reduces the weight (high surprise =
+    /// the agent was less reliable on that turn).
+    #[must_use]
+    pub fn calculate_weights_with_recency(
+        sigma: &ConversationState,
+        decay: f64,
+    ) -> HashMap<String, f64> {
+        let n = sigma.turns.len();
         let mut agent_stats: HashMap<String, (f64, f64)> = HashMap::new();
 
-        for turn in &sigma.turns {
-            let (score, weight) = agent_stats
-                .entry(turn.model_id.clone())
-                .or_insert((0.0, 0.0));
+        for (i, turn) in sigma.turns.iter().enumerate() {
+            let steps_ago = (n - 1).saturating_sub(i);
+            let recency = decay.powi(steps_ago as i32);
 
             let outcome_factor = match turn.outcome {
                 TurnOutcome::TestsPassed => 1.2,
                 TurnOutcome::Compiled => 1.0,
-                TurnOutcome::Rejected | TurnOutcome::RolledBack => 0.5,
-                _ => 0.8,
+                TurnOutcome::AdvancedConvergence => 1.1,
+                TurnOutcome::Rejected | TurnOutcome::RolledBack => 0.4,
+                TurnOutcome::Stalled => 0.6,
+                TurnOutcome::Unknown => 0.8,
             };
 
             let certainty = turn.certainty.unwrap_or(0.5);
-            *score += certainty * outcome_factor;
-            *weight += 1.0;
+            // Surprise > 0.5 means the agent behaved unexpectedly — reduce trust.
+            let surprise_factor = turn
+                .surprise_signal
+                .map(|s| 1.0 - (s - 0.5).max(0.0) * 0.4)
+                .unwrap_or(1.0);
+
+            let contribution = certainty * outcome_factor * surprise_factor * recency;
+            let (score, weight) = agent_stats
+                .entry(turn.model_id.clone())
+                .or_insert((0.0, 0.0));
+            *score += contribution;
+            *weight += recency;
         }
 
-        for (id, (score, count)) in agent_stats {
-            weights.insert(id, (score / count).clamp(0.1, 2.0));
-        }
+        agent_stats
+            .into_iter()
+            .map(|(id, (score, weight))| {
+                let w = if weight > 0.0 {
+                    (score / weight).clamp(0.1, 2.0)
+                } else {
+                    1.0
+                };
+                (id, w)
+            })
+            .collect()
+    }
 
-        weights
+    /// Return agents sorted by weight descending, highest-influence first.
+    #[must_use]
+    pub fn rank(weights: &HashMap<String, f64>) -> Vec<(String, f64)> {
+        let mut sorted: Vec<(String, f64)> = weights
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
+        sorted
     }
 }
 
+/// Game-theoretical payoff evaluator for artifact proposals.
+///
+/// `evaluate` scores a single artifact on [0, 1].
+/// `compute_payoff_matrix` produces an N×N matrix of payoffs for N competing
+/// proposals so that NashSolver can find pure strategy equilibria.
+/// `best_response` returns the strategy index that maximises the caller's
+/// expected payoff given an opponent's payoff vector.
 pub struct PayoffCalculator;
 
 impl PayoffCalculator {
+    /// Score a single artifact on [0, 1].
+    ///
+    /// Uses `ArtifactMetrics` when populated, falling back to raw content
+    /// length. Proof attachments are a strong positive signal.
     #[must_use]
     pub fn evaluate(artifact: &Artifact) -> f64 {
-        #[allow(clippy::cast_precision_loss)]
-        let length_bonus = (artifact.content.len() as f64 / 1000.0).min(0.2);
-        #[allow(clippy::cast_precision_loss)]
-        let history_penalty = (artifact.history.len() as f64 * 0.05).min(0.3);
-        (0.7 + length_bonus - history_penalty).clamp(0.0, 1.0)
+        let m = &artifact.metrics;
+        let has_metrics = m.line_count > 0;
+
+        let base = if has_metrics {
+            let complexity_penalty = (m.cyclomatic_complexity as f64 * 0.015).min(0.25);
+            let coupling_penalty = (m.coupling as f64 * 0.008).min(0.15);
+            let comment_bonus = (m.comment_density * 0.15).min(0.12);
+            let size_bonus = (m.line_count as f64 / 600.0).min(0.12);
+            0.65 + comment_bonus + size_bonus - complexity_penalty - coupling_penalty
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            let length_bonus = (artifact.content.len() as f64 / 2000.0).min(0.18);
+            #[allow(clippy::cast_precision_loss)]
+            let churn_penalty = (artifact.history.len() as f64 * 0.04).min(0.25);
+            0.65 + length_bonus - churn_penalty
+        };
+
+        let proof_bonus = (artifact.proof_attachments.len() as f64 * 0.04).min(0.12);
+        let version_penalty = if artifact.version > 15 {
+            ((artifact.version - 15) as f64 * 0.008).min(0.08)
+        } else {
+            0.0
+        };
+
+        (base + proof_bonus - version_penalty).clamp(0.0, 1.0)
+    }
+
+    /// Compute an N×N payoff matrix for N competing artifact proposals.
+    ///
+    /// Entry `[i][j]` is agent `i`'s payoff when facing agent `j`'s proposal.
+    /// Payoffs blend relative quality advantage (70 %) with coordination
+    /// incentive toward the current artifact baseline (30 %).
+    #[must_use]
+    pub fn compute_payoff_matrix(
+        proposals: &[(&str, &Artifact)],
+        current: &Artifact,
+    ) -> Vec<Vec<f64>> {
+        let current_score = Self::evaluate(current);
+        let scores: Vec<f64> = proposals.iter().map(|(_, a)| Self::evaluate(a)).collect();
+
+        scores
+            .iter()
+            .map(|&my_score| {
+                scores
+                    .iter()
+                    .map(|&their_score| {
+                        // Relative advantage: normalised to [0, 1].
+                        let relative = ((my_score - their_score) * 0.5 + 0.5).clamp(0.0, 1.0);
+                        // Coordination bonus: reward improvement over current baseline.
+                        let coordination =
+                            (1.0 - (my_score - current_score).abs()).clamp(0.0, 1.0);
+                        relative * 0.7 + coordination * 0.3
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Return the strategy index (row in the payoff matrix) that maximises
+    /// the sum of `my_payoffs[i] + opponent_payoffs[i]` — the Nash-optimal
+    /// joint response given what the opponent will also receive.
+    #[must_use]
+    pub fn best_response(my_payoffs: &[f64], opponent_payoffs: &[f64]) -> usize {
+        my_payoffs
+            .iter()
+            .copied()
+            .zip(opponent_payoffs.iter().copied())
+            .enumerate()
+            .max_by(|(_, (a1, b1)), (_, (a2, b2))| (a1 + b1).total_cmp(&(a2 + b2)))
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     }
 }

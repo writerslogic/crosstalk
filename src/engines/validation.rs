@@ -29,7 +29,9 @@ impl AstVersionHistory {
 
     pub fn record_snapshot(&mut self, turn: u32, nodes: HashMap<String, String>) {
         for (node_id, content) in nodes {
-            self.versions.entry(node_id).or_default().push((turn, content));
+            let entry = self.versions.entry(node_id).or_default();
+            entry.retain(|(t, _)| *t != turn);
+            entry.push((turn, content));
         }
     }
 
@@ -45,6 +47,9 @@ impl AstVersionHistory {
     }
 
     pub fn diff_nodes(&self, node_id: &str, from_turn: u32, to_turn: u32) -> Result<String> {
+        if from_turn == to_turn {
+            return Err(anyhow!("from_turn and to_turn must differ"));
+        }
         let from = self.revert_node(node_id, from_turn)?;
         let to = self.revert_node(node_id, to_turn)?;
         let diff = TextDiff::from_lines(from.as_str(), to.as_str());
@@ -218,7 +223,10 @@ impl AstValidator {
     fn get_node_name(node: Node, content: &str) -> Option<String> {
         // Find identifier child
         for i in 0..node.child_count() {
-            let child = node.child(i).unwrap();
+            let child = match node.child(i) {
+                Some(c) => c,
+                None => continue,
+            };
             if child.kind() == "name"
                 || child.kind() == "identifier"
                 || child.kind() == "type_identifier"

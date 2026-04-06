@@ -200,9 +200,9 @@ fn test_invariant_checker_detects_orphan() {
     let mut state = ConversationState::new("orphan-session");
     state.iteration_index = 3;
 
-    // Add a turn with index >= iteration_index (orphan)
+    // A turn with index > iteration_index is a future-orphan (strictly greater)
     state.turns.push(Turn {
-        index: 3,
+        index: 4,
         model_id: "orphan-model".to_string(),
         content: "This is an orphan turn".to_string(),
         timestamp: ConversationState::now(),

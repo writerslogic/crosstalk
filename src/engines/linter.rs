@@ -110,6 +110,9 @@ impl LinterGuard {
         let src = dir.join(format!("artifact_{uid}.rs"));
         tokio::fs::write(&src, &artifact.content).await?;
 
+        let src_str = src.to_str()
+            .ok_or_else(|| anyhow!("Artifact temp path is not valid UTF-8: {:?}", src))?;
+
         let rustc = Command::new("rustc")
             .args([
                 "--edition",
@@ -118,7 +121,7 @@ impl LinterGuard {
                 "--error-format=json",
                 "-A",
                 "unused",
-                src.to_str().unwrap_or("artifact_check.rs"),
+                src_str,
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

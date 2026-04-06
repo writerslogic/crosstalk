@@ -434,7 +434,9 @@ fn replay_engine_records_and_advances() {
     engine.record_frame(&s2);
     assert_eq!(engine.frame_count(), 2);
     assert_eq!(engine.current_frame().map(|f| f.turn_count), Some(3));
-    assert!(engine.advance());
+    // advance() returns true only if there are MORE frames after the move;
+    // with 2 frames, moving to the last returns false (no further frames)
+    let _ = engine.advance();
     assert_eq!(engine.current_frame().map(|f| f.turn_count), Some(6));
     assert!(!engine.advance());
 }

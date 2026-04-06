@@ -33,11 +33,8 @@ impl HashChain {
         sigma: &ConversationState,
         previous_hash: &[u8; 32],
         current_hash: &[u8; 32],
-    ) -> bool {
-        match Self::compute(sigma, previous_hash) {
-            Ok(computed) => computed == *current_hash,
-            Err(_) => false, // Fail-secure on serialization errors
-        }
+    ) -> Result<bool> {
+        Ok(Self::compute(sigma, previous_hash)? == *current_hash)
     }
 }
 
@@ -55,7 +52,7 @@ impl InvariantChecker {
         }
 
         // 2. Orphan detection: Every turn must belong to the current iteration
-        if sigma.turns.iter().any(|t| t.index >= sigma.iteration_index) {
+        if sigma.turns.iter().any(|t| t.index > sigma.iteration_index) {
             return Err(anyhow!("Invariant violation: Orphan future turn detected"));
         }
 
@@ -95,17 +92,20 @@ impl ContinuousAuditor {
 
             while let Some(sigma) = rx.recv().await {
                 match HashChain::compute(&sigma, &last_hash) {
-                    Ok(expected) if expected != sigma.state_hash => {
+                    Ok(expected) if expected == sigma.state_hash => {
+                        last_hash = sigma.state_hash;
+                    }
+                    Ok(_expected) => {
                         let _ = alert_tx.send(AuditAlert {
                             iteration_index: sigma.iteration_index,
-                            expected_hash: expected,
+                            expected_hash: _expected,
                             actual_hash: sigma.state_hash,
                             timestamp: ConversationState::now(),
                         }).await;
+                        // Do NOT update last_hash; preserve last valid anchor
                     }
-                    _ => {}
+                    Err(_) => {}
                 }
-                last_hash = sigma.state_hash;
             }
         });
 

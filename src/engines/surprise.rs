@@ -16,6 +16,9 @@ impl SurpriseEngine {
 
     /// Record a predicted success probability for a model before execution.
     pub fn record_prediction(&mut self, model_id: &str, certainty: f64) {
+        if !certainty.is_finite() || !(0.0..=1.0).contains(&certainty) {
+            return;
+        }
         self.predictions
             .entry(model_id.to_string())
             .or_default()
