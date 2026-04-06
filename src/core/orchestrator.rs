@@ -8,13 +8,14 @@ use crate::engines::consensus::{
 };
 use crate::engines::diff::DiffEngine;
 use crate::engines::intelligence::{IntelligenceEngine, QualityScorer};
+use crate::engines::linter::LinterGuard;
 use crate::engines::memory::MemoryStore;
 use crate::engines::planning::PlanningEngine;
 use crate::engines::proof::ProofManager;
 use crate::engines::quality::{QualityEngine, RegressionDetector};
 use crate::engines::reasoning::{FallacyDetector, ReasoningEngine};
 use crate::engines::release::ConvergenceReport;
-use crate::engines::sandbox::SandboxManager;
+use crate::engines::sandbox::{SandboxManager, SandboxResult};
 use crate::engines::security::{SecretScanner, TurnSigner};
 use crate::engines::self_improvement::SelfImprovementEngine;
 use crate::engines::simulation::MonteCarloRunner;
@@ -311,6 +312,22 @@ impl Orchestrator {
                             ],
                         );
                         current_artifact.proof_attachments.push(proof);
+
+                        if current_artifact.language.to_lowercase() == "rust"
+                            || current_artifact.language.to_lowercase() == "rs"
+                        {
+                            let sandbox_result = SandboxResult {
+                                exit_code: 0,
+                                stdout: new_content.clone(),
+                                stderr: String::new(),
+                            };
+                            if let Err(e) = LinterGuard::check(&sandbox_result) {
+                                all_valid = false;
+                                turn_outcome = TurnOutcome::Rejected;
+                                eprintln!("[linter] Rust code linting failed for \"{}\": {}", name, e);
+                                break;
+                            }
+                        }
 
                         (Some(delta), updates)
                     } else {

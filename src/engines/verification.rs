@@ -2,6 +2,8 @@ use crate::types::conversation::ConversationState;
 use anyhow::{Result, anyhow};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 
 pub struct HashChain;
 
@@ -62,12 +64,43 @@ impl InvariantChecker {
     }
 }
 
-pub struct ContinuousAuditor;
+pub struct ContinuousAuditor {
+    rx: Mutex<mpsc::Receiver<ConversationState>>,
+}
 
 impl ContinuousAuditor {
     pub fn audit_step(sigma: &ConversationState, last_hash: &[u8; 32]) -> Result<[u8; 32]> {
         let new_hash = HashChain::compute(sigma, last_hash);
         Ok(new_hash)
+    }
+
+    pub fn spawn() -> mpsc::Sender<ConversationState> {
+        let (tx, rx) = mpsc::channel(100);
+        let auditor = Arc::new(ContinuousAuditor {
+            rx: Mutex::new(rx),
+        });
+
+        tokio::spawn({
+            let auditor_clone = Arc::clone(&auditor);
+            async move {
+                let mut rx = auditor_clone.rx.lock().await;
+                let mut last_hash = [0u8; 32];
+
+                while let Some(sigma) = rx.recv().await {
+                    let turn_index = sigma.iteration_index;
+
+                    if HashChain::verify(&sigma, &last_hash, &sigma.state_hash) {
+                        println!("[AUDIT] Hash chain valid at turn {}", turn_index);
+                    } else {
+                        eprintln!("[AUDIT] Hash chain integrity violation detected at turn {}", turn_index);
+                    }
+
+                    last_hash = sigma.state_hash;
+                }
+            }
+        });
+
+        tx
     }
 }
 
