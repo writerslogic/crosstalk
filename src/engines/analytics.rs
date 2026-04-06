@@ -13,10 +13,12 @@ impl AnalyticsEngine {
     pub fn generate_report(sigma: &ConversationState) -> AnalyticsReport {
         let convergence = Self::analyze_convergence(sigma);
         let agent_performances = Self::profile_agents(sigma);
+        let recommendations = StrategyRecommender::recommend(sigma);
         AnalyticsReport {
             session_id: sigma.session_id.clone(),
             convergence,
             agent_performances,
+            recommendations,
             timestamp: ConversationState::now(),
         }
     }

@@ -1,5 +1,6 @@
 use crate::types::compute::{BudgetMode, CostEntry};
 use crate::types::conversation::ConversationState;
+use sha2::{Digest, Sha256};
 use anyhow::Result;
 use rand::Rng;
 use std::collections::HashMap;
@@ -180,7 +181,7 @@ impl InferenceCache {
     }
 
     pub fn get(&mut self, prompt: &str, model_id: &str) -> Option<String> {
-        let key = format!("{}:{}", prompt, model_id);
+        let key = Self::cache_key(prompt, model_id);
         if let Some((res, _)) = self.entries.get(&key) {
             self.hits += 1;
             Some(res.clone())
@@ -191,8 +192,16 @@ impl InferenceCache {
     }
 
     pub fn insert(&mut self, prompt: &str, model_id: &str, response: String, quality: f64) {
-        let key = format!("{}:{}", prompt, model_id);
+        let key = Self::cache_key(prompt, model_id);
         self.entries.insert(key, (response, quality));
+    }
+
+    fn cache_key(prompt: &str, model_id: &str) -> String {
+        let mut h = Sha256::new();
+        h.update(prompt.as_bytes());
+        h.update(b":");
+        h.update(model_id.as_bytes());
+        format!("{:x}", h.finalize())
     }
 
     #[must_use]
@@ -257,6 +266,14 @@ impl LatencyRouter {
             .iter()
             .filter(|id| self.thresholds_ms.get(*id).copied().unwrap_or(0) <= limit_ms)
             .collect()
+    }
+
+    /// Returns the single fastest model that satisfies the urgency constraint.
+    #[must_use]
+    pub fn select<'a>(&self, candidates: &'a [String], urgency: Urgency) -> Option<&'a String> {
+        self.filter(candidates, urgency)
+            .into_iter()
+            .min_by_key(|id| self.thresholds_ms.get(*id).copied().unwrap_or(u64::MAX))
     }
 }
 

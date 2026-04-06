@@ -287,12 +287,18 @@ impl StrategyMixer {
     }
 
     #[must_use]
-    pub fn blend(&self, task: TaskCategory) -> Vec<(TurnStructure, f64)> {
+    pub fn blend(&self, task: TaskCategory, agent_id: Option<&str>) -> Vec<(TurnStructure, f64)> {
         let mut acc: HashMap<TurnStructure, (f64, u32)> = HashMap::new();
-        for r in self.history.iter().filter(|r| r.task == task) {
+        for r in self.history.iter().filter(|r| {
+            r.task == task && agent_id.is_none_or(|id| r.agent_id == id)
+        }) {
             let e = acc.entry(r.structure).or_default();
             e.0 += r.quality_score;
             e.1 += 1;
+        }
+        // Fall back to task-wide data if no agent-specific data
+        if acc.is_empty() && agent_id.is_some() {
+            return self.blend(task, None);
         }
         let mut out: Vec<(TurnStructure, f64)> = acc
             .into_iter()
@@ -335,9 +341,9 @@ impl StructureSelector {
     }
 
     #[must_use]
-    pub fn recommend(&self, task: TaskCategory, _agent_id: &str) -> TurnStructure {
+    pub fn recommend(&self, task: TaskCategory, agent_id: &str) -> TurnStructure {
         self.mixer
-            .blend(task)
+            .blend(task, Some(agent_id))
             .first()
             .map(|(s, _)| *s)
             .unwrap_or(TurnStructure::FreeForm)
