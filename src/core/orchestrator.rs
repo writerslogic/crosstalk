@@ -321,7 +321,7 @@ impl Orchestrator {
                                 stdout: new_content.clone(),
                                 stderr: String::new(),
                             };
-                            if let Err(e) = LinterGuard::check(&sandbox_result) {
+                            if let Err(e) = LinterGuard::check(&sandbox_result, "/tmp").await {
                                 all_valid = false;
                                 turn_outcome = TurnOutcome::Rejected;
                                 eprintln!("[linter] Rust code linting failed for \"{}\": {}", name, e);
