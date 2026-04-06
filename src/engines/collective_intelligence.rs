@@ -95,17 +95,132 @@ impl PeerReview {
 pub struct EnsembleEngine;
 
 impl EnsembleEngine {
+    /// Quality-weighted merge: select paragraphs from the proposal with the
+    /// highest score for that segment, falling back to the best overall.
+    #[must_use]
     pub fn merge_proposals(proposals: Vec<(String, String, f64)>) -> String {
         if proposals.is_empty() {
             return String::new();
         }
-        // Heuristic: pick the highest quality proposal as the base
-        let mut best = &proposals[0];
-        for p in &proposals {
-            if p.2 > best.2 {
-                best = p;
+
+        let best_idx = proposals
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.2.total_cmp(&b.2))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        let base_paragraphs: Vec<&str> = proposals[best_idx].1.split("\n\n").collect();
+        let mut merged = String::with_capacity(proposals[best_idx].1.len());
+
+        for para in &base_paragraphs {
+            let mut best_para = (*para, proposals[best_idx].2);
+            for (_, content, score) in &proposals {
+                for candidate in content.split("\n\n") {
+                    let overlap = para
+                        .split_whitespace()
+                        .filter(|w| candidate.contains(*w))
+                        .count();
+                    let total = para.split_whitespace().count().max(1);
+                    if overlap as f64 / total as f64 > 0.5 && *score > best_para.1 {
+                        best_para = (candidate, *score);
+                    }
+                }
             }
+            if !merged.is_empty() {
+                merged.push_str("\n\n");
+            }
+            merged.push_str(best_para.0);
         }
-        best.1.clone()
+
+        merged
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TeamComposition {
+    pub architect: Option<String>,
+    pub coder: Option<String>,
+    pub critic: Option<String>,
+}
+
+pub struct DynamicTeamComposer;
+
+impl DynamicTeamComposer {
+    #[must_use]
+    pub fn compose(
+        profiles: &HashMap<String, AgentProfile>,
+        task_category: &str,
+    ) -> TeamComposition {
+        let mut ranked: Vec<(&String, f64)> = profiles
+            .iter()
+            .map(|(id, p)| {
+                let score = p
+                    .capabilities
+                    .iter()
+                    .find(|(cat, _)| format!("{:?}", cat).to_lowercase().contains(task_category))
+                    .map(|(_, s)| *s)
+                    .unwrap_or(0.5);
+                (id, score)
+            })
+            .collect();
+
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        TeamComposition {
+            architect: ranked.first().map(|(id, _)| (*id).clone()),
+            coder: ranked.get(1).map(|(id, _)| (*id).clone()),
+            critic: ranked.get(2).map(|(id, _)| (*id).clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StrategyOutcome {
+    pub strategy_name: String,
+    pub quality_sum: f64,
+    pub trial_count: u32,
+}
+
+impl StrategyOutcome {
+    #[must_use]
+    pub fn avg_quality(&self) -> f64 {
+        if self.trial_count == 0 {
+            0.0
+        } else {
+            self.quality_sum / self.trial_count as f64
+        }
+    }
+}
+
+pub struct MetaStrategyOptimizer {
+    pub outcomes: HashMap<String, StrategyOutcome>,
+}
+
+impl MetaStrategyOptimizer {
+    pub fn new() -> Self {
+        Self { outcomes: HashMap::new() }
+    }
+
+    pub fn record(&mut self, strategy: &str, quality: f64) {
+        let e = self.outcomes.entry(strategy.to_string()).or_default();
+        e.strategy_name = strategy.to_string();
+        e.quality_sum += quality;
+        e.trial_count += 1;
+    }
+
+    #[must_use]
+    pub fn best_strategy(&self) -> Option<&str> {
+        self.outcomes
+            .values()
+            .filter(|o| o.trial_count >= 3)
+            .max_by(|a, b| a.avg_quality().total_cmp(&b.avg_quality()))
+            .map(|o| o.strategy_name.as_str())
+    }
+}
+
+impl Default for MetaStrategyOptimizer {
+    fn default() -> Self {
+        Self::new()
     }
 }

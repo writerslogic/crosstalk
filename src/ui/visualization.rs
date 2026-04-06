@@ -1,5 +1,6 @@
 use crate::types::conversation::ConversationState;
 use anyhow::Result;
+use std::collections::VecDeque;
 
 #[derive(Default)]
 pub struct GodView {
@@ -146,6 +147,179 @@ impl HeatmapGenerator {
             }
         }
         heatmap
+    }
+}
+
+pub struct TimelineManager {
+    pub checkpoints: VecDeque<ConversationState>,
+    pub cursor: usize,
+}
+
+impl TimelineManager {
+    pub fn new() -> Self {
+        Self { checkpoints: VecDeque::new(), cursor: 0 }
+    }
+
+    pub fn push(&mut self, state: ConversationState) {
+        self.checkpoints.push_back(state);
+    }
+
+    #[must_use]
+    pub fn seek(&self, iteration: u32) -> Option<&ConversationState> {
+        self.checkpoints
+            .iter()
+            .find(|s| s.iteration_index == iteration)
+    }
+
+    #[must_use]
+    pub fn current(&self) -> Option<&ConversationState> {
+        self.checkpoints.get(self.cursor)
+    }
+
+    pub fn step_forward(&mut self) {
+        if self.cursor + 1 < self.checkpoints.len() {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn step_back(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.checkpoints.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.checkpoints.is_empty()
+    }
+}
+
+impl Default for TimelineManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplayFrame {
+    pub iteration: u32,
+    pub session_id: String,
+    pub completion_probability: f64,
+    pub turn_count: usize,
+}
+
+pub struct ReplayEngine {
+    pub frames: Vec<ReplayFrame>,
+    pub playback_speed: f32,
+    cursor: usize,
+}
+
+impl ReplayEngine {
+    pub fn new(speed: f32) -> Self {
+        Self { frames: Vec::new(), playback_speed: speed, cursor: 0 }
+    }
+
+    pub fn record_frame(&mut self, state: &ConversationState) {
+        self.frames.push(ReplayFrame {
+            iteration: state.iteration_index,
+            session_id: state.session_id.clone(),
+            completion_probability: state.completion_probability,
+            turn_count: state.turns.len(),
+        });
+    }
+
+    #[must_use]
+    pub fn current_frame(&self) -> Option<&ReplayFrame> {
+        self.frames.get(self.cursor)
+    }
+
+    pub fn advance(&mut self) -> bool {
+        if self.cursor + 1 < self.frames.len() {
+            self.cursor += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.cursor = 0;
+    }
+
+    #[must_use]
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+}
+
+pub struct SvgExporter;
+
+impl SvgExporter {
+    #[must_use]
+    pub fn export_graph(graph: &ForceDirectedGraph, width: f32, height: f32) -> String {
+        let mut svg = format!(
+            r##"<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="#0a0a0f"/>"##
+        );
+
+        for edge in &graph.edges {
+            if let (Some(src), Some(tgt)) =
+                (graph.nodes.get(edge.source), graph.nodes.get(edge.target))
+            {
+                svg.push_str(&format!(
+                    r##"<line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="#444" stroke-width="1"/>"##,
+                    src.x + width / 2.0,
+                    src.y + height / 2.0,
+                    tgt.x + width / 2.0,
+                    tgt.y + height / 2.0,
+                ));
+            }
+        }
+
+        for node in &graph.nodes {
+            let r = (node.weight * 5.0).clamp(3.0, 20.0);
+            svg.push_str(&format!(
+                r##"<circle cx="{:.1}" cy="{:.1}" r="{:.1}" fill="#00ff88"/><text x="{:.1}" y="{:.1}" font-size="10" fill="#fff">{}</text>"##,
+                node.x + width / 2.0,
+                node.y + height / 2.0,
+                r,
+                node.x + width / 2.0 + r + 2.0,
+                node.y + height / 2.0 + 4.0,
+                node.id,
+            ));
+        }
+
+        svg.push_str("</svg>");
+        svg
+    }
+
+    #[must_use]
+    pub fn export_heatmap(
+        artifact_name: &str,
+        heatmap: &[f32],
+        width: u32,
+        height: u32,
+    ) -> String {
+        let max_val = heatmap.iter().cloned().fold(0.0_f32, f32::max).max(1.0);
+        let cell_w = (width as f32 / heatmap.len().max(1) as f32).max(1.0);
+
+        let mut svg = format!(
+            r##"<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="#0a0a0f"/><text x="4" y="14" font-size="12" fill="#fff">{artifact_name}</text>"##
+        );
+
+        for (i, &val) in heatmap.iter().enumerate() {
+            let intensity = (val / max_val * 255.0) as u8;
+            let x = i as f32 * cell_w;
+            svg.push_str(&format!(
+                r##"<rect x="{x:.1}" y="20" width="{cell_w:.1}" height="{h}" fill="rgb({intensity},0,0)"/>"##,
+                h = height - 20,
+            ));
+        }
+
+        svg.push_str("</svg>");
+        svg
     }
 }
 
