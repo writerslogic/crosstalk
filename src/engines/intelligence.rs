@@ -8,17 +8,76 @@ use tokio::fs;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{interval, Duration};
 
+pub struct CheckpointService {
+    flush_tx: Option<mpsc::Sender<()>>,
+    #[allow(dead_code)]
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl CheckpointService {
+    fn new() -> Self {
+        Self { flush_tx: None, handle: None }
+    }
+
+    fn spawn(
+        path: String,
+        profiles: Arc<DashMap<String, ModelProfile>>,
+        templates: Arc<RwLock<Vec<PromptTemplate>>>,
+    ) -> Self {
+        let (tx, mut rx) = mpsc::channel(1);
+        let handle = tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    Some(_) = rx.recv() => {
+                        ticker.tick().await;
+                        while rx.try_recv().is_ok() {}
+                        let profiles_map: HashMap<String, ModelProfile> = profiles
+                            .iter()
+                            .map(|entry| (entry.key().clone(), entry.value().clone()))
+                            .collect();
+                        let data = serde_json::json!({
+                            "profiles": profiles_map,
+                            "templates": &*templates.read().await,
+                        });
+                        if let Ok(content) = serde_json::to_string_pretty(&data) {
+                            let temp_path = format!("{}.tmp", path);
+                            if fs::write(&temp_path, content).await.is_ok() {
+                                let _ = fs::rename(&temp_path, &path).await;
+                            }
+                        }
+                    }
+                    else => break,
+                }
+            }
+        });
+        Self { flush_tx: Some(tx), handle: Some(handle) }
+    }
+
+    fn trigger(&self) {
+        if let Some(tx) = &self.flush_tx {
+            let _ = tx.try_send(());
+        }
+    }
+
+    pub fn save_all(&self) -> Result<()> {
+        self.trigger();
+        Ok(())
+    }
+}
+
 pub struct IntelligenceEngine {
-    /// Upgraded to DashMap for lock-free concurrent updates across the Swarm
     pub profiles: Arc<DashMap<String, ModelProfile>>,
-    /// Templates rarely change at runtime, RwLock optimizes for heavy concurrent reads
     pub templates: Arc<RwLock<Vec<PromptTemplate>>>,
     pub storage_path: Option<String>,
     pub latency_predictor: LatencyPredictor,
-    /// Background channel for non-blocking disk writes
-    flush_tx: Option<mpsc::Sender<()>>,
-    /// Retained so panics in the actor surface as JoinErrors rather than being silently dropped
-    checkpoint_handle: Option<tokio::task::JoinHandle<()>>,
+    checkpoint: CheckpointService,
+}
+
+impl Default for IntelligenceEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IntelligenceEngine {
@@ -29,8 +88,7 @@ impl IntelligenceEngine {
             templates: Arc::new(RwLock::new(Vec::new())),
             storage_path: None,
             latency_predictor: LatencyPredictor::new(),
-            flush_tx: None,
-            checkpoint_handle: None,
+            checkpoint: CheckpointService::new(),
         }
     }
 
@@ -41,8 +99,7 @@ impl IntelligenceEngine {
             templates: Arc::new(RwLock::new(Vec::new())),
             storage_path: Some(path.to_string()),
             latency_predictor: LatencyPredictor::new(),
-            flush_tx: None,
-            checkpoint_handle: None,
+            checkpoint: CheckpointService::new(),
         };
 
         engine.load_profiles().await?;
@@ -53,72 +110,34 @@ impl IntelligenceEngine {
 
     /// Asynchronous, non-blocking file read.
     pub async fn load_profiles(&self) -> Result<()> {
-        if let Some(path) = &self.storage_path {
-            if tokio::fs::try_exists(path).await.unwrap_or(false) {
-                let content = fs::read_to_string(path).await.context("Failed to read intelligence data")?;
-                let data: serde_json::Value = serde_json::from_str(&content)?;
-                
-                if let Some(profiles) = data.get("profiles") {
-                    let parsed: HashMap<String, ModelProfile> = serde_json::from_value(profiles.clone())?;
-                    for (k, v) in parsed {
-                        self.profiles.insert(k, v);
-                    }
+        if let Some(path) = &self.storage_path
+            && tokio::fs::try_exists(path).await.unwrap_or(false)
+        {
+            let content = fs::read_to_string(path).await.context("Failed to read intelligence data")?;
+            let data: serde_json::Value = serde_json::from_str(&content)?;
+            if let Some(profiles) = data.get("profiles") {
+                let parsed: HashMap<String, ModelProfile> = serde_json::from_value(profiles.clone())?;
+                for (k, v) in parsed {
+                    self.profiles.insert(k, v);
                 }
-                if let Some(templates) = data.get("templates") {
-                    *self.templates.write().await = serde_json::from_value(templates.clone())?;
-                }
+            }
+            if let Some(templates) = data.get("templates") {
+                *self.templates.write().await = serde_json::from_value(templates.clone())?;
             }
         }
         Ok(())
     }
 
-    /// Spawns a background actor that "debounces" disk writes.
-    /// Instead of writing to disk 1,000 times a second, it wakes up periodically,
-    /// checks if a write was requested, and dumps the state exactly once.
     fn spawn_checkpoint_actor(&mut self) {
         if let Some(path) = self.storage_path.clone() {
-            let (tx, mut rx) = mpsc::channel(1);
-            self.flush_tx = Some(tx);
-            let profiles_ref = Arc::clone(&self.profiles);
-            let templates_ref = Arc::clone(&self.templates);
-
-            self.checkpoint_handle = Some(tokio::spawn(async move {
-                let mut ticker = interval(Duration::from_secs(5)); // Debounce window
-
-                loop {
-                    tokio::select! {
-                        Some(_) = rx.recv() => {
-                            // A write was requested. Wait for the tick to batch changes.
-                            ticker.tick().await;
-                            
-                            // Drain any subsequent requests that piled up during the wait
-                            while rx.try_recv().is_ok() {}
-
-                            let profiles_map: HashMap<String, ModelProfile> = profiles_ref
-                                .iter()
-                                .map(|entry| (entry.key().clone(), entry.value().clone()))
-                                .collect();
-                            let data = serde_json::json!({
-                                "profiles": profiles_map,
-                                "templates": &*templates_ref.read().await,
-                            });
-                            
-                            if let Ok(content) = serde_json::to_string_pretty(&data) {
-                                // Write to a temp file and rename to prevent corruption on crash
-                                let temp_path = format!("{}.tmp", path);
-                                if fs::write(&temp_path, content).await.is_ok() {
-                                    let _ = fs::rename(&temp_path, &path).await;
-                                }
-                            }
-                        }
-                        else => break,
-                    }
-                }
-            }));
+            self.checkpoint = CheckpointService::spawn(
+                path,
+                Arc::clone(&self.profiles),
+                Arc::clone(&self.templates),
+            );
         }
     }
 
-    /// Thread-safe, non-blocking profile update.
     pub fn update_profile(&self, turn: &Turn, quality_score: f64) {
         let mut profile = self.profiles.entry(turn.model_id.clone()).or_insert_with(|| ModelProfile {
             model_id: turn.model_id.clone(),
@@ -146,16 +165,12 @@ impl IntelligenceEngine {
         }
     }
 
-    /// Non-blocking signal to the background writer.
     fn trigger_save(&self) {
-        if let Some(tx) = &self.flush_tx {
-            let _ = tx.try_send(()); // try_send ignores if the channel is full (already queued)
-        }
+        self.checkpoint.trigger();
     }
 
     pub fn save_all(&self) -> Result<()> {
-        self.trigger_save();
-        Ok(())
+        self.checkpoint.save_all()
     }
 
     pub fn detect_regression(&self, model_id: &str, recent_turns: &[Turn]) -> Option<RegressionAlert> {
@@ -256,10 +271,10 @@ impl IntelligenceEngine {
             if blacklist.contains(model) {
                 issues.push(format!("{} is blacklisted", model));
             }
-            if let Some(profile) = self.profiles.get(model) {
-                if profile.latency_ms.mean > latency_ms as f64 {
-                    issues.push(format!("{} latency {}ms exceeds {}ms limit", model, profile.latency_ms.mean as u64, latency_ms));
-                }
+            if let Some(profile) = self.profiles.get(model)
+                && profile.latency_ms.mean > latency_ms as f64
+            {
+                issues.push(format!("{} latency {}ms exceeds {}ms limit", model, profile.latency_ms.mean as u64, latency_ms));
             }
         }
 
@@ -334,7 +349,7 @@ impl QualityScorer {
             score += certainty * 0.1;
         }
 
-        score.max(0.0).min(1.0)
+        score.clamp(0.0, 1.0)
     }
 }
 
@@ -491,6 +506,107 @@ impl ModelEnsemble {
     }
 }
 
+pub struct PromptComposer;
+
+impl PromptComposer {
+    pub fn compose(
+        template: &PromptTemplate,
+        base_task: &str,
+        context_turns: &[&Turn],
+        profile: &ModelProfile,
+    ) -> Result<String> {
+        let context_str = context_turns
+            .iter()
+            .take(3)
+            .map(|t| format!("[Turn {}|{}] {}", t.index, t.model_id, t.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let cat = template.category();
+        let profile_summary = if profile.task_scores.is_empty() {
+            format!("{} (no history)", profile.model_id)
+        } else {
+            let avg = profile.task_scores.get(&cat).map(|ra| ra.mean).unwrap_or(0.5);
+            format!("{} | {:?} mean: {:.2} | {} turns", profile.model_id, cat, avg, profile.total_turns)
+        };
+
+        let mut vars = HashMap::new();
+        vars.insert("task".to_string(), base_task.to_string());
+        vars.insert("context".to_string(), context_str);
+        vars.insert("profile_summary".to_string(), profile_summary);
+
+        template.render(&vars)
+    }
+
+    pub fn select_template(
+        templates: &[PromptTemplate],
+        category: TaskCategory,
+        is_in_regression: bool,
+    ) -> Option<&PromptTemplate> {
+        let matching: Vec<&PromptTemplate> = templates
+            .iter()
+            .filter(|t| t.category() == category)
+            .collect();
+
+        if is_in_regression {
+            matching.iter().find(|t| t.is_corrective()).copied()
+                .or_else(|| matching.first().copied())
+        } else {
+            matching.iter().find(|t| !t.is_corrective()).copied()
+                .or_else(|| matching.first().copied())
+        }
+    }
+}
+
+pub struct RegressionFeedbackHandler;
+
+impl RegressionFeedbackHandler {
+    pub fn compose_corrective_prompt(
+        alert: &RegressionAlert,
+        base_prompt: &str,
+        examples: &[String],
+    ) -> String {
+        let mut out = format!(
+            "[Corrective: {:.0}% quality drop on {:?} — baseline {:.2}, recent {:.2}]\n",
+            alert.severity * 100.0,
+            alert.task_category,
+            alert.baseline_mean,
+            alert.recent_mean,
+        );
+
+        if !examples.is_empty() {
+            out.push_str("Counter-examples (successful turns):\n");
+            for (i, ex) in examples.iter().take(3).enumerate() {
+                out.push_str(&format!("  {}. {}\n", i + 1, ex));
+            }
+        }
+
+        out.push_str(base_prompt);
+        out
+    }
+
+    pub fn counter_examples(turns: &[Turn], category: TaskCategory) -> Vec<String> {
+        turns
+            .iter()
+            .filter(|t| {
+                t.task_category == Some(category)
+                    && matches!(
+                        t.outcome,
+                        TurnOutcome::TestsPassed
+                            | TurnOutcome::Compiled
+                            | TurnOutcome::AdvancedConvergence
+                    )
+            })
+            .rev()
+            .take(3)
+            .map(|t| {
+                let preview: String = t.content.chars().take(80).collect();
+                format!("[Turn {}|{}] {}", t.index, t.model_id, preview)
+            })
+            .collect()
+    }
+}
+
 pub struct LatencyPredictor {
     history: DashMap<String, VecDeque<u64>>,
     ema: DashMap<String, f64>,
@@ -541,5 +657,11 @@ impl LatencyPredictor {
             d * d
         }).sum::<f64>() / hist.len() as f64;
         variance.sqrt() > mean * 0.5
+    }
+}
+
+impl Default for LatencyPredictor {
+    fn default() -> Self {
+        Self::new()
     }
 }

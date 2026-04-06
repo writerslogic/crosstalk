@@ -1,5 +1,5 @@
 use crate::types::artifact::Artifact;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use petgraph::graph::DiGraph;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet}; 
@@ -167,10 +167,10 @@ impl QualityEngine {
                     let trimmed = line.trim_start();
                     if trimmed.starts_with("use ") || trimmed.starts_with("mod ") {
                         for token in trimmed.split(|c: char| !c.is_alphanumeric() && c != '_') {
-                            if let Some(&target_idx) = node_indices.get(token) {
-                                if current_idx != target_idx {
-                                    local_edges.push((current_idx, target_idx));
-                                }
+                            if let Some(&target_idx) = node_indices.get(token)
+                                && current_idx != target_idx
+                            {
+                                local_edges.push((current_idx, target_idx));
                             }
                         }
                     }

@@ -1,3 +1,5 @@
+use anyhow::{Result, anyhow};
+use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
 use thiserror::Error;
 use tree_sitter::{Node, Parser};
@@ -13,6 +15,56 @@ pub enum ValidationError {
     },
     #[error("Unsupported language: {0}")]
     UnsupportedLanguage(String),
+}
+
+pub struct AstVersionHistory {
+    versions: HashMap<String, Vec<(u32, String)>>,
+}
+
+impl AstVersionHistory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { versions: HashMap::new() }
+    }
+
+    pub fn record_snapshot(&mut self, turn: u32, nodes: HashMap<String, String>) {
+        for (node_id, content) in nodes {
+            self.versions.entry(node_id).or_default().push((turn, content));
+        }
+    }
+
+    pub fn revert_node(&self, node_id: &str, target_turn: u32) -> Result<String> {
+        let history = self.versions.get(node_id)
+            .ok_or_else(|| anyhow!("Node '{}' not found in history", node_id))?;
+        history
+            .iter()
+            .rev()
+            .find(|(t, _)| *t <= target_turn)
+            .map(|(_, c)| c.clone())
+            .ok_or_else(|| anyhow!("Node '{}' did not exist at turn {}", node_id, target_turn))
+    }
+
+    pub fn diff_nodes(&self, node_id: &str, from_turn: u32, to_turn: u32) -> Result<String> {
+        let from = self.revert_node(node_id, from_turn)?;
+        let to = self.revert_node(node_id, to_turn)?;
+        let diff = TextDiff::from_lines(from.as_str(), to.as_str());
+        let mut out = String::new();
+        for change in diff.iter_all_changes() {
+            let sign = match change.tag() {
+                ChangeTag::Delete => "-",
+                ChangeTag::Insert => "+",
+                ChangeTag::Equal => " ",
+            };
+            out.push_str(&format!("{}{}", sign, change));
+        }
+        Ok(out)
+    }
+}
+
+impl Default for AstVersionHistory {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub struct AstValidator;
@@ -33,7 +85,9 @@ impl AstValidator {
         }
 
         let mut parser = Parser::new();
-        let _ = parser.set_language(&tree_sitter_rust::LANGUAGE.into());
+        if parser.set_language(&tree_sitter_rust::LANGUAGE.into()).is_err() {
+            return HashMap::new();
+        }
         let tree = match parser.parse(content, None) {
             Some(t) => t,
             None => return HashMap::new(),
@@ -66,7 +120,9 @@ impl AstValidator {
         }
 
         let mut parser = Parser::new();
-        let _ = parser.set_language(&tree_sitter_rust::LANGUAGE.into());
+        if parser.set_language(&tree_sitter_rust::LANGUAGE.into()).is_err() {
+            return String::new();
+        }
         let tree = match parser.parse(content, None) {
             Some(t) => t,
             None => return String::new(),

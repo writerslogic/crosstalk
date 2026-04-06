@@ -52,16 +52,10 @@ impl SwarmController {
                 tokio::select! {
                     Some(handle) = task_rx.recv() => {
                         join_set.spawn(async move {
-                            if let Err(e) = handle.await {
-                                eprintln!("Swarm Node panicked: {:?}", e);
-                            }
+                            let _ = handle.await;
                         });
                     }
-                    Some(res) = join_set.join_next() => {
-                        if let Err(e) = res {
-                            eprintln!("JoinSet execution error: {:?}", e);
-                        }
-                    }
+                    Some(_res) = join_set.join_next() => {}
                     else => break, // Channel closed
                 }
             }
@@ -94,20 +88,15 @@ impl SwarmController {
             loop {
                 tokio::select! {
                     // 1. Process incoming turns from the Swarm
-                    Ok(turn) = turn_rx.recv() => {
-                        // Log or process the turn
-                        println!("Node {} processing turn: {:?}", id_clone, turn);
-                        
+                    Ok(_turn) = turn_rx.recv() => {
                         // Simulate heavy distributed workload
                         tokio::time::sleep(Duration::from_millis(50)).await;
-                        
+
                         nodes_ref.insert(id_clone.clone(), NodeStatus::WaitingMerge);
                     }
-                    
+
                     // 2. React to out-of-band network notifications
-                    _ = notify_ref.notified() => {
-                        println!("Node {} received direct work notification.", id_clone);
-                    }
+                    _ = notify_ref.notified() => {}
 
                     // 3. Graceful shutdown condition (e.g., channel closed)
                     else => {
@@ -241,6 +230,6 @@ impl GlobalMergeGate {
             return false;
         }
         let approvals = votes.iter().filter(|v| v.approve).count();
-        approvals >= (total_nodes >> 1) + 1
+        approvals > (total_nodes >> 1)
     }
 }

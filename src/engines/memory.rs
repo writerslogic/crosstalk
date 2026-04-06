@@ -1,4 +1,6 @@
 use crate::types::conversation::{ConversationState, Turn, TurnOutcome};
+use fastembed::TextEmbedding;
+use std::sync::OnceLock;
 use crate::types::memory::{
     DeletionLogEntry, MemoryRecord, MemoryStoreStats, SnapshotBundle, SnapshotMetadata,
 };
@@ -31,7 +33,15 @@ fn normalize_vector(vec: &[f32]) -> Vec<f32> {
     vec.iter().map(|x| x / norm).collect()
 }
 
-fn embed_text(text: &str) -> Vec<f32> {
+static EMBEDDER: OnceLock<Option<TextEmbedding>> = OnceLock::new();
+
+fn get_embedder() -> Option<&'static TextEmbedding> {
+    EMBEDDER
+        .get_or_init(|| TextEmbedding::try_new(Default::default()).ok())
+        .as_ref()
+}
+
+fn embed_text_hash(text: &str) -> Vec<f32> {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
     let hash = hasher.finalize();
@@ -53,6 +63,17 @@ fn embed_text(text: &str) -> Vec<f32> {
     normalize_vector(&embedding)
 }
 
+fn embed_text(text: &str) -> Vec<f32> {
+    if let Some(model) = get_embedder()
+        && let Ok(mut vecs) = model.embed(vec![text], None)
+        && let Some(v) = vecs.pop()
+        && v.len() == EMBEDDING_DIM
+    {
+        return normalize_vector(&v);
+    }
+    embed_text_hash(text)
+}
+
 fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
@@ -64,10 +85,10 @@ fn dir_size(path: &str) -> u64 {
             if let Ok(meta) = entry.metadata() {
                 if meta.is_file() {
                     total += meta.len();
-                } else if meta.is_dir() {
-                    if let Some(sub) = entry.path().to_str() {
-                        total += dir_size(sub);
-                    }
+                } else if meta.is_dir()
+                    && let Some(sub) = entry.path().to_str()
+                {
+                    total += dir_size(sub);
                 }
             }
         }
@@ -85,7 +106,7 @@ fn record_weight(r: &MemoryRecord) -> f64 {
     }
 }
 
-fn batch_to_records(batch: &RecordBatch) -> Result<Vec<MemoryRecord>> {
+fn batch_to_records(batch: &RecordBatch, dim: usize) -> Result<Vec<MemoryRecord>> {
     let turn_ids = batch
         .column_by_name("turn_id")
         .ok_or_else(|| anyhow!("missing column: turn_id"))?
@@ -130,7 +151,7 @@ fn batch_to_records(batch: &RecordBatch) -> Result<Vec<MemoryRecord>> {
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| anyhow!("type error: vector float elements"))?;
-            let embedding: Vec<f32> = (0..EMBEDDING_DIM).map(|j| float_vals.value(j)).collect();
+            let embedding: Vec<f32> = (0..dim).map(|j| float_vals.value(j)).collect();
             Ok(MemoryRecord {
                 turn_id: turn_ids.value(i),
                 session_id: session_ids.value(i).to_string(),
@@ -145,7 +166,13 @@ fn batch_to_records(batch: &RecordBatch) -> Result<Vec<MemoryRecord>> {
 }
 
 pub async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-    Ok(texts.into_iter().map(|t| embed_text(&t)).collect())
+    if let Some(model) = get_embedder() {
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        if let Ok(vecs) = model.embed(refs, None) {
+            return Ok(vecs.into_iter().map(|v| normalize_vector(&v)).collect());
+        }
+    }
+    Ok(texts.iter().map(|t| embed_text_hash(t)).collect())
 }
 
 fn outcome_weight(outcome: &TurnOutcome) -> f64 {
@@ -165,6 +192,7 @@ pub struct MemoryStore {
     conn: Option<Connection>,
     cluster_assignments: HashMap<u32, usize>,
     pub deletion_log: Vec<DeletionLogEntry>,
+    pub embedding_dim: usize,
 }
 
 impl MemoryStore {
@@ -175,6 +203,18 @@ impl MemoryStore {
             conn: None,
             cluster_assignments: HashMap::new(),
             deletion_log: Vec::new(),
+            embedding_dim: EMBEDDING_DIM,
+        }
+    }
+
+    #[must_use]
+    pub fn new_with_dim(uri: &str, dim: usize) -> Self {
+        Self {
+            uri: uri.to_string(),
+            conn: None,
+            cluster_assignments: HashMap::new(),
+            deletion_log: Vec::new(),
+            embedding_dim: dim,
         }
     }
 
@@ -193,7 +233,7 @@ impl MemoryStore {
                         "vector",
                         DataType::FixedSizeList(
                             Arc::new(Field::new("item", DataType::Float32, true)),
-                            EMBEDDING_DIM as i32,
+                            self.embedding_dim as i32,
                         ),
                         false,
                     ),
@@ -244,7 +284,7 @@ impl MemoryStore {
         let vector_values = Arc::new(Float32Array::from(flattened));
         let field = Arc::new(Field::new("item", DataType::Float32, true));
         let vector_array =
-            FixedSizeListArray::try_new(field, EMBEDDING_DIM as i32, vector_values, None)?;
+            FixedSizeListArray::try_new(field, self.embedding_dim as i32, vector_values, None)?;
 
         let batch = RecordBatch::try_new(
             table.schema().await?,
@@ -374,7 +414,7 @@ impl MemoryStore {
 
         let mut records = Vec::new();
         while let Some(batch_res) = stream.next().await {
-            records.extend(batch_to_records(&batch_res?)?);
+            records.extend(batch_to_records(&batch_res?, self.embedding_dim)?);
         }
         Ok(records)
     }
@@ -439,7 +479,7 @@ impl MemoryStore {
 
         const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024; // 64 MB
         let bundle_bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
-            let mut decoder = GzDecoder::new(&bytes[..]);
+            let decoder = GzDecoder::new(&bytes[..]);
             let mut decompressed = Vec::new();
             decoder.take(MAX_SNAPSHOT_BYTES).read_to_end(&mut decompressed)?;
             decompressed
@@ -528,7 +568,7 @@ impl MemoryStore {
 
         let mut records = Vec::new();
         while let Some(batch_res) = stream.next().await {
-            records.extend(batch_to_records(&batch_res?)?);
+            records.extend(batch_to_records(&batch_res?, self.embedding_dim)?);
         }
 
         records.sort_by(|a, b| {
@@ -550,11 +590,11 @@ impl MemoryStore {
                     while let Some(batch_res) = stream.next().await {
                         let batch = batch_res?;
                         count += batch.num_rows();
-                        if let Some(col) = batch.column_by_name("session_id") {
-                            if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                                for i in 0..arr.len() {
-                                    sessions.insert(arr.value(i).to_string());
-                                }
+                        if let Some(col) = batch.column_by_name("session_id")
+                            && let Some(arr) = col.as_any().downcast_ref::<StringArray>()
+                        {
+                            for i in 0..arr.len() {
+                                sessions.insert(arr.value(i).to_string());
                             }
                         }
                     }
@@ -667,16 +707,14 @@ impl LessonExtractor {
     }
 }
 
-pub struct SessionContext {
+struct BridgeSessionContext {
+    #[allow(dead_code)]
     pub session_id: String,
-    pub start_time: u64,
-    pub last_recall_time: Option<u64>,
     pub last_recall_turn: Option<u32>,
-    pub memory_store: Option<Arc<MemoryStore>>,
 }
 
 pub struct MemoryBridge {
-    sessions: HashMap<String, SessionContext>,
+    sessions: HashMap<String, BridgeSessionContext>,
     records: HashMap<String, Vec<MemoryRecord>>,
 }
 
@@ -690,12 +728,9 @@ impl MemoryBridge {
     }
 
     pub fn open_session(&mut self, session_id: String) {
-        self.sessions.entry(session_id.clone()).or_insert_with(|| SessionContext {
+        self.sessions.entry(session_id.clone()).or_insert_with(|| BridgeSessionContext {
             session_id,
-            start_time: ConversationState::now(),
-            last_recall_time: None,
             last_recall_turn: None,
-            memory_store: None,
         });
     }
 
@@ -717,7 +752,6 @@ impl MemoryBridge {
             if ctx.last_recall_turn == Some(current_turn) {
                 return Ok(vec![]);
             }
-            ctx.last_recall_time = Some(ConversationState::now());
             ctx.last_recall_turn = Some(current_turn);
         }
 
@@ -807,7 +841,7 @@ impl SemanticClusterer {
                 break;
             }
 
-            for ci in 0..k {
+            for (ci, centroid_slot) in centroids.iter_mut().enumerate() {
                 let cluster_embs: Vec<&Vec<f32>> = assignments
                     .iter()
                     .enumerate()
@@ -829,7 +863,7 @@ impl SemanticClusterer {
                 for v in centroid.iter_mut() {
                     *v /= n;
                 }
-                centroids[ci] = normalize_vector(&centroid);
+                *centroid_slot = normalize_vector(&centroid);
             }
         }
 

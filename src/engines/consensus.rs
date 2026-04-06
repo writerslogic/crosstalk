@@ -2,12 +2,27 @@ use crate::types::artifact::Artifact;
 use crate::types::conversation::{ConversationState, TurnOutcome};
 use std::collections::HashMap;
 
+#[derive(Debug, Clone)]
+pub struct RefinementRound {
+    pub round_index: u32,
+    pub agent_id: String,
+    pub critique: String,
+    pub proposed_resolution: String,
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum ResolutionStrategy {
+    Voting,
+    WeightedAverage,
+    ExpertDeference,
+    Mediation,
+}
+
 pub struct ConsensusEngine;
 
 impl ConsensusEngine {
-    pub fn init() {
-        println!("Initialized consensus engine");
-    }
+    pub fn init() {}
 }
 
 /// Computes a "Self-Certainty" score for an agent's turn.
@@ -52,6 +67,127 @@ impl CertaintyAnalyzer {
 pub struct NashSolver;
 
 impl NashSolver {
+    /// Multi-round refinement: agents critique each other until equilibrium or max_rounds.
+    #[must_use]
+    pub fn run_refinement_rounds(
+        &self,
+        proposals: &[(&str, &str)],
+        max_rounds: usize,
+    ) -> Vec<RefinementRound> {
+        let mut rounds = Vec::new();
+
+        if proposals.is_empty() || max_rounds == 0 {
+            return rounds;
+        }
+
+        // Round 0: collect initial proposals
+        for (agent_id, proposal) in proposals {
+            rounds.push(RefinementRound {
+                round_index: 0,
+                agent_id: agent_id.to_string(),
+                critique: String::new(),
+                proposed_resolution: proposal.to_string(),
+                accepted: false,
+            });
+        }
+
+        // Rounds 1..max_rounds: each agent critiques others
+        for round in 1..max_rounds {
+            let prev_proposals: Vec<String> = proposals.iter().map(|(_, p)| p.to_string()).collect();
+            let all_same = prev_proposals.windows(2).all(|w| w[0] == w[1]);
+            if all_same {
+                // Nash equilibrium: mark last round as accepted and stop
+                for r in rounds.iter_mut().filter(|r| r.round_index == round as u32 - 1) {
+                    r.accepted = true;
+                }
+                break;
+            }
+
+            for (i, (agent_id, proposal)) in proposals.iter().enumerate() {
+                let others: Vec<&str> = prev_proposals
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, p)| p.as_str())
+                    .collect();
+                let critique = if others.is_empty() {
+                    String::new()
+                } else {
+                    format!("Disputes: {}", others.join("; "))
+                };
+                rounds.push(RefinementRound {
+                    round_index: round as u32,
+                    agent_id: agent_id.to_string(),
+                    critique,
+                    proposed_resolution: proposal.to_string(),
+                    accepted: false,
+                });
+            }
+        }
+
+        rounds
+    }
+
+    /// Resolve disagreements using the given strategy.
+    /// `proposals`: (agent_id, influence_weight, proposal_text)
+    #[must_use]
+    pub fn resolve(proposals: &[(&str, f64, &str)], strategy: ResolutionStrategy) -> String {
+        if proposals.is_empty() {
+            return String::new();
+        }
+
+        match strategy {
+            ResolutionStrategy::Voting => {
+                let mut counts: HashMap<&str, usize> = HashMap::new();
+                for (_, _, text) in proposals {
+                    *counts.entry(text).or_insert(0) += 1;
+                }
+                counts
+                    .into_iter()
+                    .max_by_key(|(_, c)| *c)
+                    .map(|(t, _)| t.to_string())
+                    .unwrap_or_default()
+            }
+            ResolutionStrategy::WeightedAverage => {
+                let mut weights: HashMap<&str, f64> = HashMap::new();
+                for (_, w, text) in proposals {
+                    *weights.entry(text).or_insert(0.0) += w;
+                }
+                weights
+                    .into_iter()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(t, _)| t.to_string())
+                    .unwrap_or_default()
+            }
+            ResolutionStrategy::ExpertDeference => proposals
+                .iter()
+                .max_by(|(_, a, _), (_, b, _)| {
+                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(_, _, t)| t.to_string())
+                .unwrap_or_default(),
+            ResolutionStrategy::Mediation => {
+                let all_words: Vec<Vec<&str>> = proposals
+                    .iter()
+                    .map(|(_, _, t)| t.split_whitespace().collect())
+                    .collect();
+                let common: Vec<&&str> = if let Some(first) = all_words.first() {
+                    first
+                        .iter()
+                        .filter(|w| all_words.iter().all(|words| words.contains(w)))
+                        .collect()
+                } else {
+                    vec![]
+                };
+                if common.is_empty() {
+                    proposals[0].2.to_string()
+                } else {
+                    common.iter().map(|w| **w).collect::<Vec<_>>().join(" ")
+                }
+            }
+        }
+    }
+
     /// Solves a 2x2 payoff matrix for pure strategy equilibria.
     #[must_use]
     pub fn solve_2x2_pure(matrix: &[[(f64, f64); 2]; 2]) -> Vec<(usize, usize)> {

@@ -1,9 +1,9 @@
 use crosstalk::engines::intelligence::{
     ContextBudgeter, ConvergenceMonitor, IntelligenceEngine, LatencyPredictor, ModelEnsemble,
-    QualityScorer, VotingStrategy,
+    PromptComposer, QualityScorer, VotingStrategy,
 };
 use crosstalk::types::conversation::{ConversationState, TaskCategory, Turn, TurnOutcome};
-use crosstalk::types::intelligence::{ModelProfile, RunningAverage};
+use crosstalk::types::intelligence::{ModelProfile, PromptTemplate, RunningAverage};
 use std::collections::HashMap;
 use tempfile::tempdir;
 
@@ -860,4 +860,94 @@ fn test_engine_route_constrained_excludes_slow_predicted() {
         &[],
     );
     assert!(result.is_err(), "model with predicted latency 5000ms should be excluded from 100ms budget");
+}
+
+// ── PromptTemplate::render ────────────────────────────────────────────────────
+
+fn make_template(id: &str, text: &str, vars: Vec<&str>, category: TaskCategory) -> PromptTemplate {
+    PromptTemplate {
+        id: id.to_string(),
+        version: 1,
+        template_text: text.to_string(),
+        task_category: category,
+        variables: vars.iter().map(|s| s.to_string()).collect(),
+        performance_history: vec![],
+    }
+}
+
+#[test]
+fn render_substitutes_all_variables() {
+    let tmpl = make_template(
+        "base",
+        "Task: {{task}}. Context: {{context}}.",
+        vec!["task", "context"],
+        TaskCategory::CodeGeneration,
+    );
+    let mut vars = HashMap::new();
+    vars.insert("task".to_string(), "refactor".to_string());
+    vars.insert("context".to_string(), "auth module".to_string());
+    let out = tmpl.render(&vars).unwrap();
+    assert_eq!(out, "Task: refactor. Context: auth module.");
+}
+
+#[test]
+fn render_errors_on_missing_variable() {
+    let tmpl = make_template(
+        "partial",
+        "Hello {{name}}",
+        vec!["name"],
+        TaskCategory::Debugging,
+    );
+    let vars = HashMap::new();
+    assert!(tmpl.render(&vars).is_err());
+}
+
+#[test]
+fn render_no_variables_returns_template_unchanged() {
+    let tmpl = make_template("static", "Fixed message", vec![], TaskCategory::Research);
+    let out = tmpl.render(&HashMap::new()).unwrap();
+    assert_eq!(out, "Fixed message");
+}
+
+#[test]
+fn is_corrective_true_for_corrective_id() {
+    let tmpl = make_template("corrective_v1", "...", vec![], TaskCategory::CodeGeneration);
+    assert!(tmpl.is_corrective());
+}
+
+#[test]
+fn is_corrective_false_for_standard_id() {
+    let tmpl = make_template("base_v1", "...", vec![], TaskCategory::CodeGeneration);
+    assert!(!tmpl.is_corrective());
+}
+
+// ── PromptComposer::select_template ──────────────────────────────────────────
+
+#[test]
+fn select_template_picks_corrective_when_in_regression() {
+    let templates = vec![
+        make_template("standard", "normal task", vec![], TaskCategory::CodeGeneration),
+        make_template("corrective", "fix regression", vec![], TaskCategory::CodeGeneration),
+    ];
+    let selected = PromptComposer::select_template(&templates, TaskCategory::CodeGeneration, true);
+    assert!(selected.is_some());
+    assert!(selected.unwrap().is_corrective());
+}
+
+#[test]
+fn select_template_picks_standard_when_not_in_regression() {
+    let templates = vec![
+        make_template("standard", "normal task", vec![], TaskCategory::Debugging),
+        make_template("corrective", "fix regression", vec![], TaskCategory::Debugging),
+    ];
+    let selected = PromptComposer::select_template(&templates, TaskCategory::Debugging, false);
+    assert!(selected.is_some());
+    assert!(!selected.unwrap().is_corrective());
+}
+
+#[test]
+fn select_template_returns_none_for_unmatched_category() {
+    let templates = vec![make_template("t1", "...", vec![], TaskCategory::Research)];
+    let selected = PromptComposer::select_template(&templates, TaskCategory::Architecture, false);
+    assert!(selected.is_none());
 }

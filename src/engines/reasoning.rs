@@ -2,7 +2,7 @@ use crate::types::artifact::ArtifactDiff;
 use crate::types::conversation::{TaskCategory, Turn, TurnStructure};
 use crate::types::security::FallacyReport;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use rustc_hash::FxHasher;
 use tree_sitter::{Node, Parser};
@@ -232,31 +232,43 @@ impl SynthesisEngine {
             }
         }
 
-        let mut file_buffer = base.to_string();
-        
-        // Reverse iteration protects byte offsets during splicing
-        for base_block in base_blocks.into_iter().rev() {
-            if let Some(proposals) = block_proposals.get(&base_block.signature) {
-                // Filter out proposals that didn't change anything
-                let changes: Vec<&String> = proposals.iter().filter(|c| **c != base_block.content).collect();
-
-                if !changes.is_empty() {
-                    // THE CONSENSUS ALGORITHM
-                    // Tally identical proposals to find what the swarm mathematically agreed on
-                    let mut frequency: HashMap<&String, usize> = HashMap::new();
-                    for change in changes {
-                        *frequency.entry(change).or_insert(0) += 1;
-                    }
-
-                    // Select the change with the highest quorum
-                    if let Some((winning_change, _)) = frequency.into_iter().max_by_key(|&(_, count)| count) {
-                        file_buffer.replace_range(base_block.byte_range, winning_change);
-                    }
+        // Collect winning replacements for all changed blocks.
+        let mut replacements: Vec<(std::ops::Range<usize>, String)> = base_blocks
+            .iter()
+            .filter_map(|base_block| {
+                let proposals = block_proposals.get(&base_block.signature)?;
+                let changes: Vec<&String> = proposals
+                    .iter()
+                    .filter(|c| **c != base_block.content)
+                    .collect();
+                if changes.is_empty() {
+                    return None;
                 }
+                let mut frequency: HashMap<&String, usize> = HashMap::new();
+                for change in &changes {
+                    *frequency.entry(*change).or_insert(0) += 1;
+                }
+                let (winning_change, _) =
+                    frequency.into_iter().max_by_key(|&(_, count)| count)?;
+                Some((base_block.byte_range.clone(), winning_change.clone()))
+            })
+            .collect();
+
+        // Sort by start offset for a single forward-pass reconstruction (O(n) vs O(n*k)).
+        replacements.sort_unstable_by_key(|(r, _)| r.start);
+
+        let mut result = String::with_capacity(base.len());
+        let mut cursor = 0usize;
+        for (range, replacement) in replacements {
+            if range.start >= cursor {
+                result.push_str(&base[cursor..range.start]);
+                result.push_str(&replacement);
+                cursor = range.end;
             }
         }
+        result.push_str(&base[cursor..]);
 
-        Some(file_buffer)
+        Some(result)
     }
 
     /// Extracts structural blocks, specifically including macros and attributes (e.g., #[derive(...)])
@@ -270,10 +282,10 @@ impl SynthesisEngine {
                 
                 // Crucial AST Fix: Expand byte_range upward to include #[attributes] preceding the block
                 let mut start_byte = node.start_byte();
-                if let Some(prev) = node.prev_sibling() {
-                    if prev.kind() == "attribute_item" || prev.kind() == "line_comment" {
-                        start_byte = prev.start_byte();
-                    }
+                if let Some(prev) = node.prev_sibling()
+                    && (prev.kind() == "attribute_item" || prev.kind() == "line_comment")
+                {
+                    start_byte = prev.start_byte();
                 }
 
                 let signature = Self::get_node_signature(source, node);

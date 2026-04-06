@@ -167,6 +167,109 @@ impl InputSchema {
     }
 }
 
+pub struct CargoBridge;
+
+impl CargoBridge {
+    pub fn build(args: &HashMap<String, String>) -> Vec<String> {
+        let mut cli = vec!["build".to_string()];
+        if args.get("release").map(|v| v == "true").unwrap_or(false) {
+            cli.push("--release".to_string());
+        }
+        if let Some(pkg) = args.get("package") {
+            cli.extend(["--package".to_string(), pkg.clone()]);
+        }
+        cli
+    }
+
+    pub fn test(args: &HashMap<String, String>) -> Vec<String> {
+        let mut cli = vec!["test".to_string()];
+        if let Some(name) = args.get("name") {
+            cli.push(name.clone());
+        }
+        if args.get("no_run").map(|v| v == "true").unwrap_or(false) {
+            cli.push("--no-run".to_string());
+        }
+        cli
+    }
+
+    pub fn check(args: &HashMap<String, String>) -> Vec<String> {
+        let mut cli = vec!["check".to_string()];
+        if let Some(pkg) = args.get("package") {
+            cli.extend(["--package".to_string(), pkg.clone()]);
+        }
+        cli
+    }
+
+    pub fn clippy(args: &HashMap<String, String>) -> Vec<String> {
+        let mut cli = vec!["clippy".to_string()];
+        if args.get("deny_warnings").map(|v| v == "true").unwrap_or(false) {
+            cli.extend(["--".to_string(), "-D".to_string(), "warnings".to_string()]);
+        }
+        cli
+    }
+
+    pub fn fmt(args: &HashMap<String, String>) -> Vec<String> {
+        let mut cli = vec!["fmt".to_string()];
+        if args.get("check").map(|v| v == "true").unwrap_or(false) {
+            cli.push("--check".to_string());
+        }
+        cli
+    }
+}
+
+pub struct GitBridge;
+
+impl GitBridge {
+    pub fn status(args: &HashMap<String, String>) -> Vec<String> {
+        let mut cli = vec!["status".to_string()];
+        if args.get("short").map(|v| v == "true").unwrap_or(false) {
+            cli.push("--short".to_string());
+        }
+        cli
+    }
+
+    pub fn diff(args: &HashMap<String, String>) -> Vec<String> {
+        let mut cli = vec!["diff".to_string()];
+        if args.get("staged").map(|v| v == "true").unwrap_or(false) {
+            cli.push("--staged".to_string());
+        }
+        if let Some(path) = args.get("path") {
+            cli.push("--".to_string());
+            cli.push(path.clone());
+        }
+        cli
+    }
+
+    pub fn log(args: &HashMap<String, String>) -> Vec<String> {
+        let mut cli = vec!["log".to_string()];
+        if let Some(n) = args.get("n") {
+            cli.extend([format!("-{n}")]);
+        }
+        if args.get("oneline").map(|v| v == "true").unwrap_or(false) {
+            cli.push("--oneline".to_string());
+        }
+        cli
+    }
+
+    pub fn add(args: &HashMap<String, String>) -> Vec<String> {
+        let mut cli = vec!["add".to_string()];
+        if args.get("all").map(|v| v == "true").unwrap_or(false) {
+            cli.push("--all".to_string());
+        } else if let Some(path) = args.get("path") {
+            cli.push(path.clone());
+        }
+        cli
+    }
+
+    pub fn commit(args: &HashMap<String, String>) -> Vec<String> {
+        let mut cli = vec!["commit".to_string()];
+        if let Some(msg) = args.get("message") {
+            cli.extend(["-m".to_string(), msg.clone()]);
+        }
+        cli
+    }
+}
+
 pub struct CliBridge;
 
 impl CliBridge {
@@ -188,20 +291,20 @@ impl CliBridge {
             return Err(anyhow!("Binary not found at path: {}", binary_path));
         }
 
-        if let Some(env) = env_override {
-            if let Some(path_val) = env.get("PATH") {
-                for dir in path_val.split(':') {
-                    let candidate = Path::new(dir).join(binary_path);
-                    if candidate.exists() {
-                        return Ok(candidate);
-                    }
+        if let Some(env) = env_override
+            && let Some(path_val) = env.get("PATH")
+        {
+            for dir in path_val.split(':') {
+                let candidate = Path::new(dir).join(binary_path);
+                if candidate.exists() {
+                    return Ok(candidate);
                 }
-                return Err(anyhow!(
-                    "Binary '{}' not found in isolated PATH: {}",
-                    binary_path,
-                    path_val
-                ));
             }
+            return Err(anyhow!(
+                "Binary '{}' not found in isolated PATH: {}",
+                binary_path,
+                path_val
+            ));
         }
 
         which::which(binary_path)
@@ -372,7 +475,7 @@ impl CliBridge {
             }
 
             flags.push(FlagDef {
-                long: long.unwrap_or_else(|| key),
+                long: long.unwrap_or(key),
                 short,
                 description: desc,
                 takes_value,

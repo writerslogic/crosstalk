@@ -1,4 +1,6 @@
+use crate::types::conversation::TurnOutcome;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MemoryRecord {
@@ -45,4 +47,73 @@ pub struct Lesson {
     pub outcome: String,
     pub confidence: f64,
     pub applicability_tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct MemoryStoreStats {
+    pub total_records: usize,
+    pub unique_sessions: usize,
+    pub avg_cluster_size: f64,
+    pub storage_size: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SnapshotMetadata {
+    pub session_id: String,
+    pub created_at: u64,
+    pub record_count: usize,
+    pub content_hash: [u8; 32],
+    pub compressed: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SnapshotBundle {
+    pub metadata: SnapshotMetadata,
+    pub records: Vec<MemoryRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SessionContext {
+    pub session_id: String,
+    pub start_time: u64,
+    pub last_recall_time: Option<u64>,
+    pub linked_sessions: Vec<String>,
+    pub total_turns: u32,
+    pub outcome_summary: HashMap<TurnOutcome, u32>,
+}
+
+impl SessionContext {
+    pub fn new(session_id: &str) -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self {
+            session_id: session_id.to_string(),
+            start_time: now,
+            last_recall_time: None,
+            linked_sessions: Vec::new(),
+            total_turns: 0,
+            outcome_summary: HashMap::new(),
+        }
+    }
+
+    pub fn record_turn(&mut self, outcome: TurnOutcome) {
+        self.total_turns += 1;
+        *self.outcome_summary.entry(outcome).or_insert(0) += 1;
+    }
+
+    pub fn link_session(&mut self, prior_session_id: &str) {
+        if !self.linked_sessions.contains(&prior_session_id.to_string()) {
+            self.linked_sessions.push(prior_session_id.to_string());
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DeletionLogEntry {
+    pub turn_id: u32,
+    pub session_id: String,
+    pub deleted_at: u64,
 }

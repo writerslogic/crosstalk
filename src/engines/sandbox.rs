@@ -1,3 +1,4 @@
+use crate::types::conversation::ConversationState;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use wasmtime::*;
@@ -64,6 +65,22 @@ impl SandboxManager {
         Ok(Self { engine })
     }
 
+    pub async fn execute_with_rollback(
+        &self,
+        wasm_bytes: &[u8],
+        config: &SandboxConfig,
+        snapshot: &ConversationState,
+    ) -> Result<(SandboxResult, Option<ConversationState>)> {
+        match self.execute(wasm_bytes, config).await {
+            Ok(result) if result.exit_code == 0 => Ok((result, None)),
+            Ok(result) => Ok((result, Some(snapshot.clone()))),
+            Err(e) => Ok((
+                SandboxResult { exit_code: -1, stdout: String::new(), stderr: e.to_string() },
+                Some(snapshot.clone()),
+            )),
+        }
+    }
+
     pub async fn execute(
         &self,
         wasm_bytes: &[u8],
@@ -85,10 +102,7 @@ impl SandboxManager {
             .call_async(&mut store, ())
             .await
             .map(|_| 0)
-            .unwrap_or_else(|e| {
-                eprintln!("WASM execution error: {}", e);
-                -1
-            });
+            .unwrap_or(-1);
 
         let stdout_bytes = store.data().stdout.contents();
         let stderr_bytes = store.data().stderr.contents();

@@ -1,7 +1,9 @@
+use crosstalk::mcp::bridge::{CargoBridge, GitBridge};
 use crosstalk::mcp::gateway::{
     McpGateway, McpResource, McpTool, PermissionError, PermissionManager, PermissionTier,
 };
 use crosstalk::mcp::transport::JsonRpcRequest;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 fn make_tool(name: &str) -> McpTool {
@@ -324,4 +326,111 @@ async fn test_denied_tool_recovery_via_permission_upgrade() {
             "should be past the permission gate after upgrade"
         );
     }
+}
+
+// ── CargoBridge argument mapping ──────────────────────────────────────────────
+
+#[test]
+fn cargo_build_basic() {
+    let args = CargoBridge::build(&HashMap::new());
+    assert_eq!(args, vec!["build"]);
+}
+
+#[test]
+fn cargo_build_release_flag() {
+    let mut m = HashMap::new();
+    m.insert("release".to_string(), "true".to_string());
+    let args = CargoBridge::build(&m);
+    assert!(args.contains(&"--release".to_string()));
+}
+
+#[test]
+fn cargo_test_with_name() {
+    let mut m = HashMap::new();
+    m.insert("name".to_string(), "my_test".to_string());
+    let args = CargoBridge::test(&m);
+    assert!(args.contains(&"my_test".to_string()));
+}
+
+#[test]
+fn cargo_clippy_deny_warnings() {
+    let mut m = HashMap::new();
+    m.insert("deny_warnings".to_string(), "true".to_string());
+    let args = CargoBridge::clippy(&m);
+    assert!(args.contains(&"-D".to_string()));
+    assert!(args.contains(&"warnings".to_string()));
+}
+
+#[test]
+fn cargo_fmt_check_flag() {
+    let mut m = HashMap::new();
+    m.insert("check".to_string(), "true".to_string());
+    let args = CargoBridge::fmt(&m);
+    assert!(args.contains(&"--check".to_string()));
+}
+
+// ── GitBridge argument mapping ────────────────────────────────────────────────
+
+#[test]
+fn git_status_short_flag() {
+    let mut m = HashMap::new();
+    m.insert("short".to_string(), "true".to_string());
+    let args = GitBridge::status(&m);
+    assert!(args.contains(&"--short".to_string()));
+}
+
+#[test]
+fn git_diff_staged_flag() {
+    let mut m = HashMap::new();
+    m.insert("staged".to_string(), "true".to_string());
+    let args = GitBridge::diff(&m);
+    assert!(args.contains(&"--staged".to_string()));
+}
+
+#[test]
+fn git_log_oneline_and_n() {
+    let mut m = HashMap::new();
+    m.insert("oneline".to_string(), "true".to_string());
+    m.insert("n".to_string(), "5".to_string());
+    let args = GitBridge::log(&m);
+    assert!(args.contains(&"--oneline".to_string()));
+    assert!(args.iter().any(|a| a.contains('5')));
+}
+
+#[test]
+fn git_commit_with_message() {
+    let mut m = HashMap::new();
+    m.insert("message".to_string(), "fix: typo".to_string());
+    let args = GitBridge::commit(&m);
+    assert!(args.contains(&"-m".to_string()));
+    assert!(args.contains(&"fix: typo".to_string()));
+}
+
+// ── Tool timeout disabling ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn disabled_tool_returns_error_immediately() {
+    let mut gateway = McpGateway::new();
+    gateway.register_tool(make_tool("slow_tool"));
+    gateway.disabled_tools.push("slow_tool".to_string());
+    gateway
+        .permissions
+        .tiers
+        .insert("agent".to_string(), PermissionTier::Full);
+
+    let req = make_req("tools/call", serde_json::json!({ "name": "slow_tool", "arguments": {} }));
+    let res = gateway.handle_request("agent", req).await;
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("disabled"));
+}
+
+// ── RPC framing ───────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn handle_unknown_method_returns_error() {
+    let mut gateway = McpGateway::new();
+    let req = make_req("unknown/method", serde_json::json!({}));
+    let res = gateway.handle_request("agent", req).await;
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("Method not found"));
 }

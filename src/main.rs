@@ -6,8 +6,18 @@ use crosstalk::types::conversation::{
     ConversationState, TaskCategory, Turn, TurnOutcome, TurnStructure,
 };
 use crosstalk::types::events::{ControlSignal, StreamEvent};
-use crosstalk::ui::tui::CrosstalkUI;
+use crosstalk::ui::app::App;
+use crosstalk::ui::events::run_event_loop;
+use crosstalk::ui::render;
+use crossterm::ExecutableCommand;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
@@ -31,27 +41,22 @@ async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     let args = Args::parse();
 
-    let dir = "/tmp/crosstalk";
-    let manager = StateManager::new(dir)?;
-
-    let sigma = Arc::new(Mutex::new(ConversationState::new("main-session")));
+    let session_id = "main-session";
+    let manager = StateManager::new("/tmp/crosstalk")?;
+    let sigma = Arc::new(Mutex::new(ConversationState::new(session_id)));
 
     let mut agents: Vec<Box<dyn PromptAgent>> = vec![];
-
     for m in &args.models {
         agents.push(ModelFactory::create_agent(m)?);
     }
-
     if agents.is_empty() {
         anyhow::bail!("No valid models provided. Use --models <model_id>");
     }
 
-    // Event System Setup
     let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(1000);
     let (control_tx, control_rx) = mpsc::channel::<ControlSignal>(100);
 
     let omicron = Orchestrator::new(manager, agents, event_tx, control_rx);
-    let mut ui = CrosstalkUI::new(event_rx, control_tx)?;
 
     {
         let mut s = sigma.lock().await;
@@ -66,38 +71,57 @@ async fn main() -> anyhow::Result<()> {
             task_category: Some(TaskCategory::Research),
             structure: Some(TurnStructure::FreeForm),
             signature: vec![],
-
             surprise_signal: None,
         });
     }
 
-    let sigma_orchestrator = Arc::clone(&sigma);
+    let app = Arc::new(Mutex::new(App::new(session_id)));
 
-    // Run UI and Orchestrator concurrently
+    // Orchestrator task
+    let sigma_orch = Arc::clone(&sigma);
+    let iterations = args.iterations;
     tokio::spawn(async move {
-        let mut i = 0;
-        loop {
-            match omicron.run_turn(Arc::clone(&sigma_orchestrator)).await {
-                Ok(optimal) => {
-                    i += 1;
-                    if optimal || (args.iterations > 0 && i >= args.iterations) {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Orchestrator error: {:?}", e);
-                    break;
-                }
+        let mut i = 0u32;
+        while let Ok(optimal) = omicron.run_turn(Arc::clone(&sigma_orch)).await {
+            i += 1;
+            if optimal || (iterations > 0 && i >= iterations) {
+                break;
             }
         }
     });
 
-    // Main thread handles UI rendering
-    let initial_state = {
-        let s = sigma.lock().await;
-        s.clone()
-    };
-    ui.run(initial_state).await?;
+    // Event loop task (keyboard + stream events)
+    let event_app = Arc::clone(&app);
+    let ctrl_tx = control_tx;
+    tokio::spawn(async move {
+        let _ = run_event_loop(event_app, ctrl_tx, event_rx).await;
+    });
 
+    // Install panic hook to restore terminal before unwinding
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = io::stdout().execute(LeaveAlternateScreen);
+        prev_hook(info);
+    }));
+
+    enable_raw_mode()?;
+    io::stdout().execute(EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+
+    // Render loop at ~60 fps
+    let mut tick = tokio::time::interval(Duration::from_millis(16));
+    loop {
+        tick.tick().await;
+        let app_guard = app.lock().await;
+        if app_guard.shutdown {
+            break;
+        }
+        terminal.draw(|f| render::draw(f, &app_guard))?;
+    }
+
+    disable_raw_mode()?;
+    io::stdout().execute(LeaveAlternateScreen)?;
     Ok(())
 }

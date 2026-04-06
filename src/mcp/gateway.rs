@@ -146,32 +146,21 @@ impl PermissionManager {
     ) -> Result<(), PermissionError> {
         let path_str = path.to_string_lossy().to_string();
 
-        if path_str.contains("..") {
-            if path.is_absolute() {
-                let normalized = Self::normalize_path(path);
-                if !allowed_dirs.iter().any(|a| normalized.starts_with(a)) {
-                    return Err(PermissionError::PathTraversal(path_str));
-                }
-            } else {
-                let mut is_safe = false;
-                for base in allowed_dirs {
-                    let full = base.join(path);
-                    let normalized_full = Self::normalize_path(&full);
-                    if normalized_full.starts_with(base) {
-                        is_safe = true;
-                        break;
-                    }
-                }
-                if !is_safe {
-                    return Err(PermissionError::PathTraversal(path_str));
-                }
-            }
-            return Ok(());
-        }
+        // Resolve symlinks; fall back to lexical normalization when path doesn't exist yet.
+        let canonical = std::fs::canonicalize(path)
+            .unwrap_or_else(|_| Self::normalize_path(path));
 
-        if path.is_absolute() {
-            let normalized = Self::normalize_path(path);
-            if !allowed_dirs.iter().any(|a| normalized.starts_with(a)) {
+        let in_allowed = allowed_dirs.iter().any(|a| {
+            let canon_a = std::fs::canonicalize(a)
+                .unwrap_or_else(|_| Self::normalize_path(a));
+            canonical.starts_with(&canon_a)
+        });
+
+        if !in_allowed {
+            if path_str.contains("..") {
+                return Err(PermissionError::PathTraversal(path_str));
+            }
+            if path.is_absolute() {
                 return Err(PermissionError::PathOutOfScope(path_str));
             }
         }
@@ -210,8 +199,14 @@ impl PermissionManager {
     }
 
     fn contains_write_patterns(&self, args: &serde_json::Value) -> bool {
-        let s = args.to_string();
-        s.contains("rm ") || s.contains("mv ") || s.contains('>') || s.contains(">>")
+        let mut strings = vec![];
+        Self::collect_strings(args, &mut strings);
+        strings.iter().any(|s| {
+            let t = s.trim();
+            t == "rm" || t.starts_with("rm ")
+                || t == "mv" || t.starts_with("mv ")
+                || t.contains('>')
+        })
     }
 
     fn collect_strings(val: &serde_json::Value, out: &mut Vec<String>) {
@@ -316,8 +311,10 @@ impl McpGateway {
                 let mut transport = JsonRpcTransport::new(stream);
                 while let Ok(Some(msg)) = transport.next_message().await {
                     if let Ok(req) = serde_json::from_str::<JsonRpcRequest>(&msg) {
-                        let mut g = gateway.lock().await;
-                        let result = g.handle_request("default_agent", req).await;
+                        let result = {
+                            let mut g = gateway.lock().await;
+                            g.handle_request("default_agent", req).await
+                        };
                         match result {
                             Ok(res) => {
                                 let _ = transport

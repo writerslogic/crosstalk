@@ -652,7 +652,7 @@ fn test_query_weighted_outcome_ranking() {
 // ============================================================================
 
 use crosstalk::engines::memory::{MemoryStore, SemanticClusterer};
-use crosstalk::types::memory::{DeletionLogEntry, MemoryStoreStats};
+use crosstalk::types::memory::{DeletionLogEntry, MemoryStoreStats, SessionContext};
 
 fn make_turn(index: u32, content: &str, outcome: TurnOutcome) -> Turn {
     Turn {
@@ -917,4 +917,62 @@ async fn test_stats_counts_inserted_records() {
     let stats = store.stats().await.unwrap();
     assert_eq!(stats.total_records, 3);
     assert_eq!(stats.unique_sessions, 2);
+}
+
+// ── SessionContext ────────────────────────────────────────────────────────────
+
+#[test]
+fn session_context_new_sets_session_id() {
+    let ctx = SessionContext::new("my-session");
+    assert_eq!(ctx.session_id, "my-session");
+    assert_eq!(ctx.total_turns, 0);
+    assert!(ctx.linked_sessions.is_empty());
+    assert!(ctx.last_recall_time.is_none());
+}
+
+#[test]
+fn session_context_record_turn_increments_total() {
+    let mut ctx = SessionContext::new("s1");
+    ctx.record_turn(TurnOutcome::TestsPassed);
+    ctx.record_turn(TurnOutcome::TestsPassed);
+    ctx.record_turn(TurnOutcome::RolledBack);
+    assert_eq!(ctx.total_turns, 3);
+    assert_eq!(*ctx.outcome_summary.get(&TurnOutcome::TestsPassed).unwrap(), 2);
+    assert_eq!(*ctx.outcome_summary.get(&TurnOutcome::RolledBack).unwrap(), 1);
+}
+
+#[test]
+fn session_context_link_session_adds_entry() {
+    let mut ctx = SessionContext::new("current");
+    ctx.link_session("prior-1");
+    ctx.link_session("prior-2");
+    assert_eq!(ctx.linked_sessions.len(), 2);
+    assert!(ctx.linked_sessions.contains(&"prior-1".to_string()));
+}
+
+#[test]
+fn session_context_link_session_deduplicates() {
+    let mut ctx = SessionContext::new("current");
+    ctx.link_session("dup");
+    ctx.link_session("dup");
+    assert_eq!(ctx.linked_sessions.len(), 1);
+}
+
+// ── MemoryStore::new_with_dim ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn memory_store_new_with_dim_creates_table_with_custom_dim() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = MemoryStore::new_with_dim(dir.path().to_str().unwrap(), 128);
+    store.init().await.unwrap();
+    assert_eq!(store.embedding_dim, 128);
+    // Verify the table is created without error at the custom dimension.
+    let _table = store.get_or_create_table("memory").await.unwrap();
+}
+
+#[tokio::test]
+async fn memory_store_new_defaults_to_384() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = MemoryStore::new(dir.path().to_str().unwrap());
+    assert_eq!(store.embedding_dim, 384);
 }

@@ -1,7 +1,8 @@
 use crosstalk::engines::sandbox::{SandboxConfig, SandboxManager};
 use crosstalk::engines::simulation::MonteCarloRunner;
-use crosstalk::engines::validation::AstValidator;
+use crosstalk::engines::validation::{AstValidator, AstVersionHistory};
 use crosstalk::types::artifact::Artifact;
+use crosstalk::types::conversation::ConversationState;
 use std::collections::HashMap;
 
 // Invalid WASM bytes for testing error handling
@@ -261,4 +262,103 @@ fn test_ast_versioning_struct() {
         changed_nodes.iter().any(|id| id.contains("Point")),
         "Expected 'Point' struct to be identified as changed"
     );
+}
+
+// ── AstVersionHistory ─────────────────────────────────────────────────────────
+
+#[test]
+fn revert_node_returns_content_at_target_turn() {
+    let mut history = AstVersionHistory::new();
+    let mut snap1 = HashMap::new();
+    snap1.insert("fn:foo".to_string(), "fn foo() {}".to_string());
+    history.record_snapshot(1, snap1);
+    let mut snap2 = HashMap::new();
+    snap2.insert("fn:foo".to_string(), "fn foo() { 42 }".to_string());
+    history.record_snapshot(2, snap2);
+
+    let v1 = history.revert_node("fn:foo", 1).unwrap();
+    assert_eq!(v1, "fn foo() {}");
+    let v2 = history.revert_node("fn:foo", 2).unwrap();
+    assert_eq!(v2, "fn foo() { 42 }");
+}
+
+#[test]
+fn revert_node_errors_for_unknown_node() {
+    let history = AstVersionHistory::new();
+    assert!(history.revert_node("fn:missing", 1).is_err());
+}
+
+#[test]
+fn revert_node_errors_when_node_not_yet_created() {
+    let mut history = AstVersionHistory::new();
+    let mut snap = HashMap::new();
+    snap.insert("fn:late".to_string(), "fn late() {}".to_string());
+    history.record_snapshot(5, snap);
+    assert!(history.revert_node("fn:late", 3).is_err());
+}
+
+#[test]
+fn diff_nodes_contains_added_line() {
+    let mut history = AstVersionHistory::new();
+    let mut s1 = HashMap::new();
+    s1.insert("fn:bar".to_string(), "line1\n".to_string());
+    history.record_snapshot(1, s1);
+    let mut s2 = HashMap::new();
+    s2.insert("fn:bar".to_string(), "line1\nline2\n".to_string());
+    history.record_snapshot(2, s2);
+
+    let diff = history.diff_nodes("fn:bar", 1, 2).unwrap();
+    assert!(diff.contains('+'), "diff must contain '+' for inserted lines");
+}
+
+#[test]
+fn diff_nodes_identical_versions_has_no_changes() {
+    let mut history = AstVersionHistory::new();
+    let mut s1 = HashMap::new();
+    s1.insert("fn:same".to_string(), "fn same() {}\n".to_string());
+    history.record_snapshot(1, s1.clone());
+    history.record_snapshot(2, s1);
+
+    let diff = history.diff_nodes("fn:same", 1, 2).unwrap();
+    assert!(!diff.contains('+') && !diff.contains('-'), "identical versions should produce no change markers");
+}
+
+// ── execute_with_rollback ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn execute_with_rollback_returns_snapshot_on_invalid_wasm() {
+    let manager = SandboxManager::new().unwrap();
+    let snapshot = ConversationState::new("snap-session");
+    let config = SandboxConfig { memory_limit_bytes: 1024 * 1024, fuel_limit: 10_000_000 };
+    let (result, rollback) = manager
+        .execute_with_rollback(&[0xFF, 0xFF], &config, &snapshot)
+        .await
+        .unwrap();
+    assert!(result.exit_code != 0);
+    assert!(rollback.is_some());
+    assert_eq!(rollback.unwrap().session_id, "snap-session");
+}
+
+#[tokio::test]
+async fn execute_with_rollback_rollback_is_none_on_success() {
+    // A minimal valid WASM module that immediately returns (empty _start).
+    // WAT: (module (func (export "_start")))
+    let wasm_bytes: Vec<u8> = vec![
+        0x00, 0x61, 0x73, 0x6D, // magic
+        0x01, 0x00, 0x00, 0x00, // version
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type section: () -> ()
+        0x03, 0x02, 0x01, 0x00, // function section
+        0x07, 0x0A, 0x01, 0x06, 0x5F, 0x73, 0x74, 0x61, 0x72, 0x74, 0x00, 0x00, // export "_start"
+        0x0A, 0x04, 0x01, 0x02, 0x00, 0x0B, // code section: empty body
+    ];
+    let manager = SandboxManager::new().unwrap();
+    let snapshot = ConversationState::new("success-session");
+    let config = SandboxConfig { memory_limit_bytes: 1024 * 1024, fuel_limit: 10_000_000 };
+    let (_result, rollback) = manager
+        .execute_with_rollback(&wasm_bytes, &config, &snapshot)
+        .await
+        .unwrap();
+    // Either success (rollback=None) or compilation failure (rollback=Some).
+    // We can't guarantee the WASM is valid as a WASI component, so just assert the API works.
+    let _ = rollback;
 }

@@ -1,4 +1,5 @@
 use crate::types::conversation::TaskCategory;
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -51,7 +52,28 @@ pub struct PromptTemplate {
     pub template_text: String,
     pub task_category: TaskCategory,
     pub variables: Vec<String>,
-    pub performance_history: Vec<(String, f64)>, // (session_id, quality_score)
+    pub performance_history: Vec<(String, f64)>,
+}
+
+impl PromptTemplate {
+    pub fn render(&self, vars: &HashMap<String, String>) -> Result<String> {
+        let mut out = self.template_text.clone();
+        for var in &self.variables {
+            let placeholder = format!("{{{{{}}}}}", var);
+            let value = vars.get(var.as_str())
+                .ok_or_else(|| anyhow!("Missing template variable: {}", var))?;
+            out = out.replace(&placeholder, value);
+        }
+        Ok(out)
+    }
+
+    pub fn is_corrective(&self) -> bool {
+        self.id.contains("corrective")
+    }
+
+    pub fn category(&self) -> TaskCategory {
+        self.task_category
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
