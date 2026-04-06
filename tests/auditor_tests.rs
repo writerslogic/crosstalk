@@ -21,7 +21,7 @@ async fn test_continuous_auditor_spawns_and_receives() {
         signature: vec![],
     });
     let prev_hash = [0u8; 32];
-    state1.state_hash = HashChain::compute(&state1, &prev_hash);
+    state1.state_hash = HashChain::compute(&state1, &prev_hash).expect("Hash computation failed");
 
     let send_result = tx.send(state1.clone()).await;
     assert!(send_result.is_ok(), "Should successfully send state to auditor");
@@ -41,7 +41,7 @@ async fn test_continuous_auditor_spawns_and_receives() {
         structure: None,
         signature: vec![],
     });
-    state2.state_hash = HashChain::compute(&state2, &state1.state_hash);
+    state2.state_hash = HashChain::compute(&state2, &state1.state_hash).expect("Hash computation failed");
 
     let send_result = tx.send(state2.clone()).await;
     assert!(send_result.is_ok(), "Should successfully send second state to auditor");
