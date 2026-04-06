@@ -376,7 +376,7 @@ fn test_regression_not_detected() {
 fn test_model_profile_update() {
     let dir = tempdir().expect("temp dir");
     let path = dir.path().to_str().expect("path");
-    let mut engine = IntelligenceEngine::with_storage(path);
+    let mut engine = IntelligenceEngine::new();
 
     // Create initial turn
     let turn1 = make_turn(

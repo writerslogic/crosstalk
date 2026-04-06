@@ -29,7 +29,7 @@ fn test_hash_chain_10_consecutive() {
         });
 
         let prev_hash = hashes[i];
-        let current_hash = HashChain::compute(&state, &prev_hash);
+        let current_hash = HashChain::compute(&state, &prev_hash).expect("Hash computation failed");
 
         // Verify the hash is valid
         assert!(HashChain::verify(&state, &prev_hash, &current_hash));
@@ -78,7 +78,7 @@ fn test_hash_chain_genesis() {
     });
 
     let genesis_prev_hash = [0u8; 32];
-    let genesis_hash = HashChain::compute(&state, &genesis_prev_hash);
+    let genesis_hash = HashChain::compute(&state, &genesis_prev_hash).expect("Hash computation failed");
 
     // Verify the genesis hash was computed with [0u8; 32]
     assert!(HashChain::verify(&state, &genesis_prev_hash, &genesis_hash));

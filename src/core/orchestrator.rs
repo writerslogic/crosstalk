@@ -88,9 +88,7 @@ impl Orchestrator {
             mc_runner: MonteCarloRunner::new().expect("Failed to init simulation"),
             mcp_gateway,
             memory_store: MemoryStore::new("/tmp/crosstalk-memory"),
-            intelligence: Mutex::new(IntelligenceEngine::with_storage(
-                "/tmp/crosstalk-intelligence.json",
-            )),
+            intelligence: Mutex::new(IntelligenceEngine::new()),
             compute: Mutex::new(ComputeManager::new()),
             reasoning: ReasoningEngine,
             self_improve: SelfImprovementEngine,
@@ -443,7 +441,7 @@ impl Orchestrator {
             sigma.iteration_index += 1;
 
             let prev_hash = sigma.state_hash;
-            sigma.state_hash = HashChain::compute(&sigma, &prev_hash);
+            sigma.state_hash = HashChain::compute(&sigma, &prev_hash)?;
 
             if sigma.iteration_index <= current_i {
                 *sigma = sigma_snapshot;

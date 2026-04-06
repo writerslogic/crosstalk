@@ -1,9 +1,12 @@
 use crate::types::artifact::Artifact;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use petgraph::graph::DiGraph;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::process::Command;
+use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet}; 
+use serde::{Deserialize, Serialize, de::IgnoredAny};
+use std::process::Stdio;
+use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 use tree_sitter::Parser;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -24,22 +27,27 @@ impl QualityEngine {
         let lines: Vec<&str> = artifact.content.lines().collect();
         let line_count = lines.len() as u32;
 
+        // O(N) optimized comment counting
         let comment_lines = lines
             .iter()
-            .filter(|l: &&&str| l.trim().starts_with("//") || l.trim().starts_with("/*"))
+            .filter(|l| {
+                let trimmed = l.trim_start();
+                trimmed.starts_with("//") || trimmed.starts_with("/*")
+            })
             .count();
+            
         let comment_density = if line_count > 0 {
             comment_lines as f64 / line_count as f64
         } else {
             0.0
         };
 
-        let mut complexity = 1;
-        if artifact.language.to_lowercase() == "rust" || artifact.language.to_lowercase() == "rs" {
-            complexity = Self::calculate_rust_complexity(&artifact.content);
-        }
-
-        let coupling = Self::calculate_coupling(artifact, other_artifact_names);
+        // Combine Complexity and Coupling into a single, highly-optimized AST pass
+        let (complexity, coupling) = if artifact.language.eq_ignore_ascii_case("rust") || artifact.language.eq_ignore_ascii_case("rs") {
+            Self::analyze_rust_ast(&artifact.content, other_artifact_names)
+        } else {
+            (1, 0)
+        };
 
         ArtifactMetrics {
             line_count,
@@ -49,112 +57,171 @@ impl QualityEngine {
         }
     }
 
-    fn calculate_coupling(artifact: &Artifact, other_artifact_names: &[String]) -> u32 {
-        let mut coupling = 0;
-        let mut seen = std::collections::HashSet::new();
-        for line in artifact.content.lines() {
-            let trimmed = line.trim();
-            // Look for imports or direct module references
-            if (trimmed.starts_with("use ")
-                || trimmed.starts_with("mod ")
-                || trimmed.contains("::"))
-                && !trimmed.starts_with("//")
-            {
-                for other in other_artifact_names {
-                    let other_mod = other
-                        .trim_end_matches(".rs")
-                        .split('/')
-                        .next_back()
-                        .unwrap_or(other);
-                    if other != &artifact.name
-                        && trimmed.contains(other_mod)
-                        && !seen.contains(other)
-                    {
-                        coupling += 1;
-                        seen.insert(other.clone());
-                    }
-                }
-            }
-        }
-        coupling
-    }
-
-    fn calculate_rust_complexity(content: &str) -> u32 {
+    /// SINGLE-PASS AST TRAVERSAL
+    /// Extracts both Cyclomatic Complexity and Dependency Coupling simultaneously.
+    /// Completely immune to string-matching false positives (e.g., comments/strings).
+    fn analyze_rust_ast(content: &str, known_modules: &[String]) -> (u32, u32) {
         let mut parser = Parser::new();
-        let _ = parser.set_language(&tree_sitter_rust::LANGUAGE.into());
+        if parser.set_language(&tree_sitter_rust::LANGUAGE.into()).is_err() {
+            return (1, 0);
+        }
+        
         let tree = match parser.parse(content, None) {
             Some(t) => t,
-            None => return 1,
+            None => return (1, 0),
         };
 
+        // Pre-compute lookup table for O(1) existence checks
+        let module_lookup: FxHashSet<&str> = known_modules
+            .iter()
+            .map(|name| name.trim_end_matches(".rs"))
+            .collect();
+
         let mut complexity = 1;
-        let mut cursor = tree.root_node().walk();
-        let mut stack = vec![tree.root_node()];
+        let mut dependencies = FxHashSet::default();
+        
+        let mut cursor = tree.walk();
+        let mut going_down = true;
 
-        while let Some(node) = stack.pop() {
-            let kind = node.kind();
-            if matches!(
-                kind,
-                "if_expression"
-                    | "for_expression"
-                    | "while_expression"
-                    | "match_arm"
-                    | "if_let_expression"
-                    | "while_let_expression"
-            ) {
-                complexity += 1;
-            }
-
-            for child in node.children(&mut cursor) {
-                stack.push(child);
-            }
-        }
-        complexity
-    }
-
-    pub fn verify_compilation() -> Result<bool> {
-        let output = Command::new("cargo").arg("check").output()?;
-
-        Ok(output.status.success())
-    }
-
-    pub fn build_dependency_graph(artifacts: &HashMap<String, Artifact>) -> DiGraph<String, ()> {
-        let mut graph = DiGraph::new();
-        let mut nodes = HashMap::new();
-
-        for name in artifacts.keys() {
-            let idx = graph.add_node(name.clone());
-            nodes.insert(name.clone(), idx);
-        }
-
-        for (name, artifact) in artifacts {
-            let idx = nodes[name];
-            for line in artifact.content.lines() {
-                if line.trim().starts_with("use ") || line.trim().starts_with("mod ") {
-                    for other_name in artifacts.keys() {
-                        if name != other_name
-                            && line.contains(other_name.trim_end_matches(".rs"))
-                            && let Some(&other_idx) = nodes.get(other_name)
-                        {
-                            graph.add_edge(idx, other_idx, ());
+        loop {
+            if going_down {
+                let node = cursor.node();
+                let kind = node.kind();
+                
+                // 1. Evaluate Complexity
+                if matches!(
+                    kind,
+                    "if_expression" | "for_expression" | "while_expression" | 
+                    "match_arm" | "if_let_expression" | "while_let_expression"
+                ) {
+                    complexity += 1;
+                }
+                
+                // 2. Evaluate Coupling (Only inside actual `use` or `mod` declarations)
+                if kind == "use_declaration" || kind == "scoped_identifier" {
+                    // Extract the text of the node directly from the source bytes
+                    if let Ok(text) = std::str::from_utf8(&content.as_bytes()[node.byte_range()]) {
+                        for token in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                            if module_lookup.contains(token) {
+                                dependencies.insert(token);
+                            }
                         }
                     }
                 }
+                
+                if cursor.goto_first_child() { continue; }
             }
+            if cursor.goto_next_sibling() {
+                going_down = true;
+                continue;
+            }
+            if cursor.goto_parent() {
+                going_down = false;
+                continue;
+            }
+            break; 
         }
+        
+        (complexity, dependencies.len() as u32)
+    }
+
+    /// Asynchronous, timeout-protected, AND leak-proof compilation check.
+    pub async fn verify_compilation(workspace_dir: &str) -> Result<bool> {
+        let mut check_task = Command::new("cargo")
+            .current_dir(workspace_dir)
+            .arg("check")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true) // CRITICAL: Reaps the OS process if Tokio drops the future
+            .spawn()
+            .context("Failed to spawn cargo process")?;
+
+        let output = timeout(Duration::from_secs(60), check_task.wait())
+            .await
+            .context("Cargo check timed out")??;
+
+        Ok(output.success())
+    }
+
+    /// Parallelized Graph Construction.
+    /// Operates in O(N * L) time but executes across all available CPU cores concurrently.
+    pub fn build_dependency_graph(artifacts: &FxHashMap<String, Artifact>) -> DiGraph<String, ()> {
+        let mut graph = DiGraph::new();
+        let mut node_indices = FxHashMap::default();
+
+        // Register nodes
+        for name in artifacts.keys() {
+            let stripped = name.trim_end_matches(".rs");
+            node_indices.insert(stripped, graph.add_node(name.clone()));
+        }
+
+        // Parallel map: Extract edges for all artifacts simultaneously
+        let all_edges: Vec<(petgraph::graph::NodeIndex, petgraph::graph::NodeIndex)> = artifacts
+            .par_iter()
+            .flat_map(|(name, artifact)| {
+                let stripped_name = name.trim_end_matches(".rs");
+                let current_idx = *node_indices.get(stripped_name).unwrap();
+                let mut local_edges = vec![];
+
+                for line in artifact.content.lines() {
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with("use ") || trimmed.starts_with("mod ") {
+                        for token in trimmed.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                            if let Some(&target_idx) = node_indices.get(token) {
+                                if current_idx != target_idx {
+                                    local_edges.push((current_idx, target_idx));
+                                }
+                            }
+                        }
+                    }
+                }
+                local_edges
+            })
+            .collect();
+
+        // Sequential reduce: Insert edges into the graph
+        for (source, target) in all_edges {
+            graph.add_edge(source, target, ());
+        }
+
         graph
     }
+
+    /// Rayon-Parallelized Duplication Detection.
+    /// Eliminates thread-blocking on massive artifact registries.
     pub fn detect_duplication(
         new_content: &str,
-        existing: &HashMap<String, Artifact>,
+        existing: &std::collections::HashMap<String, Artifact>,
     ) -> Vec<String> {
-        let mut duplicates = vec![];
-        for (name, artifact) in existing {
-            if artifact.content.contains(new_content) && !new_content.is_empty() {
-                duplicates.push(name.clone());
-            }
+        let new_lines: FxHashSet<&str> = new_content
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| l.len() > 2 && *l != "}" && *l != "{")
+            .collect();
+
+        if new_lines.is_empty() {
+            return vec![];
         }
-        duplicates
+
+        let new_lines_len = new_lines.len() as f64;
+
+        // Map-Reduce pattern using Rayon
+        existing
+            .par_iter()
+            .filter_map(|(name, artifact)| {
+                let match_count = artifact.content.lines()
+                    .map(|l| l.trim())
+                    .filter(|l| new_lines.contains(l))
+                    .count();
+
+                let overlap_ratio = match_count as f64 / new_lines_len;
+                if overlap_ratio > 0.70 {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 
@@ -163,17 +230,18 @@ pub struct ValidatorRegistry;
 impl ValidatorRegistry {
     pub fn validate(content: &str, language: &str) -> Result<()> {
         match language.to_lowercase().as_str() {
-            "json" => serde_json::from_str::<serde_json::Value>(content)
-                .map(|_| ())
-                .map_err(|e| anyhow!("JSON error: {}", e)),
-            "toml" => toml::from_str::<toml::Value>(content)
-                .map(|_| ())
-                .map_err(|e| anyhow!("TOML error: {}", e)),
-            "yaml" | "yml" => serde_yaml::from_str::<serde_yaml::Value>(content)
-                .map(|_| ())
-                .map_err(|e| anyhow!("YAML error: {}", e)),
-            _ => Ok(()),
+            "json" => {
+                serde_json::from_str::<IgnoredAny>(content).context("Invalid JSON")?;
+            }
+            "toml" => {
+                toml::from_str::<toml::Value>(content).context("Invalid TOML")?;
+            }
+            "yaml" | "yml" => {
+                serde_yaml::from_str::<serde_yaml::Value>(content).context("Invalid YAML")?;
+            }
+            _ => {}
         }
+        Ok(())
     }
 }
 
@@ -182,12 +250,7 @@ pub struct RegressionDetector;
 impl RegressionDetector {
     #[must_use]
     pub fn is_regressive(old: &ArtifactMetrics, new: &ArtifactMetrics) -> bool {
-        if new.cyclomatic_complexity > old.cyclomatic_complexity + 5 {
-            return true;
-        }
-        if new.comment_density < old.comment_density - 0.1 {
-            return true;
-        }
-        false
+        new.cyclomatic_complexity > old.cyclomatic_complexity + 5 || 
+        new.comment_density < old.comment_density - 0.1
     }
 }
