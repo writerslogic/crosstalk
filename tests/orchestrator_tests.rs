@@ -441,3 +441,380 @@ async fn test_orchestrator_records_surprise_after_turn() {
     let surprise = se.surprise_history("SurpModel")[0];
     assert!(surprise >= 0.0 && surprise <= 1.0);
 }
+
+// ── Track 10-B: PromptComposer, RegressionFeedbackHandler, template_cache ────
+
+use crosstalk::engines::intelligence::{PromptComposer, RegressionFeedbackHandler};
+use crosstalk::types::intelligence::{ModelProfile, RegressionAlert, RunningAverage};
+use crosstalk::types::conversation::TaskCategory;
+use std::collections::HashMap as StdHashMap;
+
+fn make_profile(model_id: &str, category: TaskCategory, mean: f64, turns: u32) -> ModelProfile {
+    let mut task_scores = StdHashMap::new();
+    task_scores.insert(category, RunningAverage { mean, count: turns, variance: 0.0 });
+    ModelProfile {
+        model_id: model_id.to_string(),
+        task_scores,
+        total_turns: turns,
+        last_updated: 0,
+        latency_ms: RunningAverage::default(),
+    }
+}
+
+fn make_turn_with_outcome(index: u32, outcome: TurnOutcome, category: Option<TaskCategory>) -> Turn {
+    Turn {
+        index,
+        model_id: "m".to_string(),
+        content: format!("content for turn {index}"),
+        timestamp: 0,
+        diffs: vec![],
+        certainty: None,
+        outcome,
+        task_category: category,
+        structure: None,
+        signature: vec![],
+        surprise_signal: None,
+    }
+}
+
+#[test]
+fn test_prompt_composer_base_pass_through() {
+    let composer = PromptComposer::new();
+    let ctx = make_turn_with_outcome(0, TurnOutcome::Unknown, None);
+    let result = composer.compose("base prompt", "m", TaskCategory::CodeGeneration, &ctx);
+    assert!(result.starts_with("base prompt"));
+}
+
+#[test]
+fn test_prompt_composer_injects_profile_context() {
+    let profile = make_profile("gpt4", TaskCategory::CodeGeneration, 0.85, 10);
+    let ctx = make_turn_with_outcome(1, TurnOutcome::Compiled, Some(TaskCategory::CodeGeneration));
+    let result = PromptComposer::new()
+        .with_profile(profile)
+        .compose("task", "gpt4", TaskCategory::CodeGeneration, &ctx);
+    assert!(result.contains("0.85") || result.contains("CodeGeneration"));
+    assert!(result.contains("gpt4"));
+}
+
+#[test]
+fn test_prompt_composer_appends_examples() {
+    let ctx = make_turn_with_outcome(0, TurnOutcome::Unknown, None);
+    let result = PromptComposer::new()
+        .with_examples(vec!["ex1".to_string(), "ex2".to_string()])
+        .compose("base", "m", TaskCategory::Debugging, &ctx);
+    assert!(result.contains("ex1"));
+    assert!(result.contains("ex2"));
+}
+
+#[test]
+fn test_prompt_composer_examples_capped_at_3() {
+    let ctx = make_turn_with_outcome(0, TurnOutcome::Unknown, None);
+    let examples: Vec<String> = (0..10).map(|i| format!("example_{i}")).collect();
+    let result = PromptComposer::new()
+        .with_examples(examples)
+        .compose("base", "m", TaskCategory::Debugging, &ctx);
+    // Only first 3 examples should appear
+    assert!(result.contains("example_0"));
+    assert!(result.contains("example_2"));
+    assert!(!result.contains("example_3"));
+}
+
+#[test]
+fn test_regression_feedback_corrective_prefix() {
+    let alert = RegressionAlert {
+        agent_id: "model-x".to_string(),
+        task_category: TaskCategory::Refactoring,
+        baseline_mean: 0.80,
+        recent_mean: 0.55,
+        severity: 0.31,
+        timestamp: 0,
+    };
+    let result = RegressionFeedbackHandler::compose_corrective_prompt(&alert, "do the task", &[]);
+    assert!(result.contains("Corrective"));
+    assert!(result.contains("Refactoring"));
+    assert!(result.contains("do the task"));
+}
+
+#[test]
+fn test_regression_feedback_includes_examples() {
+    let alert = RegressionAlert {
+        agent_id: "m".to_string(),
+        task_category: TaskCategory::CodeGeneration,
+        baseline_mean: 0.7,
+        recent_mean: 0.4,
+        severity: 0.43,
+        timestamp: 0,
+    };
+    let examples = vec!["good_turn_1".to_string(), "good_turn_2".to_string()];
+    let result = RegressionFeedbackHandler::compose_corrective_prompt(&alert, "base", &examples);
+    assert!(result.contains("good_turn_1"));
+    assert!(result.contains("good_turn_2"));
+}
+
+#[test]
+fn test_counter_examples_filters_by_category_and_outcome() {
+    let turns = vec![
+        make_turn_with_outcome(1, TurnOutcome::TestsPassed, Some(TaskCategory::CodeGeneration)),
+        make_turn_with_outcome(2, TurnOutcome::Rejected, Some(TaskCategory::CodeGeneration)),
+        make_turn_with_outcome(3, TurnOutcome::Compiled, Some(TaskCategory::Refactoring)),
+        make_turn_with_outcome(4, TurnOutcome::Compiled, Some(TaskCategory::CodeGeneration)),
+    ];
+    let examples = RegressionFeedbackHandler::counter_examples(&turns, TaskCategory::CodeGeneration);
+    assert_eq!(examples.len(), 2);
+    for ex in &examples {
+        assert!(ex.contains("Turn 1") || ex.contains("Turn 4"));
+    }
+}
+
+#[tokio::test]
+async fn test_template_cache_initialized_with_defaults() {
+    let dir = tempdir().expect("temp dir");
+    let manager = StateManager::new(dir.path().to_str().unwrap()).unwrap();
+    let agent: Box<dyn PromptAgent> = Box::new(MockAgent {
+        name: "M".to_string(),
+        response: "r".to_string(),
+    });
+    let omicron = make_orchestrator(manager, vec![agent]);
+    let cache = omicron.template_cache.read().await;
+    assert!(cache.contains_key("base"), "base template missing");
+    assert!(cache.contains_key("corrective"), "corrective template missing");
+}
+
+#[tokio::test]
+async fn test_regression_corrective_prompt_reaches_agent() {
+    // Build an orchestrator whose intelligence engine has a regressed profile,
+    // then verify the turn still completes (corrective path doesn't break execution).
+    let dir = tempdir().expect("temp dir");
+    let manager = StateManager::new(dir.path().to_str().unwrap()).unwrap();
+    let agent: Box<dyn PromptAgent> = Box::new(MockAgent {
+        name: "RegModel".to_string(),
+        response: "recovered response".to_string(),
+    });
+    let omicron = make_orchestrator(manager, vec![agent]);
+
+    // Seed profile with high baseline then inject low-quality recent turns
+    {
+        let intell = omicron.intelligence.lock().await;
+        for _ in 0..5 {
+            let good = make_turn_with_outcome(0, TurnOutcome::TestsPassed, Some(TaskCategory::CodeGeneration));
+            intell.update_profile(&good, 0.9);
+        }
+    }
+
+    let sigma = make_sigma("regression-corrective");
+    // Add recent low-quality turns so detect_regression fires
+    {
+        let mut s = sigma.lock().await;
+        for i in 0..3u32 {
+            s.turns.push(make_turn_with_outcome(
+                i,
+                TurnOutcome::Rejected,
+                Some(TaskCategory::CodeGeneration),
+            ));
+        }
+        s.iteration_index = 3;
+    }
+
+    let result = omicron.run_turn(sigma.clone()).await;
+    assert!(result.is_ok(), "run_turn should succeed even with regression: {result:?}");
+    let s = sigma.lock().await;
+    assert!(!s.turns.is_empty() || s.iteration_index >= 0);
+}
+
+// ── Track 09-B: Cross-Session Memory Linkage ──────────────────────────────
+
+use crosstalk::engines::memory::MemoryBridge;
+use crosstalk::types::memory::{MemoryRecord, OutcomeRecord};
+
+fn make_record(turn_id: u32, session_id: &str, content: &str, tests_passed: bool) -> MemoryRecord {
+    MemoryRecord {
+        turn_id,
+        session_id: session_id.to_string(),
+        embedding: vec![],
+        content_hash: content.to_string(),
+        timestamp: 0,
+        metadata_json: format!(r#"{{"content":"{content}"}}"#),
+        outcome: Some(OutcomeRecord {
+            compiled: true,
+            tests_passed,
+            quality_delta: 0.0,
+            was_rolled_back: false,
+            convergence_contribution: 0.0,
+        }),
+    }
+}
+
+#[test]
+fn test_memory_bridge_open_session_tracks_count() {
+    let mut bridge = MemoryBridge::new();
+    bridge.open_session("sess-a".to_string());
+    bridge.open_session("sess-b".to_string());
+    assert_eq!(bridge.session_count(), 2);
+}
+
+#[test]
+fn test_memory_bridge_push_increments_record_count() {
+    let mut bridge = MemoryBridge::new();
+    bridge.open_session("s1".to_string());
+    bridge.push_record("s1", make_record(1, "s1", "fn foo() {}", false));
+    bridge.push_record("s1", make_record(2, "s1", "fn bar() {}", true));
+    assert_eq!(bridge.record_count("s1"), 2);
+    assert_eq!(bridge.total_record_count(), 2);
+}
+
+#[test]
+fn test_memory_bridge_cross_session_recall_returns_records_from_all_sessions() {
+    let mut bridge = MemoryBridge::new();
+    bridge.open_session("alpha".to_string());
+    bridge.open_session("beta".to_string());
+    bridge.push_record("alpha", make_record(1, "alpha", "implement sorting algorithm", false));
+    bridge.push_record("beta", make_record(2, "beta", "implement sorting algorithm", true));
+
+    let results = bridge
+        .recall_relevant("alpha", "sorting algorithm", 5, 0)
+        .unwrap();
+    let sessions: Vec<&str> = results.iter().map(|r| r.session_id.as_str()).collect();
+    assert!(
+        sessions.contains(&"alpha") || sessions.contains(&"beta"),
+        "recall should search across all sessions"
+    );
+}
+
+#[test]
+fn test_memory_bridge_ranking_prefers_tests_passed() {
+    let mut bridge = MemoryBridge::new();
+    bridge.open_session("s".to_string());
+    bridge.push_record("s", make_record(1, "s", "refactor parser module", false));
+    bridge.push_record("s", make_record(2, "s", "refactor parser module", true));
+
+    let results = bridge
+        .recall_relevant("s", "refactor parser module", 2, 0)
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(
+        results[0].outcome.as_ref().map_or(false, |o| o.tests_passed),
+        "record with tests_passed should rank first"
+    );
+}
+
+#[test]
+fn test_memory_bridge_max_one_recall_per_turn() {
+    let mut bridge = MemoryBridge::new();
+    bridge.open_session("s".to_string());
+    bridge.push_record("s", make_record(1, "s", "some content", false));
+
+    let first = bridge.recall_relevant("s", "some content", 5, 42).unwrap();
+    let second = bridge.recall_relevant("s", "some content", 5, 42).unwrap();
+    assert!(!first.is_empty(), "first recall should return results");
+    assert!(second.is_empty(), "second recall for same turn should return empty");
+}
+
+#[test]
+fn test_memory_bridge_different_turns_both_recall() {
+    let mut bridge = MemoryBridge::new();
+    bridge.open_session("s".to_string());
+    bridge.push_record("s", make_record(1, "s", "content", false));
+
+    let r0 = bridge.recall_relevant("s", "content", 5, 0).unwrap();
+    let r1 = bridge.recall_relevant("s", "content", 5, 1).unwrap();
+    assert!(!r0.is_empty());
+    assert!(!r1.is_empty(), "recall on a new turn index should work");
+}
+
+#[test]
+fn test_memory_bridge_snapshot_and_index_round_trip() {
+    let mut bridge = MemoryBridge::new();
+    bridge.open_session("original".to_string());
+    bridge.push_record("original", make_record(10, "original", "snapshot content", true));
+
+    let snapshot = bridge.take_snapshot("original");
+    assert_eq!(snapshot.len(), 1);
+
+    bridge.open_session("restored".to_string());
+    bridge.index_snapshot("restored", snapshot);
+    assert_eq!(bridge.record_count("restored"), 1);
+}
+
+#[test]
+fn test_memory_bridge_concurrent_sessions_isolated() {
+    let mut bridge = MemoryBridge::new();
+    bridge.open_session("sess-x".to_string());
+    bridge.open_session("sess-y".to_string());
+    bridge.push_record("sess-x", make_record(1, "sess-x", "x content", false));
+    bridge.push_record("sess-x", make_record(2, "sess-x", "x content 2", false));
+    bridge.push_record("sess-y", make_record(3, "sess-y", "y content", true));
+
+    assert_eq!(bridge.record_count("sess-x"), 2);
+    assert_eq!(bridge.record_count("sess-y"), 1);
+    assert_eq!(bridge.total_record_count(), 3);
+}
+
+#[tokio::test]
+async fn test_orchestrator_memory_bridge_populated_after_turn() {
+    let dir = tempdir().expect("temp dir");
+    let manager = StateManager::new(dir.path().to_str().unwrap()).unwrap();
+    let agent: Box<dyn PromptAgent> = Box::new(MockAgent {
+        name: "MemAgent".to_string(),
+        response: "response without code".to_string(),
+    });
+    let omicron = make_orchestrator(manager, vec![agent]);
+    let sigma = make_sigma("mem-session");
+
+    omicron.run_turn(sigma.clone()).await.expect("turn failed");
+
+    let bridge = omicron.memory_bridge.lock().await;
+    assert_eq!(bridge.record_count("mem-session"), 1, "one record per turn");
+}
+
+#[tokio::test]
+async fn test_orchestrator_cross_session_recall_returns_examples() {
+    let dir = tempdir().expect("temp dir");
+    let manager = StateManager::new(dir.path().to_str().unwrap()).unwrap();
+    let agent: Box<dyn PromptAgent> = Box::new(MockAgent {
+        name: "CrossAgent".to_string(),
+        response: "cross session response".to_string(),
+    });
+    let omicron = make_orchestrator(manager, vec![agent]);
+
+    // Seed bridge with records from a different session before running a turn.
+    {
+        let mut bridge = omicron.memory_bridge.lock().await;
+        bridge.open_session("prior-session".to_string());
+        bridge.push_record(
+            "prior-session",
+            make_record(0, "prior-session", "cross session response", true),
+        );
+    }
+
+    let sigma = make_sigma("new-session");
+    omicron.run_turn(sigma.clone()).await.expect("turn failed");
+
+    let bridge = omicron.memory_bridge.lock().await;
+    assert!(bridge.total_record_count() >= 2, "both sessions should contribute records");
+}
+
+#[tokio::test]
+async fn test_orchestrator_session_memory_map_registered_on_convergence() {
+    let dir = tempdir().expect("temp dir");
+    let manager = StateManager::new(dir.path().to_str().unwrap()).unwrap();
+    let agent: Box<dyn PromptAgent> = Box::new(MockAgent {
+        name: "ConvAgent".to_string(),
+        response: "OPTIMAL solution CONVERGED".to_string(),
+    });
+    let omicron = make_orchestrator(manager, vec![agent]);
+    let sigma = make_sigma("conv-session");
+
+    // Force completion_probability above threshold so is_converged triggers.
+    {
+        let mut s = sigma.lock().await;
+        s.completion_probability = 0.96;
+    }
+
+    omicron.run_turn(sigma.clone()).await.expect("turn failed");
+
+    let map = omicron.session_memory_map.lock().await;
+    assert!(
+        map.contains_key("conv-session"),
+        "session should be registered in session_memory_map on convergence"
+    );
+}

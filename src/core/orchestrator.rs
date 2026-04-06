@@ -12,10 +12,11 @@ use crate::engines::intelligence::{
 };
 use crate::types::intelligence::PromptTemplate;
 use crate::engines::linter::LinterGuard;
-use crate::engines::memory::MemoryStore;
+use crate::engines::memory::{MemoryBridge, MemoryStore};
+use crate::types::memory::{MemoryRecord, OutcomeRecord};
 use crate::engines::planning::PlanningEngine;
 use crate::engines::proof::ProofManager;
-use crate::engines::quality::{QualityEngine, RegressionDetector};
+use crate::engines::quality::{ArtifactMetrics, QualityEngine, RegressionDetector};
 use crate::engines::reasoning::{FallacyDetector, ReasoningEngine};
 use crate::engines::release::ConvergenceReport;
 use crate::engines::sandbox::{SandboxManager, SandboxResult};
@@ -28,7 +29,7 @@ use crate::engines::validation::AstValidator;
 use crate::engines::verification::{AuditAlert, ContinuousAuditor, HashChain, InvariantChecker, TautologyFilter};
 use crate::mcp::bridge::ToolDiscovery;
 use crate::mcp::gateway::McpGateway;
-use crate::types::artifact::Artifact;
+use crate::types::artifact::{Artifact, ArtifactDiff, ProofAttachment};
 use crate::types::compute::{CostEntry, TokenUsage};
 use crate::types::conversation::{
     ConversationState, TaskCategory, Turn, TurnOutcome, TurnStructure,
@@ -43,6 +44,18 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 use tokio::sync::mpsc;
+
+/// All computed data for one artifact change, assembled outside the sigma lock.
+struct PreparedArtifactChange {
+    name: String,
+    lang: String,
+    new_content: String,
+    delta: ArtifactDiff,
+    new_metrics: ArtifactMetrics,
+    node_updates: Vec<(String, String)>,
+    proof: ProofAttachment,
+    skeleton: String,
+}
 
 pub struct Orchestrator {
     agents: Vec<Box<dyn PromptAgent>>,
@@ -68,6 +81,8 @@ pub struct Orchestrator {
     pub audit_rx: Mutex<mpsc::Receiver<AuditAlert>>,
     pub surprise_engine: Mutex<SurpriseEngine>,
     pub template_cache: Arc<RwLock<HashMap<String, PromptTemplate>>>,
+    pub session_memory_map: Mutex<HashMap<String, Arc<MemoryStore>>>,
+    pub memory_bridge: Mutex<MemoryBridge>,
 }
 
 impl Orchestrator {
@@ -117,6 +132,8 @@ impl Orchestrator {
             auditor_tx,
             audit_rx: Mutex::new(alert_rx),
             surprise_engine: Mutex::new(SurpriseEngine::new()),
+            session_memory_map: Mutex::new(HashMap::new()),
+            memory_bridge: Mutex::new(MemoryBridge::new()),
             template_cache: Arc::new(RwLock::new({
                 let mut m = HashMap::new();
                 m.insert(
@@ -150,12 +167,26 @@ impl Orchestrator {
     }
 
     pub async fn run_turn(&self, sigma_lock: Arc<Mutex<ConversationState>>) -> Result<bool> {
-        let (iteration_index, prompt, history_contents, agent_id) = {
+        // Phase 0: Recall cross-session memory examples before acquiring the main lock.
+        let (pre_session_id, pre_turn_idx) = {
+            let s = sigma_lock.lock().await;
+            (s.session_id.clone(), s.iteration_index)
+        };
+        let memory_examples = {
+            let mut bridge = self.memory_bridge.lock().await;
+            bridge.open_session(pre_session_id.clone());
+            bridge
+                .recall_relevant(&pre_session_id, &pre_session_id, 5, pre_turn_idx)
+                .unwrap_or_default()
+        };
+
+        // Phase 1: Brief lock to snapshot state needed for streaming and processing.
+        let (iteration_index, prompt, history_contents, agent_id, artifacts_snapshot) = {
             let s = sigma_lock.lock().await;
             if s.iteration_index == 0 && s.turns.is_empty() {
                 self.state_manager.checkpoint(&s)?;
             }
-            let contents: Vec<String> = s.turns.iter().map(|t| t.content.clone()).collect();
+            let contents: Vec<String> = s.turns.iter().rev().take(10).map(|t| t.content.clone()).collect();
             let distilled_prompt = self.build_differential_prompt(&s);
 
             let agent_idx = (s.iteration_index as usize) % self.agents.len();
@@ -171,15 +202,35 @@ impl Orchestrator {
                     final_prompt.push_str("\nExplicitly analyze tradeoffs (Pros vs Cons).")
                 }
                 TurnStructure::CodeFirst => {
-                    final_prompt.push_str("\nProvide the code delta (Δα) before any explanation.")
+                    final_prompt
+                        .push_str("\nProvide the code delta (Δα) before any explanation.")
                 }
                 _ => {}
             }
 
-            (s.iteration_index, final_prompt, contents, model_id)
+            if !memory_examples.is_empty() {
+                final_prompt.push_str("\n\nSuccessful examples from similar tasks:\n");
+                for ex in memory_examples.iter().take(5) {
+                    let _ = writeln!(
+                        final_prompt,
+                        "- [Session {}] Turn {}: {}",
+                        ex.session_id, ex.turn_id, ex.metadata_json
+                    );
+                }
+            }
+
+            let artifacts_snapshot = s.artifacts.clone();
+            (
+                s.iteration_index,
+                final_prompt,
+                contents,
+                model_id,
+                artifacts_snapshot,
+            )
         };
+        // sigma_lock released here.
 
-
+        // Phase 2: Stream response — no lock held.
         let agent_idx = (iteration_index as usize) % self.agents.len();
         let agent = &self.agents[agent_idx];
 
@@ -216,7 +267,8 @@ impl Orchestrator {
 
             match stream.next().await {
                 Some(chunk_res) => {
-                    let chunk = chunk_res.map_err(|e| anyhow::anyhow!("Stream error: {e:?}"))?;
+                    let chunk =
+                        chunk_res.map_err(|e| anyhow::anyhow!("Stream error: {e:?}"))?;
                     response.push_str(&chunk);
                     let _ = self.event_tx.send(StreamEvent::TokenReceived(chunk)).await;
                 }
@@ -226,6 +278,7 @@ impl Orchestrator {
 
         let latency_ms = start_time.elapsed().as_millis() as u64;
 
+        // Phase 3: Stateless checks — no lock held.
         let secrets = SecretScanner::scan(&response);
         if !secrets.is_empty() {
             let _ = self
@@ -258,325 +311,444 @@ impl Orchestrator {
                 .await;
         }
 
+        // Phase 4: Validate and prepare artifact changes — no lock held.
+        // mc_runner.predict() and LinterGuard::check() run freely here.
         let proposed_artifacts = Self::parse_artifacts(&response);
-        let mut turn_diffs = vec![];
+        let Some((changes, turn_outcome)) = self
+            .process_proposed_artifacts(proposed_artifacts, &artifacts_snapshot)
+            .await?
+        else {
+            return Ok(false);
+        };
+
+        // Phase 5: Commit under lock — only fast, CPU-bound work remains.
+        let mut sigma = sigma_lock.lock().await;
+        self.commit_turn(
+            &mut sigma,
+            changes,
+            turn_outcome,
+            &agent_id,
+            &response,
+            &prompt,
+            latency_ms,
+        )
+        .await
+    }
+
+    /// Validate proposed artifacts and compute all changes without holding the sigma lock.
+    /// Returns None if any artifact fails validation (caller should return Ok(false)).
+    async fn process_proposed_artifacts(
+        &self,
+        proposed: HashMap<String, (String, String)>,
+        snapshot: &HashMap<String, Artifact>,
+    ) -> Result<Option<(Vec<PreparedArtifactChange>, TurnOutcome)>> {
+        let all_names: Vec<String> = snapshot.keys().cloned().collect();
+        let mut changes = Vec::new();
         let mut turn_outcome = TurnOutcome::Unknown;
 
-        {
-            let mut sigma = sigma_lock.lock().await;
-            let sigma_snapshot = sigma.clone();
-            let current_i = sigma.iteration_index;
-
-            let mut all_valid = true;
-            for (name, (lang, new_content)) in proposed_artifacts {
-                if let Err(e) = AstValidator::validate(&new_content, &lang) {
-                    let _ = self.event_tx.send(StreamEvent::TokenReceived(format!(
+        for (name, (lang, new_content)) in proposed {
+            if let Err(e) = AstValidator::validate(&new_content, &lang) {
+                let _ = self
+                    .event_tx
+                    .send(StreamEvent::TokenReceived(format!(
                         "[diff] artifact \"{name}\" rejected: AST validation failed: {e}"
-                    ))).await;
-                    all_valid = false;
-                    turn_outcome = TurnOutcome::Rejected;
-                    break;
-                }
-
-                let dups = QualityEngine::detect_duplication(&new_content, &sigma.artifacts);
-                if !dups.is_empty() {
-                    let _ = self.event_tx.send(StreamEvent::TokenReceived(format!(
-                        "[quality] duplication detected for \"{name}\": {:?}", dups
-                    ))).await;
-                }
-
-                let all_names: Vec<String> = sigma.artifacts.keys().cloned().collect();
-                let (delta, node_updates) = {
-                    let current_artifact =
-                        sigma
-                            .artifacts
-                            .entry(name.clone())
-                            .or_insert_with(|| Artifact {
-                                name: name.clone(),
-                                language: lang.clone(),
-                                content: String::new(),
-                                version: 0,
-                                history: vec![],
-                                ast_versions: HashMap::new(),
-                                proof_attachments: vec![],
-                                metrics: crate::engines::quality::ArtifactMetrics::default(),
-                                skeleton: String::new(),
-                            });
-
-                    if current_artifact.content != new_content {
-                        let delta = DiffEngine::generate_delta(
-                            &current_artifact.content,
-                            &new_content,
-                            current_artifact.version,
-                        );
-                        let p_fail = self.mc_runner.predict(current_artifact, &delta, 10).await.map(|(mean, _)| mean).unwrap_or(0.5);
-                        if p_fail > 0.5 {
-                            all_valid = false;
-                            turn_outcome = TurnOutcome::RolledBack;
-                            break;
-                        }
-
-                        let new_metrics = QualityEngine::analyze_artifact(
-                            &Artifact {
-                                content: new_content.clone(),
-                                ..current_artifact.clone()
-                            },
-                            &all_names,
-                        );
-                        if RegressionDetector::is_regressive(
-                            &current_artifact.metrics,
-                            &new_metrics,
-                        ) {
-                            all_valid = false;
-                            turn_outcome = TurnOutcome::Rejected;
-                            break;
-                        }
-
-                        current_artifact.history.push(delta.clone());
-                        current_artifact.content = new_content.clone();
-                        current_artifact.version += 1;
-                        current_artifact.language = lang.clone();
-                        current_artifact.metrics = new_metrics;
-                        current_artifact.skeleton =
-                            AstValidator::generate_skeleton(&new_content, &lang);
-
-                        let nodes = AstValidator::extract_nodes(&new_content, &lang);
-                        let mut updates = vec![];
-                        for (node_id, content) in nodes {
-                            current_artifact
-                                .ast_versions
-                                .entry(node_id.clone())
-                                .or_default()
-                                .push((current_i, content.clone()));
-                            updates.push((node_id, content));
-                        }
-
-                        let proof = ProofManager::generate_proof(
-                            current_artifact,
-                            vec![
-                                "ast_valid".to_string(),
-                                "mc_safe".to_string(),
-                                "quality_checked".to_string(),
-                            ],
-                        );
-                        current_artifact.proof_attachments.push(proof);
-
-                        if current_artifact.language.to_lowercase() == "rust"
-                            || current_artifact.language.to_lowercase() == "rs"
-                        {
-                            let sandbox_result = SandboxResult {
-                                exit_code: 0,
-                                stdout: new_content.clone(),
-                                stderr: String::new(),
-                            };
-                            match LinterGuard::check(&sandbox_result, "/tmp").await {
-                                Ok(report) if !report.passed => {
-                                    all_valid = false;
-                                    turn_outcome = TurnOutcome::Rejected;
-                                    break;
-                                }
-                                Err(_) => {
-                                    all_valid = false;
-                                    turn_outcome = TurnOutcome::Rejected;
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        (Some(delta), updates)
-                    } else {
-                        (None, vec![])
-                    }
-                };
-
-                if let Some(d) = delta {
-                    turn_diffs.push((name.clone(), d));
-                    turn_outcome = TurnOutcome::Compiled;
-                }
-
-                for (node_id, _content) in node_updates {
-                    if let Some(history) = sigma
-                        .artifacts
-                        .get(&name)
-                        .and_then(|a| a.ast_versions.get(&node_id))
-                        && history.len() >= 3
-                    {
-                        let v1 = &history[history.len() - 1].1;
-                        let v2 = &history[history.len() - 2].1;
-                        let v3 = &history[history.len() - 3].1;
-                        if v1 == v3 && v1 != v2 {
-                            let matrix = [[(0.8, 0.2), (0.1, 0.1)], [(0.1, 0.1), (0.2, 0.8)]];
-                            let _eq = NashSolver::solve_2x2_pure(&matrix);
-                        }
-                    }
-
-                    let node_p = sigma.node_consensus.entry(node_id).or_insert(0.1);
-                    let mut kalman = KalmanConvergence::new(*node_p);
-                    *node_p = kalman.update(0.8);
-                }
+                    )))
+                    .await;
+                return Ok(None);
             }
 
-            if !all_valid {
-                *sigma = sigma_snapshot;
-                return Ok(false);
+            let dups = QualityEngine::detect_duplication(&new_content, snapshot);
+            if !dups.is_empty() {
+                let _ = self
+                    .event_tx
+                    .send(StreamEvent::TokenReceived(format!(
+                        "[quality] duplication detected for \"{name}\": {:?}",
+                        dups
+                    )))
+                    .await;
             }
 
-            let volatility = 0.1;
-            let certainty = CertaintyAnalyzer::compute(&response, volatility);
-
-            let surprise = {
-                let mut se = self.surprise_engine.lock().await;
-                se.record_prediction(&agent_id, certainty);
-                let s = se.compute_surprise(&agent_id, turn_outcome);
-                if s > 0.5 {
-                    let _ = self.event_tx.send(StreamEvent::TokenReceived(format!(
-                        "[sandbox] High Surprise detected: {:.2}", s
-                    ))).await;
-                }
-                let current_w = sigma.agent_weights.get(&agent_id).copied().unwrap_or(1.0);
-                let new_w = se.calibrate_weight(&agent_id, current_w);
-                sigma.agent_weights.insert(agent_id.clone(), new_w);
-                s
+            let default_artifact = Artifact {
+                name: name.clone(),
+                language: lang.clone(),
+                content: String::new(),
+                version: 0,
+                history: vec![],
+                ast_versions: HashMap::new(),
+                proof_attachments: vec![],
+                metrics: ArtifactMetrics::default(),
+                skeleton: String::new(),
             };
+            let current = snapshot.get(&name).unwrap_or(&default_artifact);
 
-            let mut turn = Turn {
-                index: sigma.iteration_index,
-                model_id: agent_id.clone(),
-                content: response.clone(),
-                timestamp: ConversationState::now(),
-                diffs: turn_diffs,
-                certainty: Some(certainty),
-                outcome: turn_outcome,
-                task_category: Some(TaskCategory::CodeGeneration),
-                structure: Some(ReasoningEngine::select_structure(
-                    TaskCategory::CodeGeneration,
-                    &agent_id,
-                )),
-                signature: vec![],
-                surprise_signal: Some(surprise),
-            };
+            if current.content == new_content {
+                continue;
+            }
 
-            let serialized = serde_json::to_vec(&turn)?;
-            turn.signature = self.signer.sign(&serialized);
+            let delta =
+                DiffEngine::generate_delta(&current.content, &new_content, current.version);
 
-            {
-                let mut intell = self.intelligence.lock().await;
-                intell.update_profile(&turn, QualityScorer::score(&turn, &sigma));
+            let p_fail = self
+                .mc_runner
+                .predict(current, &delta, 10)
+                .await
+                .map(|(mean, _)| mean)
+                .unwrap_or(0.5);
+            if p_fail > 0.5 {
+                return Ok(None);
+            }
 
-                let recent_turns: Vec<Turn> = sigma
-                    .turns
-                    .iter()
-                    .rev()
-                    .take(5)
-                    .cloned()
-                    .collect::<Vec<_>>()
+            let new_metrics = QualityEngine::analyze_artifact(
+                &Artifact {
+                    content: new_content.clone(),
+                    ..current.clone()
+                },
+                &all_names,
+            );
+            if RegressionDetector::is_regressive(&current.metrics, &new_metrics) {
+                return Ok(None);
+            }
+
+            let node_updates: Vec<(String, String)> =
+                AstValidator::extract_nodes(&new_content, &lang)
                     .into_iter()
-                    .rev()
                     .collect();
-                if let Some(alert) = intell.detect_regression(&agent_id, &recent_turns) {
-                    let _ = self.event_tx.send(StreamEvent::TokenReceived(format!(
+
+            let proof = ProofManager::generate_proof(
+                &Artifact {
+                    name: name.clone(),
+                    content: new_content.clone(),
+                    language: lang.clone(),
+                    version: current.version + 1,
+                    history: vec![],
+                    ast_versions: HashMap::new(),
+                    proof_attachments: vec![],
+                    metrics: new_metrics.clone(),
+                    skeleton: String::new(),
+                },
+                vec![
+                    "ast_valid".to_string(),
+                    "mc_safe".to_string(),
+                    "quality_checked".to_string(),
+                ],
+            );
+
+            if lang.to_lowercase() == "rust" || lang.to_lowercase() == "rs" {
+                let sandbox_result = SandboxResult {
+                    exit_code: 0,
+                    stdout: new_content.clone(),
+                    stderr: String::new(),
+                };
+                match LinterGuard::check(&sandbox_result, "/tmp").await {
+                    Ok(report) if !report.passed => return Ok(None),
+                    Err(_) => return Ok(None),
+                    _ => {}
+                }
+            }
+
+            let skeleton = AstValidator::generate_skeleton(&new_content, &lang);
+
+            changes.push(PreparedArtifactChange {
+                name,
+                lang,
+                new_content,
+                delta,
+                new_metrics,
+                node_updates,
+                proof,
+                skeleton,
+            });
+            turn_outcome = TurnOutcome::Compiled;
+        }
+
+        Ok(Some((changes, turn_outcome)))
+    }
+
+    /// Apply validated changes to sigma and persist the turn. Called under the sigma lock.
+    async fn commit_turn(
+        &self,
+        sigma: &mut ConversationState,
+        changes: Vec<PreparedArtifactChange>,
+        turn_outcome: TurnOutcome,
+        agent_id: &str,
+        response: &str,
+        prompt: &str,
+        latency_ms: u64,
+    ) -> Result<bool> {
+        let current_i = sigma.iteration_index;
+
+        // Apply artifact changes and update node consensus.
+        let mut turn_diffs = Vec::new();
+        for change in changes {
+            let artifact = sigma
+                .artifacts
+                .entry(change.name.clone())
+                .or_insert_with(|| Artifact {
+                    name: change.name.clone(),
+                    language: change.lang.clone(),
+                    content: String::new(),
+                    version: 0,
+                    history: vec![],
+                    ast_versions: HashMap::new(),
+                    proof_attachments: vec![],
+                    metrics: ArtifactMetrics::default(),
+                    skeleton: String::new(),
+                });
+
+            artifact.history.push(change.delta.clone());
+            artifact.content = change.new_content;
+            artifact.version += 1;
+            artifact.language = change.lang;
+            artifact.metrics = change.new_metrics;
+            artifact.skeleton = change.skeleton;
+            artifact.proof_attachments.push(change.proof);
+
+            for (node_id, content) in &change.node_updates {
+                artifact
+                    .ast_versions
+                    .entry(node_id.clone())
+                    .or_default()
+                    .push((current_i, content.clone()));
+            }
+
+            for (node_id, _) in &change.node_updates {
+                if let Some(history) = artifact.ast_versions.get(node_id)
+                    && history.len() >= 3
+                {
+                    let v1 = &history[history.len() - 1].1;
+                    let v2 = &history[history.len() - 2].1;
+                    let v3 = &history[history.len() - 3].1;
+                    if v1 == v3 && v1 != v2 {
+                        let matrix = [[(0.8, 0.2), (0.1, 0.1)], [(0.1, 0.1), (0.2, 0.8)]];
+                        let _eq = NashSolver::solve_2x2_pure(&matrix);
+                    }
+                }
+
+                let node_p = sigma.node_consensus.entry(node_id.clone()).or_insert(0.1);
+                let mut kalman = KalmanConvergence::new(*node_p);
+                *node_p = kalman.update(0.8);
+            }
+
+            turn_diffs.push((change.name, change.delta));
+        }
+
+        let volatility = 0.1;
+        let certainty = CertaintyAnalyzer::compute(response, volatility);
+
+        let surprise = {
+            let mut se = self.surprise_engine.lock().await;
+            se.record_prediction(agent_id, certainty);
+            let s = se.compute_surprise(agent_id, turn_outcome);
+            if s > 0.5 {
+                let _ = self
+                    .event_tx
+                    .send(StreamEvent::TokenReceived(format!(
+                        "[sandbox] High Surprise detected: {:.2}",
+                        s
+                    )))
+                    .await;
+            }
+            let current_w = sigma.agent_weights.get(agent_id).copied().unwrap_or(1.0);
+            let new_w = se.calibrate_weight(agent_id, current_w);
+            sigma.agent_weights.insert(agent_id.to_string(), new_w);
+            s
+        };
+
+        let mut turn = Turn {
+            index: sigma.iteration_index,
+            model_id: agent_id.to_string(),
+            content: response.to_string(),
+            timestamp: ConversationState::now(),
+            diffs: turn_diffs,
+            certainty: Some(certainty),
+            outcome: turn_outcome,
+            task_category: Some(TaskCategory::CodeGeneration),
+            structure: Some(ReasoningEngine::select_structure(
+                TaskCategory::CodeGeneration,
+                agent_id,
+            )),
+            signature: vec![],
+            surprise_signal: Some(surprise),
+        };
+
+        let serialized = serde_json::to_vec(&turn)?;
+        turn.signature = self.signer.sign(&serialized);
+
+        {
+            let intell = self.intelligence.lock().await;
+            intell.update_profile(&turn, QualityScorer::score(&turn, sigma));
+
+            let recent_turns: Vec<Turn> = sigma
+                .turns
+                .iter()
+                .rev()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if let Some(alert) = intell.detect_regression(agent_id, &recent_turns) {
+                let _ = self
+                    .event_tx
+                    .send(StreamEvent::TokenReceived(format!(
                         "[intelligence] Regression detected for {}: {:.2} -> {:.2}",
                         alert.agent_id, alert.baseline_mean, alert.recent_mean
-                    ))).await;
+                    )))
+                    .await;
+            }
+        }
+
+        {
+            let mut coll = self.collective.lock().await;
+            coll.update_specialization(&turn);
+        }
+
+        let cost_entry = CostEntry {
+            turn_id: turn.index,
+            model_id: agent_id.to_string(),
+            usage: TokenUsage {
+                input_tokens: prompt.len() as u32 / 4,
+                output_tokens: response.len() as u32 / 4,
+                total_tokens: (prompt.len() + response.len()) as u32 / 4,
+            },
+            cost_usd: 0.01,
+            latency_ms,
+            timestamp: turn.timestamp,
+        };
+        ComputeManager::manage_budget(sigma, cost_entry);
+
+        sigma.turns.push(turn.clone());
+        sigma.iteration_index += 1;
+
+        let prev_hash = sigma.state_hash;
+        sigma.state_hash = HashChain::compute(sigma, &prev_hash)?;
+
+        if sigma.iteration_index <= current_i {
+            return Ok(false);
+        }
+
+        sigma.agent_weights = InfluenceWeightManager::calculate_weights(sigma);
+        let mut kalman = KalmanConvergence::new(sigma.completion_probability);
+        let measurement = if response.contains("OPTIMAL") || response.contains("CONVERGED") {
+            1.0
+        } else {
+            certainty * 0.8
+        };
+        sigma.completion_probability = kalman.update(measurement);
+
+        InvariantChecker::check_all(sigma)?;
+        self.state_manager.checkpoint(sigma)?;
+        let _ = self.swarm.broadcast_turn(turn.clone());
+
+        if let Some(ref auditor_tx) = self.auditor_tx {
+            let _ = auditor_tx.send(sigma.clone()).await;
+        }
+
+        if let Some(ref mut root) = sigma.goal_tree.root {
+            PlanningEngine::update_goal_status(root);
+        }
+
+        {
+            let mut viz = self.viz.lock().await;
+            let _ = viz.render_frame(sigma).await;
+        }
+
+        let _ = self
+            .event_tx
+            .send(StreamEvent::TokenReceived(format!(
+                "\n[Turn Complete | P(C): {:.2} | Hash: {:02x?}]\n",
+                sigma.completion_probability,
+                &sigma.state_hash[..4]
+            )))
+            .await;
+        let _ = self.event_tx.send(StreamEvent::TurnComplete(turn.clone())).await;
+
+        {
+            let mut audit_rx = self.audit_rx.lock().await;
+            while let Ok(alert) = audit_rx.try_recv() {
+                let _ = self
+                    .event_tx
+                    .send(StreamEvent::TokenReceived(format!(
+                        "[audit] Hash mismatch at iteration {}: expected {:02x?}, got {:02x?}",
+                        alert.iteration_index,
+                        &alert.expected_hash[..4],
+                        &alert.actual_hash[..4]
+                    )))
+                    .await;
+                if let Ok(Some(safe_state)) = self
+                    .state_manager
+                    .restore(alert.iteration_index.saturating_sub(1))
+                {
+                    *sigma = safe_state;
                 }
             }
+        }
 
-            {
-                let mut coll = self.collective.lock().await;
-                coll.update_specialization(&turn);
-            }
-
-            let cost_entry = CostEntry {
+        // Record the committed turn in the memory bridge for cross-session recall.
+        {
+            let session_id = sigma.session_id.clone();
+            let compiled = matches!(
+                turn.outcome,
+                TurnOutcome::Compiled | TurnOutcome::TestsPassed | TurnOutcome::AdvancedConvergence
+            );
+            let tests_passed = turn.outcome == TurnOutcome::TestsPassed;
+            let convergence_contribution = sigma.completion_probability;
+            let content_key = response[..response.len().min(500)].to_string();
+            let preview = response[..response.len().min(200)].to_string();
+            let outcome_str = format!("{:?}", turn.outcome);
+            let metadata = serde_json::json!({
+                "content": preview,
+                "outcome": outcome_str,
+                "agent": agent_id,
+            })
+            .to_string();
+            let record = MemoryRecord {
                 turn_id: turn.index,
-                model_id: agent_id.clone(),
-                usage: TokenUsage {
-                    input_tokens: prompt.len() as u32 / 4,
-                    output_tokens: response.len() as u32 / 4,
-                    total_tokens: (prompt.len() + response.len()) as u32 / 4,
-                },
-                cost_usd: 0.01,
-                latency_ms,
+                session_id: session_id.clone(),
+                embedding: vec![],
+                content_hash: content_key,
                 timestamp: turn.timestamp,
+                metadata_json: metadata,
+                outcome: Some(OutcomeRecord {
+                    compiled,
+                    tests_passed,
+                    quality_delta: 0.0,
+                    was_rolled_back: false,
+                    convergence_contribution,
+                }),
             };
-            ComputeManager::manage_budget(&mut sigma, cost_entry);
+            let mut bridge = self.memory_bridge.lock().await;
+            bridge.open_session(session_id.clone());
+            bridge.push_record(&session_id, record);
+        }
 
-            sigma.turns.push(turn.clone());
-            sigma.iteration_index += 1;
-
-            let prev_hash = sigma.state_hash;
-            sigma.state_hash = HashChain::compute(&sigma, &prev_hash)?;
-
-            if sigma.iteration_index <= current_i {
-                *sigma = sigma_snapshot;
-                return Ok(false);
-            }
-
-            sigma.agent_weights = InfluenceWeightManager::calculate_weights(&sigma);
-            let mut kalman = KalmanConvergence::new(sigma.completion_probability);
-            let measurement = if response.contains("OPTIMAL") || response.contains("CONVERGED") {
-                1.0
-            } else {
-                certainty * 0.8
-            };
-            sigma.completion_probability = kalman.update(measurement);
-
-            InvariantChecker::check_all(&sigma)?;
-            self.state_manager.checkpoint(&sigma)?;
-            let _ = self.swarm.broadcast_turn(turn.clone());
-
-            if let Some(ref auditor_tx) = self.auditor_tx {
-                let _ = auditor_tx.send(sigma.clone()).await;
-            }
-
-            if let Some(ref mut root) = sigma.goal_tree.root {
-                PlanningEngine::update_goal_status(root);
-            }
-
-            {
-                let mut viz = self.viz.lock().await;
-                let _ = viz.render_frame(&sigma).await;
-            }
-
+        let is_converged = sigma.completion_probability > 0.95;
+        if is_converged {
+            let eval = SelfImprovementEngine::evaluate_session(sigma);
+            let report = AnalyticsEngine::generate_report(sigma);
+            let exec_summary = ConvergenceReport::generate(sigma);
             let _ = self
                 .event_tx
                 .send(StreamEvent::TokenReceived(format!(
-                    "\n[Turn Complete | P(C): {:.2} | Hash: {:02x?}]\n",
-                    sigma.completion_probability,
-                    &sigma.state_hash[..4]
-                )))
-                .await;
-            let _ = self.event_tx.send(StreamEvent::TurnComplete(turn)).await;
-
-            {
-                let mut audit_rx = self.audit_rx.lock().await;
-                while let Ok(alert) = audit_rx.try_recv() {
-                    let _ = self.event_tx.send(StreamEvent::TokenReceived(format!(
-                        "[audit] Hash mismatch at iteration {}: expected {:02x?}, got {:02x?}",
-                        alert.iteration_index, &alert.expected_hash[..4], &alert.actual_hash[..4]
-                    ))).await;
-                    if let Ok(Some(safe_state)) = self
-                        .state_manager
-                        .restore(alert.iteration_index.saturating_sub(1))
-                    {
-                        *sigma = safe_state;
-                    }
-                }
-            }
-
-            let is_converged = sigma.completion_probability > 0.95;
-            if is_converged {
-                let eval = SelfImprovementEngine::evaluate_session(&sigma);
-                let report = AnalyticsEngine::generate_report(&sigma);
-                let exec_summary = ConvergenceReport::generate(&sigma);
-                let _ = self.event_tx.send(StreamEvent::TokenReceived(format!(
                     "[self-improve] {:?} | [analytics] {:?} | [release] {}",
                     eval, report, exec_summary
-                ))).await;
-            }
-
-            Ok(is_converged)
+                )))
+                .await;
+            // Register session in map to mark it as indexed for cross-session search.
+            self.session_memory_map
+                .lock()
+                .await
+                .entry(sigma.session_id.clone())
+                .or_insert_with(|| {
+                    Arc::new(MemoryStore::new(&format!(
+                        "/tmp/crosstalk-{}",
+                        sigma.session_id
+                    )))
+                });
         }
+
+        Ok(is_converged)
     }
 
     fn build_differential_prompt(&self, sigma: &ConversationState) -> String {
