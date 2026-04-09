@@ -3,6 +3,8 @@ use crate::types::conversation::ConversationState;
 use anyhow::{Result, anyhow};
 use clap_complete::{Shell, generate};
 use std::io;
+use std::sync::Arc;
+use dashmap::DashMap;
 
 #[derive(Debug, Clone)]
 pub struct StabilityAuditResult {
@@ -14,7 +16,7 @@ pub struct StabilityAuditResult {
 impl StabilityAuditResult {
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.failed == 0
+        self.failed == 0 && self.passed > 0
     }
 }
 
@@ -93,6 +95,11 @@ impl ReleaseManager {
 
     #[must_use]
     pub fn generate_homebrew_formula(version: &str, sha256: &str) -> String {
+        fn is_safe(s: &str) -> bool {
+            s.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-')
+        }
+        let version = if is_safe(version) { version } else { "invalid" };
+        let sha256 = if is_safe(sha256) { sha256 } else { "invalid" };
         format!(
             r##"class Crosstalk < Formula
   desc "AI multi-model orchestrator"
@@ -109,8 +116,7 @@ impl ReleaseManager {
   test do
     system "#{{bin}}/crosstalk", "--version"
   end
-end
-"##
+  "##
         )
     }
 }
@@ -159,3 +165,49 @@ impl ConvergenceReport {
         report
     }
 }
+
+// ── Plugin Architecture ──────────────────────────────────────────────────────
+
+pub trait CrosstalkPlugin: Send + Sync {
+    fn name(&self) -> &str;
+    fn capabilities(&self) -> Vec<String>;
+    fn on_turn(&self, sigma: &mut ConversationState) -> Result<()>;
+    fn on_checkpoint(&self, sigma: &ConversationState) -> Result<()>;
+    fn on_quality_check(&self, sigma: &ConversationState) -> Result<f64>;
+}
+
+pub struct PluginManager {
+    pub plugins: DashMap<String, Arc<dyn CrosstalkPlugin>>,
+}
+
+impl PluginManager {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { plugins: DashMap::new() }
+    }
+
+    pub fn register(&self, plugin: Arc<dyn CrosstalkPlugin>) {
+        self.plugins.insert(plugin.name().to_string(), plugin);
+    }
+
+    pub fn run_on_turn(&self, sigma: &mut ConversationState) -> Result<()> {
+        for entry in self.plugins.iter() {
+            entry.value().on_turn(sigma)?;
+        }
+        Ok(())
+    }
+
+    pub fn run_quality_checks(&self, sigma: &ConversationState) -> Vec<(String, f64)> {
+        self.plugins
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().on_quality_check(sigma).unwrap_or(0.0)))
+            .collect()
+    }
+}
+
+impl Default for PluginManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+

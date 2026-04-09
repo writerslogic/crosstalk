@@ -127,17 +127,20 @@ impl LinterGuard {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        let output = timeout(Duration::from_millis(500), rustc.wait_with_output())
-            .await
-            .map_err(|_| anyhow!("Artifact lint timed out (>500ms)"))??;
+        let lint_result = async {
+            let output = timeout(Duration::from_millis(500), rustc.wait_with_output())
+                .await
+                .map_err(|_| anyhow!("Artifact lint timed out (>500ms)"))??;
 
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let diags = Self::parse_json_diagnostics(&stderr);
+            let passed = !diags.iter().any(|d| d.severity == Severity::Error);
+            Ok(ArtifactLintReport { diagnostics: diags, passed, skipped: false })
+        }
+        .await;
+        // Always clean up temp file regardless of lint outcome
         let _ = tokio::fs::remove_file(&src).await;
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let diags = Self::parse_json_diagnostics(&stderr);
-        let passed = !diags.iter().any(|d| d.severity == Severity::Error);
-
-        Ok(ArtifactLintReport { diagnostics: diags, passed, skipped: false })
+        lint_result
     }
 
     /// Generate safe auto-fixes for common warnings in a `LintReport`.
@@ -154,13 +157,18 @@ impl LinterGuard {
     // ── Private helpers ──────────────────────────────────────────────────────
 
     async fn run_clippy(workspace_dir: &str) -> Result<LintReport> {
-        let cargo_path = Path::new(workspace_dir).join("Cargo.toml");
-        if !cargo_path.exists() {
+        let resolved = Path::new(workspace_dir)
+            .canonicalize()
+            .map_err(|e| anyhow!("Cannot resolve workspace path '{}': {}", workspace_dir, e))?;
+        if !resolved.is_dir() {
+            return Err(anyhow!("Workspace path is not a directory: {}", workspace_dir));
+        }
+        if !resolved.join("Cargo.toml").exists() {
             return Ok(LintReport { warnings: vec![], errors: vec![], passed: true });
         }
 
         let child = Command::new("cargo")
-            .current_dir(workspace_dir)
+            .current_dir(&resolved)
             .args([
                 "clippy",
                 "--all-targets",
@@ -185,8 +193,8 @@ impl LinterGuard {
                     continue;
                 }
                 let msg = &v["message"];
-                let level = msg["level"].as_str().unwrap_or("note");
-                let text = msg["message"].as_str().unwrap_or("").to_string();
+                let Some(level_str) = msg["level"].as_str() else { continue; };
+                let Some(text) = msg["message"].as_str() else { continue; };
                 let code = msg["code"]["code"].as_str().map(|s| s.to_string());
 
                 let (line_n, col_n) = msg["spans"]
@@ -201,13 +209,13 @@ impl LinterGuard {
                     .unwrap_or((None, None));
 
                 let diag = Diagnostic {
-                    severity: match level {
+                    severity: match level_str {
                         "error" => Severity::Error,
                         "warning" => Severity::Warning,
                         _ => Severity::Info,
                     },
                     code,
-                    message: text,
+                    message: text.to_string(),
                     line: line_n,
                     column: col_n,
                 };
@@ -227,11 +235,8 @@ impl LinterGuard {
         let mut diags = Vec::new();
         for line in stderr.lines() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                let level = v["level"].as_str().unwrap_or("note");
-                let text = v["message"].as_str().unwrap_or("").to_string();
-                if text.is_empty() {
-                    continue;
-                }
+                let Some(level_str) = v["level"].as_str() else { continue; };
+                let Some(text) = v["message"].as_str() else { continue; };
                 let code = v["code"]["code"].as_str().map(|s| s.to_string());
                 let (line_n, col_n) = v["spans"]
                     .as_array()
@@ -245,13 +250,13 @@ impl LinterGuard {
                     .unwrap_or((None, None));
 
                 diags.push(Diagnostic {
-                    severity: match level {
+                    severity: match level_str {
                         "error" => Severity::Error,
                         "warning" => Severity::Warning,
                         _ => Severity::Info,
                     },
                     code,
-                    message: text,
+                    message: text.to_string(),
                     line: line_n,
                     column: col_n,
                 });
@@ -260,13 +265,24 @@ impl LinterGuard {
         diags
     }
 
+    fn looks_like_comment(line: &str) -> bool {
+        let t = line.trim_start();
+        t.starts_with("//") || t.starts_with('#') || t.starts_with("/*") || t.starts_with('*')
+    }
+
+    fn has_comment_marker(line: &str) -> bool {
+        Self::looks_like_comment(line)
+            || line.contains("//")
+            || line.contains('#')
+            || line.contains("/*")
+    }
+
     /// Heuristic scan for non-Rust artifacts (JS, Python, etc.).
     fn heuristic_scan(content: &str) -> Vec<Diagnostic> {
         let mut diags = Vec::new();
         for (i, line) in content.lines().enumerate() {
             let line_n = (i + 1) as u32;
-            // Detect TODO/FIXME as Info
-            if line.contains("TODO") || line.contains("FIXME") {
+            if (line.contains("TODO") || line.contains("FIXME")) && Self::has_comment_marker(line) {
                 diags.push(Diagnostic {
                     severity: Severity::Info,
                     code: Some("advisory".to_string()),

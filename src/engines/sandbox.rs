@@ -1,5 +1,5 @@
 use crate::types::conversation::ConversationState;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use wasmtime::*;
 use wasmtime_wasi::pipe::MemoryOutputPipe;
@@ -15,6 +15,8 @@ pub struct SandboxResult {
 pub struct SandboxConfig {
     pub memory_limit_bytes: usize,
     pub fuel_limit: u64,
+    pub output_buffer_bytes: usize,
+    pub entry_point: Option<String>,
 }
 
 struct MyState {
@@ -35,9 +37,9 @@ impl WasiView for MyState {
 }
 
 impl MyState {
-    fn new(mem_limit: usize) -> Self {
-        let stdout = MemoryOutputPipe::new(1024 * 1024);
-        let stderr = MemoryOutputPipe::new(1024 * 1024);
+    fn new(mem_limit: usize, buf_size: usize) -> Self {
+        let stdout = MemoryOutputPipe::new(buf_size);
+        let stderr = MemoryOutputPipe::new(buf_size);
         let wasi_ctx = WasiCtxBuilder::new()
             .stdout(stdout.clone())
             .stderr(stderr.clone())
@@ -86,7 +88,17 @@ impl SandboxManager {
         wasm_bytes: &[u8],
         config: &SandboxConfig,
     ) -> Result<SandboxResult> {
-        let mut store = Store::new(&self.engine, MyState::new(config.memory_limit_bytes));
+        if config.fuel_limit == 0 {
+            return Err(anyhow!("fuel_limit must be > 0"));
+        }
+        if config.memory_limit_bytes == 0 {
+            return Err(anyhow!("memory_limit_bytes must be > 0"));
+        }
+
+        let mut store = Store::new(
+            &self.engine,
+            MyState::new(config.memory_limit_bytes, config.output_buffer_bytes),
+        );
         store.set_fuel(config.fuel_limit)?;
         store.limiter(|s| &mut s.resource_limiter);
 
@@ -96,7 +108,9 @@ impl SandboxManager {
         wasmtime_wasi::add_to_linker_sync(&mut linker)?;
 
         let instance = linker.instantiate_async(&mut store, &component).await?;
-        let run_func = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
+        // entry_point defaults to "_start" (WASI convention)
+        let entry = config.entry_point.as_deref().unwrap_or("_start");
+        let run_func = instance.get_typed_func::<(), ()>(&mut store, entry)?;
 
         let exit_code = run_func
             .call_async(&mut store, ())

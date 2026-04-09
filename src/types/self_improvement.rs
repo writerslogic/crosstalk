@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SessionEvaluation {
     pub session_id: String,
-    pub metrics: HashMap<String, f64>,
+    pub metrics: BTreeMap<String, f64>,
     pub timestamp: u64,
 }
 

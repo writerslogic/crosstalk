@@ -49,6 +49,9 @@ pub struct App {
     pub mode: AppMode,
     /// Row offset for events log scroll
     pub scroll_offset: usize,
+    pub ghost_scroll: usize,
+    pub artifact_scroll: usize,
+    pub entropy_scroll: usize,
     /// Set to true to signal the render loop to exit
     pub shutdown: bool,
     /// Text being typed in the inject dialog
@@ -82,6 +85,9 @@ impl App {
             recent_events: VecDeque::new(),
             mode: AppMode::Streaming,
             scroll_offset: 0,
+            ghost_scroll: 0,
+            artifact_scroll: 0,
+            entropy_scroll: 0,
             shutdown: false,
             inject_buffer: String::new(),
             showing_inject: false,
@@ -94,7 +100,21 @@ impl App {
         }
     }
 
-    pub fn push_token(&mut self, token: &str) {
+    pub fn push_token(&mut self, agent_id: &str, token: &str) {
+        if !self.agent_list.contains(&agent_id.to_string()) {
+            self.agent_list.push(agent_id.to_string());
+        }
+        if !self.streaming_buffer.is_empty() && !self.streaming_buffer.ends_with(' ') && !token.starts_with(' ') && !token.starts_with('\n') {
+            // Potential word break across tokens
+        }
+        
+        let prefix = if self.streaming_buffer.is_empty() || self.streaming_buffer.ends_with('\n') {
+            format!("[{agent_id}] ")
+        } else {
+            String::new()
+        };
+
+        self.streaming_buffer.push_str(&prefix);
         self.streaming_buffer.push_str(token);
         const BUF_CAP: usize = 50 * 1024;
         if self.streaming_buffer.len() > BUF_CAP {
@@ -202,23 +222,49 @@ impl App {
         }
     }
 
-    pub fn scroll_up(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+        pub fn scroll_up(&mut self) {
+        match self.focused_pane {
+            FocusedPane::GhostStream => self.ghost_scroll = self.ghost_scroll.saturating_sub(1),
+            FocusedPane::Artifacts => self.artifact_scroll = self.artifact_scroll.saturating_sub(1),
+            FocusedPane::EntropyMap => self.entropy_scroll = self.entropy_scroll.saturating_sub(1),
+            FocusedPane::Events => self.scroll_offset = self.scroll_offset.saturating_sub(1),
+        }
     }
 
     pub fn scroll_down(&mut self) {
-        let max = self.recent_events.len().saturating_sub(1);
-        if self.scroll_offset < max {
-            self.scroll_offset += 1;
+        match self.focused_pane {
+            FocusedPane::GhostStream => self.ghost_scroll += 1, // Paragraph handles wrapping, exact limit hard to pre-calc
+            FocusedPane::Artifacts => {
+                let max = self.artifacts.len().saturating_sub(1);
+                if self.artifact_scroll < max { self.artifact_scroll += 1; }
+            }
+            FocusedPane::EntropyMap => {
+                let max = self.entropy_scores.len().saturating_sub(1);
+                if self.entropy_scroll < max { self.entropy_scroll += 1; }
+            }
+            FocusedPane::Events => {
+                let max = self.recent_events.len().saturating_sub(1);
+                if self.scroll_offset < max { self.scroll_offset += 1; }
+            }
         }
     }
 
     pub fn scroll_top(&mut self) {
-        self.scroll_offset = 0;
+        match self.focused_pane {
+            FocusedPane::GhostStream => self.ghost_scroll = 0,
+            FocusedPane::Artifacts => self.artifact_scroll = 0,
+            FocusedPane::EntropyMap => self.entropy_scroll = 0,
+            FocusedPane::Events => self.scroll_offset = 0,
+        }
     }
 
     pub fn scroll_bottom(&mut self) {
-        self.scroll_offset = self.recent_events.len().saturating_sub(1);
+        match self.focused_pane {
+            FocusedPane::GhostStream => self.ghost_scroll = 1000, // Reasonable heuristic for "end" of streaming text
+            FocusedPane::Artifacts => self.artifact_scroll = self.artifacts.len().saturating_sub(1),
+            FocusedPane::EntropyMap => self.entropy_scroll = self.entropy_scores.len().saturating_sub(1),
+            FocusedPane::Events => self.scroll_offset = self.recent_events.len().saturating_sub(1),
+        }
     }
 
     pub fn cycle_focus(&mut self) {

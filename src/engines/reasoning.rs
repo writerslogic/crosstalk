@@ -23,8 +23,12 @@ pub struct ReasoningEngine;
 
 impl ReasoningEngine {
     #[must_use]
-    pub fn select_structure(_task: TaskCategory, _agent_id: &str) -> TurnStructure {
-        TurnStructure::FreeForm
+    pub fn select_structure(task: TaskCategory, _agent_id: &str) -> TurnStructure {
+        match task {
+            TaskCategory::Research => TurnStructure::Symbolic,
+            TaskCategory::CodeGeneration => TurnStructure::CodeFirst,
+            _ => TurnStructure::StepByStep,
+        }
     }
 
     /// Single-pass, $O(N)$, zero-regex state machine.
@@ -61,9 +65,9 @@ impl ReasoningEngine {
             // Handle Logic Signals (Zero-allocation prefix matching)
             if trimmed.is_empty() { continue; }
 
-            if trimmed.eq_ignore_ascii_case("decision:") || trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]") {
+            if trimmed.eq_ignore_ascii_case("decision:") || trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]") || trimmed.starts_with("⊢") || trimmed.starts_with("Δα:") {
                 decisions.push(trimmed.to_string());
-            } else if trimmed.eq_ignore_ascii_case("problem:") || trimmed.eq_ignore_ascii_case("err:") {
+            } else if trimmed.eq_ignore_ascii_case("problem:") || trimmed.eq_ignore_ascii_case("err:") || trimmed.starts_with("⊥") {
                 problems.push(trimmed.to_string());
             } else if trimmed.ends_with('?') {
                 questions.push(trimmed.to_string());

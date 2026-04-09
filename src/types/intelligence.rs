@@ -1,7 +1,7 @@
 use crate::types::conversation::TaskCategory;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct RunningAverage {
@@ -30,7 +30,7 @@ impl RunningAverage {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ModelProfile {
     pub model_id: String,
-    pub task_scores: HashMap<TaskCategory, RunningAverage>,
+    pub task_scores: BTreeMap<TaskCategory, RunningAverage>,
     pub total_turns: u32,
     pub last_updated: u64,
     #[serde(default)]
@@ -40,7 +40,7 @@ pub struct ModelProfile {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AgentProfile {
     pub model_id: String,
-    pub capabilities: HashMap<TaskCategory, f64>,
+    pub capabilities: BTreeMap<TaskCategory, f64>,
     pub total_turns: u32,
     pub compilation_success_rate: f64,
 }
@@ -56,7 +56,7 @@ pub struct PromptTemplate {
 }
 
 impl PromptTemplate {
-    pub fn render(&self, vars: &HashMap<String, String>) -> Result<String> {
+    pub fn render(&self, vars: &BTreeMap<String, String>) -> Result<String> {
         let mut out = self.template_text.clone();
         for var in &self.variables {
             let placeholder = format!("{{{{{}}}}}", var);

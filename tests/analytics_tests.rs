@@ -3,9 +3,9 @@ use crosstalk::engines::analytics::{
     StrategyRecommender,
 };
 use crosstalk::engines::collective_intelligence::{
-    DynamicTeamComposer, EnsembleEngine, MetaStrategyOptimizer, PeerReview,
+    DynamicTeamComposer, EnsembleEngine, MetaStrategy, MetaStrategyOptimizer, PeerReview,
 };
-use crosstalk::engines::release::{ConvergenceReport, CpopVerifier, ReleaseManager, StabilityAuditResult};
+use crosstalk::engines::release::{ConvergenceReport, CpopVerifier, ReleaseManager};
 use crosstalk::ui::visualization::{
     ForceDirectedGraph, HeatmapGenerator, LatentMapper, Node, ReplayEngine, SvgExporter,
     TimelineManager,
@@ -13,7 +13,7 @@ use crosstalk::ui::visualization::{
 use crosstalk::types::analytics::QualityTrend;
 use crosstalk::types::conversation::{ConversationState, Turn, TurnOutcome};
 use crosstalk::types::intelligence::AgentProfile;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 fn make_state(session_id: &str, turns: u32, prob: f64) -> ConversationState {
     let mut s = ConversationState::new(session_id);
@@ -131,7 +131,7 @@ fn failure_taxonomy_categorizes_five_types() {
 fn analytics_report_to_json_is_parseable() {
     let sigma = make_state("json-test", 5, 0.7);
     let report = AnalyticsEngine::generate_report(&sigma);
-    let json = report.to_json();
+    let json = report.to_json().expect("to_json must succeed");
     let parsed: serde_json::Value = serde_json::from_str(&json)
         .expect("to_json must produce parseable JSON");
     assert_eq!(parsed["session_id"], "json-test");
@@ -363,13 +363,13 @@ fn ensemble_merges_to_highest_quality() {
 
 #[test]
 fn dynamic_team_composer_assigns_roles() {
-    let mut profiles = HashMap::new();
+    let mut profiles = BTreeMap::new();
     for id in ["alpha", "beta", "gamma"] {
         profiles.insert(
             id.to_string(),
             AgentProfile {
                 model_id: id.to_string(),
-                capabilities: HashMap::new(),
+                capabilities: BTreeMap::new(),
                 total_turns: 5,
                 compilation_success_rate: 0.8,
             },
@@ -382,16 +382,16 @@ fn dynamic_team_composer_assigns_roles() {
 #[test]
 fn meta_strategy_optimizer_best_after_three_trials() {
     let mut opt = MetaStrategyOptimizer::new();
-    for _ in 0..3 { opt.record("adversarial", 0.9); }
-    for _ in 0..3 { opt.record("collaborative", 0.6); }
-    assert_eq!(opt.best_strategy(), Some("adversarial"));
+    for _ in 0..3 { opt.record(MetaStrategy::DebateAndCritique, 0.9); }
+    for _ in 0..3 { opt.record(MetaStrategy::EnsembleVoting, 0.6); }
+    assert_eq!(opt.best_strategy(), Some(MetaStrategy::DebateAndCritique));
 }
 
 #[test]
 fn meta_strategy_optimizer_no_best_before_three_trials() {
     let mut opt = MetaStrategyOptimizer::new();
-    opt.record("adversarial", 0.9);
-    opt.record("adversarial", 0.9);
+    opt.record(MetaStrategy::DebateAndCritique, 0.9);
+    opt.record(MetaStrategy::DebateAndCritique, 0.9);
     assert!(opt.best_strategy().is_none(), "needs 3+ trials to commit");
 }
 

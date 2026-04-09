@@ -11,6 +11,66 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
+/// Manages per-tool timeouts, consecutive-failure counting, and automatic
+/// disabling after `max_failures` consecutive timeouts.
+#[derive(Debug)]
+pub struct TimeoutManager {
+    per_tool_secs: HashMap<String, u64>,
+    failure_counts: HashMap<String, u32>,
+    disabled: Vec<String>,
+    default_secs: u64,
+    max_failures: u32,
+}
+
+impl TimeoutManager {
+    pub fn new(default_secs: u64, max_failures: u32) -> Self {
+        Self {
+            per_tool_secs: HashMap::new(),
+            failure_counts: HashMap::new(),
+            disabled: vec![],
+            default_secs,
+            max_failures,
+        }
+    }
+
+    pub fn set_timeout(&mut self, tool: &str, secs: u64) {
+        self.per_tool_secs.insert(tool.to_string(), secs);
+    }
+
+    pub fn duration_for(&self, tool: &str) -> Duration {
+        Duration::from_secs(
+            self.per_tool_secs
+                .get(tool)
+                .copied()
+                .unwrap_or(self.default_secs),
+        )
+    }
+
+    pub fn is_disabled(&self, tool: &str) -> bool {
+        self.disabled.contains(&tool.to_string())
+    }
+
+    /// Record a successful call — reset the failure counter.
+    pub fn record_success(&mut self, tool: &str) {
+        self.failure_counts.remove(tool);
+    }
+
+    /// Record a timeout.  Returns `true` if the tool is now disabled.
+    pub fn record_timeout(&mut self, tool: &str) -> bool {
+        let count = self.failure_counts.entry(tool.to_string()).or_insert(0);
+        *count += 1;
+        if *count >= self.max_failures && !self.disabled.contains(&tool.to_string()) {
+            self.disabled.push(tool.to_string());
+            return true;
+        }
+        false
+    }
+
+    pub fn failure_count(&self, tool: &str) -> u32 {
+        self.failure_counts.get(tool).copied().unwrap_or(0)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpTool {
     pub name: String,
@@ -265,13 +325,10 @@ static CRITICAL_TOOLS: &[(&str, Option<&str>)] = &[
 pub struct McpGateway {
     pub tools: HashMap<String, McpTool>,
     pub permissions: PermissionManager,
-    pub tool_timeouts: HashMap<String, u32>,
-    pub disabled_tools: Vec<String>,
+    pub timeout_manager: TimeoutManager,
     pub resources: Vec<McpResource>,
     pub prompt_templates: Vec<serde_json::Value>,
-    /// Controls critical-tool confirmation behaviour.
-    /// None = prompt via stdin (production), Some(true) = auto-approve, Some(false) = auto-deny.
-    pub confirmation_override: Option<bool>,
+    confirmation_override: Option<bool>,
 }
 
 impl McpGateway {
@@ -279,12 +336,15 @@ impl McpGateway {
         Self {
             tools: HashMap::new(),
             permissions: PermissionManager::new(),
-            tool_timeouts: HashMap::new(),
-            disabled_tools: vec![],
+            timeout_manager: TimeoutManager::new(60, 3),
             resources: vec![],
             prompt_templates: vec![],
             confirmation_override: None,
         }
+    }
+
+    pub fn set_confirmation_override(&mut self, v: Option<bool>) {
+        self.confirmation_override = v;
     }
 
     pub fn register_tool(&mut self, tool: McpTool) {
@@ -377,7 +437,7 @@ impl McpGateway {
         let tools: Vec<&McpTool> = self
             .tools
             .values()
-            .filter(|t| !self.disabled_tools.contains(&t.name))
+            .filter(|t| !self.timeout_manager.is_disabled(&t.name))
             .filter(|t| {
                 self.permissions
                     .check(agent_id, &t.name, &serde_json::json!({}))
@@ -434,11 +494,8 @@ impl McpGateway {
         name: &str,
         args: serde_json::Value,
     ) -> Result<ToolResult> {
-        if self.disabled_tools.contains(&name.to_string()) {
-            return Err(anyhow!(
-                "Tool {} is disabled due to repeated timeouts",
-                name
-            ));
+        if self.timeout_manager.is_disabled(name) {
+            return Err(anyhow!("Tool {} is disabled due to repeated timeouts", name));
         }
 
         if let Err(e) = self.permissions.check_with_reason(agent_id, name, &args) {
@@ -472,28 +529,51 @@ impl McpGateway {
             .collect();
 
         let bin = name.to_string();
-        let fut = async move { CliBridge::invoke(&bin, cli_args, None) };
+        let tool_timeout = self.timeout_manager.duration_for(name);
+        let fut = tokio::task::spawn_blocking(move || CliBridge::invoke(&bin, cli_args, None));
 
-        match timeout(Duration::from_secs(60), fut).await {
+        match timeout(tool_timeout, fut).await {
             Ok(res) => {
-                self.tool_timeouts.remove(name);
-                res
+                self.timeout_manager.record_success(name);
+                res?
             }
             Err(_) => {
-                let count = self.tool_timeouts.entry(name.to_string()).or_insert(0);
-                *count += 1;
-                if *count >= 3 {
-                    self.disabled_tools.push(name.to_string());
-                }
+                let now_disabled = self.timeout_manager.record_timeout(name);
+                let count = self.timeout_manager.failure_count(name);
                 Ok(ToolResult {
                     tool_name: name.to_string(),
                     success: false,
                     output: String::new(),
-                    error: Some(format!("Timeout after 60s (Occurrence {})", count)),
-                    elapsed_ms: 60000,
+                    error: Some(format!(
+                        "Timeout after {}s (occurrence {}){}",
+                        tool_timeout.as_secs(),
+                        count,
+                        if now_disabled { " — tool disabled" } else { "" }
+                    )),
+                    elapsed_ms: tool_timeout.as_millis() as u64,
                 })
             }
         }
+    }
+
+    /// Route a JSON-RPC method call without requiring a full `JsonRpcRequest`
+    /// envelope.  Suitable for internal callers and testing.
+    pub async fn dispatch(
+        &mut self,
+        agent_id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.handle_request(
+            agent_id,
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::Value::Null,
+                method: method.to_string(),
+                params,
+            },
+        )
+        .await
     }
 }
 

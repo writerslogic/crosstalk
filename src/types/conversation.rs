@@ -2,30 +2,48 @@ use crate::types::artifact::{Artifact, ArtifactDiff};
 use crate::types::compute::BudgetLedger;
 use crate::types::planning::GoalTree;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+/// The observable result of a single model turn.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TurnOutcome {
+    /// The generated artifact compiled successfully.
     Compiled,
+    /// All tests passed after applying the turn's changes.
     TestsPassed,
+    /// The turn moved the session closer to the goal.
     AdvancedConvergence,
+    /// The turn was reverted; prior state restored.
     RolledBack,
+    /// The turn was rejected by the consensus engine.
     Rejected,
+    /// No meaningful progress was made.
     Stalled,
+    /// Outcome has not been evaluated yet.
     Unknown,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+/// The prompt layout strategy used when generating a turn.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TurnStructure {
+    /// Unconstrained free-form output.
     FreeForm,
+    /// Numbered step-by-step reasoning.
     StepByStep,
+    /// Explicit pros/cons enumeration.
     ProsCons,
+    /// State a hypothesis then validate it.
     HypothesisTest,
+    /// Lead with code, follow with explanation.
     CodeFirst,
+    /// Symbolic logic and mathematical notation.
+    Symbolic,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+/// High-level category used for routing, analytics, and prompt selection.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TaskCategory {
     CodeGeneration,
     Debugging,
@@ -35,6 +53,8 @@ pub enum TaskCategory {
     Testing,
 }
 
+/// A single model response within a session, including its diff, metadata, and
+/// cryptographic signature.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Turn {
     pub index: u32,
@@ -58,14 +78,15 @@ fn default_outcome() -> TurnOutcome {
     TurnOutcome::Unknown
 }
 
+/// Full mutable state of a running session, persisted to Sled on every checkpoint.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ConversationState {
     pub session_id: String,
     pub iteration_index: u32,
     pub turns: Vec<Turn>,
-    pub artifacts: HashMap<String, Artifact>,
+    pub artifacts: BTreeMap<String, Arc<Artifact>>,
     #[serde(default)]
-    pub agent_weights: HashMap<String, f64>,
+    pub agent_weights: BTreeMap<String, f64>,
     #[serde(default)]
     pub completion_probability: f64,
     #[serde(default)]
@@ -75,7 +96,7 @@ pub struct ConversationState {
     #[serde(default)]
     pub goal_tree: GoalTree,
     #[serde(default)]
-    pub node_consensus: HashMap<String, f64>,
+    pub node_consensus: BTreeMap<String, f64>,
 }
 
 impl ConversationState {
@@ -84,13 +105,13 @@ impl ConversationState {
             session_id: session_id.to_string(),
             iteration_index: 0,
             turns: vec![],
-            artifacts: HashMap::new(),
-            agent_weights: HashMap::new(),
+            artifacts: BTreeMap::new(),
+            agent_weights: BTreeMap::new(),
             completion_probability: 0.0,
             state_hash: [0u8; 32],
             budget: BudgetLedger::default(),
             goal_tree: GoalTree::default(),
-            node_consensus: HashMap::new(),
+            node_consensus: BTreeMap::new(),
         }
     }
 

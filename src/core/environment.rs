@@ -31,6 +31,11 @@ impl NixManager {
     }
 
     pub fn generate_flake(&self) -> Result<String> {
+        for dep in &self.deps {
+            if !dep.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+                return Err(anyhow!("invalid dependency name: {}", dep));
+            }
+        }
         let deps_str = self
             .deps
             .iter()

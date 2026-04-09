@@ -4,84 +4,70 @@ use petgraph::graph::DiGraph;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
-use std::collections::{HashMap, HashSet};
-use std::process::Stdio;
-use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tree_sitter::Parser;
+use std::sync::Arc;
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+thread_local! {
+    static PARSER: RefCell<Parser> = RefCell::new({
+        let mut p = Parser::new();
+        p.set_language(&tree_sitter_rust::LANGUAGE.into()).ok();
+        p
+    });
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ArtifactMetrics {
-    pub line_count: u32,
     pub cyclomatic_complexity: u32,
+    pub coupling_factor: u32,
     pub comment_density: f64,
-    pub coupling: u32,
+    pub line_count: u32,
+    pub health_score: f64,
 }
 
 pub struct QualityEngine;
 
 impl QualityEngine {
-    pub fn analyze_artifact(
-        artifact: &Artifact,
-        other_artifact_names: &[String],
-    ) -> ArtifactMetrics {
-        let lines: Vec<&str> = artifact.content.lines().collect();
-        let line_count = lines.len() as u32;
+    #[must_use]
+    pub fn analyze_artifact(artifact: &Artifact, workspace_modules: &[String]) -> ArtifactMetrics {
+        let total_lines = artifact.content.lines().count() as u32;
+        let comment_lines = artifact
+            .content
+            .lines()
+            .filter(|l| l.trim().starts_with("//") || l.trim().starts_with("/*"))
+            .count() as u32;
 
-        // O(N) optimized comment counting
-        let comment_lines = lines
-            .iter()
-            .filter(|l| {
-                let trimmed = l.trim_start();
-                trimmed.starts_with("//") || trimmed.starts_with("/*")
-            })
-            .count();
-            
-        let comment_density = if line_count > 0 {
-            comment_lines as f64 / line_count as f64
+        let (complexity, coupling) = Self::compute_ast_metrics(&artifact.content, workspace_modules);
+
+        let comment_density = if total_lines > 0 {
+            f64::from(comment_lines) / f64::from(total_lines)
         } else {
             0.0
         };
 
-        // Combine Complexity and Coupling into a single, highly-optimized AST pass
-        let (complexity, coupling) = if artifact.language.eq_ignore_ascii_case("rust") || artifact.language.eq_ignore_ascii_case("rs") {
-            Self::analyze_rust_ast(&artifact.content, other_artifact_names)
-        } else {
-            (1, 0)
-        };
+        let health_score = 1.0
+            - (f64::from(complexity) / 100.0)
+            - (f64::from(coupling) / 20.0)
+            + comment_density;
 
         ArtifactMetrics {
-            line_count,
             cyclomatic_complexity: complexity,
+            coupling_factor: coupling,
             comment_density,
-            coupling,
+            line_count: total_lines,
+            health_score: health_score.clamp(0.0, 1.0),
         }
     }
 
-    /// SINGLE-PASS AST TRAVERSAL
-    /// Extracts both Cyclomatic Complexity and Dependency Coupling simultaneously.
-    /// Completely immune to string-matching false positives (e.g., comments/strings).
-    fn analyze_rust_ast(content: &str, known_modules: &[String]) -> (u32, u32) {
-        let mut parser = Parser::new();
-        if parser.set_language(&tree_sitter_rust::LANGUAGE.into()).is_err() {
-            return (1, 0);
-        }
-        
-        let tree = match parser.parse(content, None) {
-            Some(t) => t,
-            None => return (1, 0),
-        };
+    fn compute_ast_metrics(content: &str, module_lookup: &[String]) -> (u32, u32) {
+        let mut complexity = 1u32;
+        let mut dependencies = HashSet::new();
 
-        // Pre-compute lookup table for O(1) existence checks
-        let module_lookup: FxHashSet<&str> = known_modules
-            .iter()
-            .map(|name| name.trim_end_matches(".rs"))
-            .collect();
+        let tree = PARSER.with(|p| p.borrow_mut().parse(content, None));
+        let Some(t) = tree else { return (1, 0) };
 
-        let mut complexity = 1;
-        let mut dependencies = FxHashSet::default();
-        
-        let mut cursor = tree.walk();
+        let mut cursor = t.walk();
         let mut going_down = true;
 
         loop {
@@ -89,7 +75,6 @@ impl QualityEngine {
                 let node = cursor.node();
                 let kind = node.kind();
                 
-                // 1. Evaluate Complexity
                 if matches!(
                     kind,
                     "if_expression" | "for_expression" | "while_expression" | 
@@ -98,14 +83,13 @@ impl QualityEngine {
                     complexity += 1;
                 }
                 
-                // 2. Evaluate Coupling (Only inside actual `use` or `mod` declarations)
-                if kind == "use_declaration" || kind == "scoped_identifier" {
-                    // Extract the text of the node directly from the source bytes
-                    if let Ok(text) = std::str::from_utf8(&content.as_bytes()[node.byte_range()]) {
-                        for token in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
-                            if module_lookup.contains(token) {
-                                dependencies.insert(token);
-                            }
+                if (kind == "use_declaration" || kind == "scoped_identifier")
+                    && let Some(slice) = content.as_bytes().get(node.byte_range())
+                    && let Ok(text) = std::str::from_utf8(slice)
+                {
+                    for token in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                        if module_lookup.contains(&token.to_string()) {
+                            dependencies.insert(token);
                         }
                     }
                 }
@@ -126,42 +110,37 @@ impl QualityEngine {
         (complexity, dependencies.len() as u32)
     }
 
-    /// Asynchronous, timeout-protected, AND leak-proof compilation check.
-    pub async fn verify_compilation(workspace_dir: &str) -> Result<bool> {
-        let mut check_task = Command::new("cargo")
-            .current_dir(workspace_dir)
-            .arg("check")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true) // CRITICAL: Reaps the OS process if Tokio drops the future
-            .spawn()
-            .context("Failed to spawn cargo process")?;
+    pub async fn verify_compilation(workspace_dir: &str) -> Result<(bool, String)> {
+        let workspace = workspace_dir.to_string();
+        let out = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("cargo")
+                .current_dir(workspace)
+                .arg("check")
+                .output()
+        })
+        .await??;
 
-        let output = timeout(Duration::from_secs(60), check_task.wait())
-            .await
-            .context("Cargo check timed out")??;
-
-        Ok(output.success())
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        Ok((out.status.success(), stderr))
     }
 
-    /// Parallelized Graph Construction.
-    /// Operates in O(N * L) time but executes across all available CPU cores concurrently.
-    pub fn build_dependency_graph(artifacts: &FxHashMap<String, Artifact>) -> DiGraph<String, ()> {
+    pub fn build_dependency_graph(artifacts: &HashMap<String, Arc<Artifact>>) -> DiGraph<String, ()> {
         let mut graph = DiGraph::new();
         let mut node_indices = FxHashMap::default();
 
-        // Register nodes
         for name in artifacts.keys() {
             let stripped = name.trim_end_matches(".rs");
             node_indices.insert(stripped, graph.add_node(name.clone()));
         }
 
-        // Parallel map: Extract edges for all artifacts simultaneously
         let all_edges: Vec<(petgraph::graph::NodeIndex, petgraph::graph::NodeIndex)> = artifacts
             .par_iter()
             .flat_map(|(name, artifact)| {
                 let stripped_name = name.trim_end_matches(".rs");
-                let current_idx = *node_indices.get(stripped_name).unwrap();
+                let current_idx = match node_indices.get(stripped_name) {
+                    Some(&idx) => idx,
+                    None => return vec![],
+                };
                 let mut local_edges = vec![];
 
                 for line in artifact.content.lines() {
@@ -180,7 +159,6 @@ impl QualityEngine {
             })
             .collect();
 
-        // Sequential reduce: Insert edges into the graph
         for (source, target) in all_edges {
             graph.add_edge(source, target, ());
         }
@@ -188,11 +166,9 @@ impl QualityEngine {
         graph
     }
 
-    /// Rayon-Parallelized Duplication Detection.
-    /// Eliminates thread-blocking on massive artifact registries.
     pub fn detect_duplication(
         new_content: &str,
-        existing: &std::collections::HashMap<String, Artifact>,
+        existing: &BTreeMap<String, Arc<Artifact>>,
     ) -> Vec<String> {
         let new_lines: FxHashSet<&str> = new_content
             .lines()
@@ -206,7 +182,6 @@ impl QualityEngine {
 
         let new_lines_len = new_lines.len() as f64;
 
-        // Map-Reduce pattern using Rayon
         existing
             .par_iter()
             .filter_map(|(name, artifact)| {
@@ -280,7 +255,6 @@ pub enum TrendClassification {
 pub struct QualityTrendAnalyzer;
 
 impl QualityTrendAnalyzer {
-    /// Quality velocity = (last_score - first_score) / turns_elapsed.
     #[must_use]
     pub fn velocity(trend: &QualityTrend) -> Option<f64> {
         let h = &trend.history;
@@ -293,9 +267,6 @@ impl QualityTrendAnalyzer {
         Some((last.score - first.score) / turns)
     }
 
-    /// Improving: positive delta for 3+ consecutive pairs (from the tail).
-    /// Degrading: negative delta for 2+ consecutive pairs (from the tail).
-    /// Stable: otherwise.
     #[must_use]
     pub fn classify(trend: &QualityTrend) -> TrendClassification {
         let h = &trend.history;
@@ -330,14 +301,6 @@ pub struct CompileError {
 pub struct CompileErrorParser;
 
 impl CompileErrorParser {
-    /// Parse `cargo check` / `rustc` stderr into structured `CompileError` records.
-    ///
-    /// Recognises the standard rustc format:
-    /// ```text
-    /// error[E0308]: mismatched types
-    ///  --> src/main.rs:42:10
-    ///    = help: consider using ...
-    /// ```
     #[must_use]
     pub fn parse(output: &str) -> Vec<CompileError> {
         let mut errors: Vec<CompileError> = Vec::new();
@@ -441,12 +404,8 @@ pub struct IncoherenceReport {
 pub struct CoherenceChecker;
 
 impl CoherenceChecker {
-    /// Build a global symbol table, then flag:
-    /// - `mod name;` declarations where `name` matches no known artifact stem.
-    /// - `use path::{Sym}` where `Sym` is a PascalCase identifier absent from
-    ///   every artifact's top-level definitions.
     #[must_use]
-    pub fn verify(artifacts: &HashMap<String, Artifact>) -> Vec<IncoherenceReport> {
+    pub fn verify(artifacts: &HashMap<String, Arc<Artifact>>) -> Vec<IncoherenceReport> {
         let stems: HashSet<String> = artifacts
             .keys()
             .map(|k| k.trim_end_matches(".rs").to_string())
@@ -480,7 +439,6 @@ impl CoherenceChecker {
             for line in artifact.content.lines() {
                 let t = line.trim();
 
-                // mod name; with no body and no matching artifact
                 if !t.contains('{')
                     && let Some(mod_name) = t.strip_prefix("mod ").map(|r| r.trim_end_matches(';').trim())
                     && !stems.contains(mod_name)
@@ -492,7 +450,6 @@ impl CoherenceChecker {
                     });
                 }
 
-                // use path::{Sym, ...} — flag PascalCase symbols absent globally
                 if let Some(rest) = t.strip_prefix("use ").map(|r| r.trim_end_matches(';')) {
                     let last = rest.split("::").last().unwrap_or("");
                     let candidates: Vec<&str> = if last.starts_with('{') {
@@ -552,9 +509,6 @@ pub struct BlockerReport {
 pub struct CompletionScorer;
 
 impl CompletionScorer {
-    /// Composite score = 0.5 × requirements_met + 0.3 × tests_passing +
-    /// 0.2 × quality_floor.
-    /// Converged when score > 0.95 in this call (caller tracks consecutive turns).
     #[must_use]
     pub fn evaluate(
         requirements_met: f64,
@@ -572,8 +526,6 @@ impl CompletionScorer {
         }
     }
 
-    /// Given a rolling window of recent reports, diagnose what is blocking progress
-    /// (score delta < 0.01 for 3+ consecutive reports).
     #[must_use]
     pub fn diagnose_blocker(recent: &[CompletionReport]) -> Option<BlockerReport> {
         if recent.len() < 3 {
@@ -628,8 +580,6 @@ pub struct TournamentResult {
 pub struct TournamentRunner;
 
 impl TournamentRunner {
-    /// Rank proposals by composite score (compilation × 0.3 + tests × 0.4 +
-    /// quality × 0.3) and return the highest-ranked winner.
     #[must_use]
     pub fn run(proposals: &[TournamentProposal]) -> Option<TournamentResult> {
         if proposals.is_empty() {
@@ -685,8 +635,6 @@ impl DuplicationDetector {
         tokens.windows(n).map(|w| w.to_vec()).collect()
     }
 
-    /// Scan `new_content` against every `(name, content)` pair in `existing`.
-    /// Returns one report per artifact whose n-gram overlap exceeds 30 %.
     #[must_use]
     pub fn scan<'a>(
         new_content: &str,
@@ -720,7 +668,6 @@ impl DuplicationDetector {
 #[derive(Debug, Clone)]
 pub struct Section {
     pub name: String,
-    /// Regex pattern that must match somewhere in the content.
     pub pattern: String,
 }
 
@@ -754,11 +701,10 @@ impl StructureEnforcer {
                     pattern: r"#\[cfg\(test\)\]".to_string(),
                 },
             ],
-            forbidden_patterns: vec![r"(?m)^\s*panic!\s*\(.*todo".to_string()],
+            forbidden_patterns: vec![r"panic!\s*\(.*todo".to_string()],
         }
     }
 
-    /// Check `content` against `template`; return all violations found.
     #[must_use]
     pub fn check(content: &str, template: &StructureTemplate) -> Vec<StructureViolation> {
         let mut violations = Vec::new();
@@ -802,13 +748,6 @@ pub struct DocInconsistency {
 pub struct DocChecker;
 
 impl DocChecker {
-    /// Heuristic doc-code consistency check on Rust source.
-    ///
-    /// Detects two patterns:
-    /// 1. A doc comment mentioning a return type (`-> Foo`) that disagrees with
-    ///    the actual signature on the following `pub fn` line.
-    /// 2. A doc comment mentioning a parameter name (`param_name:`) that does not
-    ///    appear in the function signature.
     #[must_use]
     pub fn verify(content: &str) -> Vec<DocInconsistency> {
         let mut inconsistencies = Vec::new();
@@ -835,9 +774,8 @@ impl DocChecker {
 
                             let doc_text = doc_lines.join(" ");
 
-                            // Check: doc says `-> Option<T>` but sig says `-> Result<T>`
-                            let doc_returns_option = doc_text.contains("-> Option");
-                            let doc_returns_result = doc_text.contains("-> Result");
+                            let doc_returns_option = doc_text.contains("Option");
+                            let doc_returns_result = doc_text.contains("Result");
                             let sig_returns_option = fn_t.contains("-> Option");
                             let sig_returns_result = fn_t.contains("-> Result");
 
@@ -855,7 +793,6 @@ impl DocChecker {
                                 });
                             }
 
-                            // Check: doc mentions a param name not found in the signature
                             let sig_params = fn_t
                                 .split('(')
                                 .nth(1)
@@ -911,13 +848,6 @@ pub struct DeadCodeReport {
 pub struct DeadCodeDetector;
 
 impl DeadCodeDetector {
-    /// Scan a single artifact for likely dead code using heuristic analysis.
-    ///
-    /// Detects private (non-pub) functions that are defined but never called
-    /// within the same source, and `use` imports whose final identifier does not
-    /// appear elsewhere in the content.
-    ///
-    /// Excludes: `main`, functions annotated with `#[test]` or `#[allow(dead_code)]`.
     #[must_use]
     pub fn scan(artifact_name: &str, content: &str) -> DeadCodeReport {
         let lines: Vec<&str> = content.lines().collect();
@@ -925,8 +855,7 @@ impl DeadCodeDetector {
         let mut dead_items: Vec<DeadItem> = Vec::new();
         let mut dead_lines = 0usize;
 
-        // ── private function detection ─────────────────────────────────────
-        let mut defined_fns: Vec<(String, u32)> = Vec::new(); // (name, line_idx)
+        let mut defined_fns: Vec<(String, u32)> = Vec::new();
         let mut prev_attrs: Vec<&str> = Vec::new();
 
         for (i, &line) in lines.iter().enumerate() {
@@ -976,7 +905,6 @@ impl DeadCodeDetector {
             }
         }
 
-        // ── unused import detection ────────────────────────────────────────
         for (i, &line) in lines.iter().enumerate() {
             let t = line.trim();
             if let Some(rest) = t.strip_prefix("use ").map(|r| r.trim_end_matches(';')) {

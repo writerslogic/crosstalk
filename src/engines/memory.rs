@@ -1,5 +1,4 @@
 use crate::types::conversation::{ConversationState, Turn, TurnOutcome};
-use fastembed::TextEmbedding;
 use std::sync::OnceLock;
 use crate::types::memory::{
     DeletionLogEntry, MemoryRecord, MemoryStoreStats, SnapshotBundle, SnapshotMetadata,
@@ -20,6 +19,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::Arc;
+use fastembed::{TextEmbedding, InitOptions, ExecutionProviderDispatch};
+use ort::{CoreMLExecutionProvider, CPUExecutionProvider};
 
 const EMBEDDING_DIM: usize = 384;
 const DEFAULT_TABLE: &str = "memory";
@@ -37,7 +38,16 @@ static EMBEDDER: OnceLock<Option<TextEmbedding>> = OnceLock::new();
 
 fn get_embedder() -> Option<&'static TextEmbedding> {
     EMBEDDER
-        .get_or_init(|| TextEmbedding::try_new(Default::default()).ok())
+        .get_or_init(|| {
+            let options = InitOptions {
+                execution_providers: vec![
+                    ExecutionProviderDispatch::from(CoreMLExecutionProvider::default()),
+                    ExecutionProviderDispatch::from(CPUExecutionProvider::default()),
+                ],
+                ..Default::default()
+            };
+            TextEmbedding::try_new(options).ok()
+        })
         .as_ref()
 }
 
@@ -79,6 +89,13 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn dir_size(path: &str) -> u64 {
+    dir_size_depth(path, 0)
+}
+
+fn dir_size_depth(path: &str, depth: usize) -> u64 {
+    if depth > 20 {
+        return 0;
+    }
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
@@ -88,7 +105,7 @@ fn dir_size(path: &str) -> u64 {
                 } else if meta.is_dir()
                     && let Some(sub) = entry.path().to_str()
                 {
-                    total += dir_size(sub);
+                    total += dir_size_depth(sub, depth + 1);
                 }
             }
         }
@@ -265,6 +282,13 @@ impl MemoryStore {
 
         let texts_to_embed: Vec<String> = records.iter().map(|r| r.content_hash.clone()).collect();
         let batch_embeddings = embed_texts(texts_to_embed).await?;
+        if batch_embeddings.len() != records.len() {
+            return Err(anyhow!(
+                "embed_texts returned {} vectors for {} records",
+                batch_embeddings.len(),
+                records.len()
+            ));
+        }
 
         for (record, embedding) in records.iter_mut().zip(batch_embeddings) {
             record.embedding = embedding;
@@ -323,7 +347,7 @@ impl MemoryStore {
         top_k: usize,
     ) -> Result<Vec<(MemoryRecord, f64)>> {
         let mut embeddings = embed_texts(vec![query_text.to_string()]).await?;
-        let query_vector = embeddings.pop().unwrap_or_default();
+        let query_vector = embeddings.pop().ok_or_else(|| anyhow!("embed_texts returned no vectors"))?;
 
         let table = self.get_or_create_table(table_name).await?;
 
@@ -430,6 +454,7 @@ impl MemoryStore {
         let base = std::env::var("CROSSTALK_MEMORY_DIR").unwrap_or_else(|_| {
             let home = std::env::var("HOME")
                 .or_else(|_| std::env::var("USERPROFILE"))
+                // fallback: HOME/USERPROFILE unset; /tmp is insecure on shared systems
                 .unwrap_or_else(|_| "/tmp".to_string());
             format!("{home}/.crosstalk-memory")
         });
@@ -484,7 +509,7 @@ impl MemoryStore {
             .await
             .with_context(|| format!("Snapshot not found: {}", path.display()))?;
 
-        const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024; // 64 MB
+        const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
         let bundle_bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
             let decoder = GzDecoder::new(&bytes[..]);
             let mut decompressed = Vec::new();
@@ -607,7 +632,7 @@ impl MemoryStore {
                     }
                     (count, sessions.len())
                 }
-                Err(_) => (0, 0),
+                Err(e) => return Err(e),
             }
         } else {
             (0, 0)
@@ -673,6 +698,45 @@ impl ContextDistiller {
 
         distilled
     }
+
+    /// Distills context by clustering turns to ensure a representative sample of all discussion threads.
+    #[must_use]
+    pub fn distill_diverse(sigma: &ConversationState, max_chars: usize, k: usize) -> String {
+        if sigma.turns.is_empty() {
+            return format!("Session: {} (Empty Context)\n", sigma.session_id);
+        }
+
+        let k = k.clamp(1, sigma.turns.len());
+        let clusters = SemanticClusterer::cluster(&sigma.turns, k).unwrap_or_default();
+        
+        let mut picked_indices = HashSet::new();
+        for cluster in &clusters {
+            // Pick the latest turn from each cluster as the representative.
+            if let Some(&idx) = cluster.iter().max() {
+                picked_indices.insert(idx);
+            }
+        }
+
+        let mut distilled = format!("Session: {} (Diverse Distilled Context)\n", sigma.session_id);
+        let mut picked_turns: Vec<&Turn> = sigma.turns.iter()
+            .filter(|t| picked_indices.contains(&t.index))
+            .collect();
+        
+        // Sort by index to maintain temporal flow.
+        picked_turns.sort_by_key(|t| t.index);
+
+        for turn in picked_turns {
+            let entry = format!("i_{}: {}: {}\n", turn.index, turn.model_id, turn.content);
+            if distilled.len() + entry.len() > max_chars {
+                let remaining = max_chars.saturating_sub(distilled.len());
+                let safe_entry: String = entry.chars().take(remaining).collect();
+                distilled.push_str(&safe_entry);
+                break;
+            }
+            distilled.push_str(&entry);
+        }
+        distilled
+    }
 }
 
 pub struct FailurePredictor;
@@ -720,8 +784,6 @@ impl LessonExtractor {
 }
 
 struct BridgeSessionContext {
-    #[allow(dead_code)]
-    pub session_id: String,
     pub last_recall_turn: Option<u32>,
 }
 
@@ -740,8 +802,7 @@ impl MemoryBridge {
     }
 
     pub fn open_session(&mut self, session_id: String) {
-        self.sessions.entry(session_id.clone()).or_insert_with(|| BridgeSessionContext {
-            session_id,
+        self.sessions.entry(session_id).or_insert_with(|| BridgeSessionContext {
             last_recall_turn: None,
         });
     }

@@ -1,6 +1,7 @@
 use crosstalk::mcp::bridge::{CargoBridge, GitBridge};
 use crosstalk::mcp::gateway::{
     McpGateway, McpResource, McpTool, PermissionError, PermissionManager, PermissionTier,
+    TimeoutManager,
 };
 use crosstalk::mcp::transport::JsonRpcRequest;
 use std::collections::HashMap;
@@ -224,7 +225,7 @@ async fn test_critical_tool_denied_without_confirmation() {
         .permissions
         .tiers
         .insert("agent_full".to_string(), PermissionTier::Full);
-    gateway.confirmation_override = Some(false);
+    gateway.set_confirmation_override(Some(false));
 
     let req = make_req(
         "tools/call",
@@ -243,7 +244,7 @@ async fn test_critical_tool_confirmed_passes_gate() {
         .permissions
         .tiers
         .insert("agent_full".to_string(), PermissionTier::Full);
-    gateway.confirmation_override = Some(true);
+    gateway.set_confirmation_override(Some(true));
 
     let req = make_req(
         "tools/call",
@@ -264,7 +265,7 @@ async fn test_critical_confirmation_tier_requires_confirmation() {
         "agent_cc".to_string(),
         PermissionTier::CriticalConfirmation(vec!["deploy".to_string()]),
     );
-    gateway.confirmation_override = Some(false);
+    gateway.set_confirmation_override(Some(false));
 
     let req = make_req(
         "tools/call",
@@ -412,7 +413,9 @@ fn git_commit_with_message() {
 async fn disabled_tool_returns_error_immediately() {
     let mut gateway = McpGateway::new();
     gateway.register_tool(make_tool("slow_tool"));
-    gateway.disabled_tools.push("slow_tool".to_string());
+    gateway.timeout_manager.record_timeout("slow_tool");
+    gateway.timeout_manager.record_timeout("slow_tool");
+    gateway.timeout_manager.record_timeout("slow_tool");
     gateway
         .permissions
         .tiers
@@ -433,4 +436,105 @@ async fn handle_unknown_method_returns_error() {
     let res = gateway.handle_request("agent", req).await;
     assert!(res.is_err());
     assert!(res.unwrap_err().to_string().contains("Method not found"));
+}
+
+// ── TimeoutManager ─────────────────────────────────────────────────────────────
+
+#[test]
+fn timeout_manager_default_not_disabled() {
+    let tm = TimeoutManager::new(30, 3);
+    assert!(!tm.is_disabled("any_tool"));
+}
+
+#[test]
+fn timeout_manager_disabled_after_max_failures() {
+    let mut tm = TimeoutManager::new(30, 3);
+    assert!(!tm.record_timeout("t"));
+    assert!(!tm.record_timeout("t"));
+    let now_disabled = tm.record_timeout("t");
+    assert!(now_disabled);
+    assert!(tm.is_disabled("t"));
+}
+
+#[test]
+fn timeout_manager_success_resets_count() {
+    let mut tm = TimeoutManager::new(30, 3);
+    tm.record_timeout("t");
+    tm.record_timeout("t");
+    tm.record_success("t");
+    assert_eq!(tm.failure_count("t"), 0);
+    assert!(!tm.is_disabled("t"));
+}
+
+#[test]
+fn timeout_manager_per_tool_override() {
+    let mut tm = TimeoutManager::new(60, 3);
+    tm.set_timeout("fast_tool", 5);
+    assert_eq!(tm.duration_for("fast_tool").as_secs(), 5);
+    assert_eq!(tm.duration_for("other_tool").as_secs(), 60);
+}
+
+#[test]
+fn timeout_manager_independent_per_tool_counts() {
+    let mut tm = TimeoutManager::new(30, 2);
+    tm.record_timeout("a");
+    tm.record_timeout("b");
+    assert!(!tm.is_disabled("a"));
+    assert!(!tm.is_disabled("b"));
+    tm.record_timeout("a");
+    assert!(tm.is_disabled("a"));
+    assert!(!tm.is_disabled("b"));
+}
+
+// ── dispatch ──────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn dispatch_initialize_returns_protocol_version() {
+    let mut gateway = McpGateway::new();
+    let res = gateway
+        .dispatch("agent", "initialize", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(res["protocolVersion"], "1.0");
+}
+
+#[tokio::test]
+async fn dispatch_tools_list_returns_array() {
+    let mut gateway = McpGateway::new();
+    gateway.register_tool(make_tool("hammer"));
+    gateway
+        .permissions
+        .tiers
+        .insert("a".to_string(), PermissionTier::Full);
+    let res = gateway
+        .dispatch("a", "tools/list", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(res["tools"].is_array());
+}
+
+#[tokio::test]
+async fn dispatch_unknown_method_errors() {
+    let mut gateway = McpGateway::new();
+    let res = gateway
+        .dispatch("a", "no/such/method", serde_json::json!({}))
+        .await;
+    assert!(res.is_err());
+}
+
+#[tokio::test]
+async fn dispatch_tools_call_missing_tool_errors() {
+    let mut gateway = McpGateway::new();
+    gateway
+        .permissions
+        .tiers
+        .insert("a".to_string(), PermissionTier::Full);
+    let res = gateway
+        .dispatch(
+            "a",
+            "tools/call",
+            serde_json::json!({ "name": "nonexistent", "arguments": {} }),
+        )
+        .await;
+    assert!(res.is_err());
 }

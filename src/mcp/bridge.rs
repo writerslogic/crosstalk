@@ -13,6 +13,7 @@ impl ToolDiscovery {
     pub fn scan() -> Vec<McpTool> {
         let mut tools = vec![];
         let known_binaries = [
+            "uv",
             "cargo",
             "git",
             "rustfmt",
@@ -67,6 +68,7 @@ impl ToolDiscovery {
     pub fn scan_with_versions() -> Vec<McpTool> {
         let mut tools = vec![];
         let known_binaries = [
+            "uv",
             "cargo",
             "git",
             "rustfmt",
@@ -328,7 +330,13 @@ impl CliBridge {
 
         let resolved = Self::resolve_binary(binary_path, env_override)?;
 
-        let mut cmd = Command::new(&resolved);
+        let mut cmd = if binary_path.ends_with(".py") {
+            let mut c = Command::new("uv");
+            c.arg("run").arg(&resolved);
+            c
+        } else {
+            Command::new(&resolved)
+        };
         cmd.args(&args);
 
         if let Some(env) = env_override {

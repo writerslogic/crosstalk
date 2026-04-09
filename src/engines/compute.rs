@@ -130,6 +130,8 @@ impl Default for ComputeManager {
 pub struct ParallelInference;
 
 impl ParallelInference {
+    /// Runs inference across multiple models in parallel.
+    /// Fails if any model fails.
     pub async fn run<F, Fut>(
         prompt: String,
         models: Vec<String>,
@@ -155,6 +157,49 @@ impl ParallelInference {
             }
         }
         Ok(results)
+    }
+
+    /// Runs inference across multiple models in parallel with a timeout.
+    /// Returns only the successes within the timeout.
+    pub async fn run_robust<F, Fut>(
+        prompt: String,
+        models: Vec<String>,
+        timeout: Duration,
+        mut f: F,
+    ) -> Vec<(String, String)>
+    where
+        F: FnMut(String, String) -> Fut,
+        Fut: std::future::Future<Output = Result<String>> + Send + 'static,
+    {
+        let mut set: tokio::task::JoinSet<(String, Result<String>)> =
+            tokio::task::JoinSet::new();
+
+        for model in models {
+            let fut = f(prompt.clone(), model.clone());
+            set.spawn(async move { (model, fut.await) });
+        }
+
+        let mut results = Vec::new();
+        let timeout_fut = tokio::time::sleep(timeout);
+        tokio::pin!(timeout_fut);
+
+        loop {
+            tokio::select! {
+                res = set.join_next() => {
+                    if let Some(join_res) = res {
+                        if let Ok((model, Ok(output))) = join_res {
+                            results.push((model, output));
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                _ = &mut timeout_fut => {
+                    break;
+                }
+            }
+        }
+        results
     }
 }
 

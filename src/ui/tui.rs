@@ -70,7 +70,7 @@ impl CrosstalkUI {
             if self.mode == UIMode::Normal || self.mode == UIMode::Insert {
                 while let Ok(event) = self.event_rx.try_recv() {
                     match event {
-                        StreamEvent::TokenReceived(token) => {
+                        StreamEvent::TokenReceived { agent_id: _, token } => {
                             self.ghost_stream_buffer.push_str(&token);
                         }
                         StreamEvent::TurnComplete(turn) => {
@@ -319,11 +319,18 @@ impl CrosstalkUI {
     }
 
     pub fn capture_to_svg(&self, sigma: &ConversationState) -> io::Result<()> {
+        use std::fs;
         use std::fs::File;
         use std::io::Write;
 
-        let filename = format!("capture_{}_{}.svg", sigma.session_id, sigma.iteration_index);
-        let mut file = File::create(filename)?;
+        let safe_id: String = sigma.session_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        let capture_dir = std::env::temp_dir().join("crosstalk-captures");
+        fs::create_dir_all(&capture_dir)?;
+        let filename = format!("capture_{}_{}.svg", safe_id, sigma.iteration_index);
+        let mut file = File::create(capture_dir.join(filename))?;
 
         writeln!(
             file,

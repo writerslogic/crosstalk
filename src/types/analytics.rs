@@ -27,9 +27,8 @@ pub struct AnalyticsReport {
 }
 
 impl AnalyticsReport {
-    #[must_use]
-    pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
+    pub fn to_json(&self) -> anyhow::Result<String> {
+        serde_json::to_string_pretty(self).map_err(|e| anyhow::anyhow!(e))
     }
 }
 

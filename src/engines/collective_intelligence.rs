@@ -1,18 +1,33 @@
-use crate::types::conversation::{Turn, TurnOutcome};
+use crate::types::conversation::{Turn, TurnOutcome, TaskCategory};
 use crate::types::intelligence::AgentProfile;
 use crate::types::memory::TransferableLesson;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
-#[derive(Default)]
+#[derive(Debug, Clone)]
+pub struct RefinementRound {
+    pub round_index: u32,
+    pub agent_contributions: Vec<(String, String)>,
+}
+
 pub struct CollectiveIntelligenceEngine {
-    pub profiles: HashMap<String, AgentProfile>,
+    pub profiles: BTreeMap<String, AgentProfile>,
+    pub meta_optimizer: MetaStrategyOptimizer,
+}
+
+impl Default for CollectiveIntelligenceEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CollectiveIntelligenceEngine {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            profiles: BTreeMap::new(),
+            meta_optimizer: MetaStrategyOptimizer::new(),
+        }
     }
 
     pub fn update_specialization(&mut self, turn: &Turn) {
@@ -21,7 +36,7 @@ impl CollectiveIntelligenceEngine {
             .entry(turn.model_id.clone())
             .or_insert(AgentProfile {
                 model_id: turn.model_id.clone(),
-                capabilities: HashMap::new(),
+                capabilities: BTreeMap::new(),
                 total_turns: 0,
                 compilation_success_rate: 0.0,
             });
@@ -41,6 +56,10 @@ impl CollectiveIntelligenceEngine {
         }
         profile.total_turns += 1;
     }
+
+    pub fn select_strategy(&self, task_category: TaskCategory) -> MetaStrategy {
+        self.meta_optimizer.select_best(task_category)
+    }
 }
 
 pub struct KnowledgeTransfer;
@@ -57,6 +76,38 @@ impl KnowledgeTransfer {
             });
         }
         None
+    }
+
+    /// Prepend relevant lessons to `agent_context`, returning the enriched prompt.
+    ///
+    /// A lesson is injected when it shares at least one applicability tag with
+    /// `task_tags`, or when its category matches `task_category`.
+    #[must_use]
+    pub fn inject(
+        agent_context: &str,
+        lessons: &[TransferableLesson],
+        task_category: &str,
+        task_tags: &[&str],
+    ) -> String {
+        let relevant: Vec<&TransferableLesson> = lessons
+            .iter()
+            .filter(|l| {
+                l.category == task_category
+                    || l.applicability_tags.iter().any(|t| task_tags.contains(&t.as_str()))
+            })
+            .collect();
+
+        if relevant.is_empty() {
+            return agent_context.to_string();
+        }
+
+        let prefix: String = relevant
+            .iter()
+            .map(|l| format!("[lesson] {}", l.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!("{prefix}\n\n{agent_context}")
     }
 }
 
@@ -75,18 +126,36 @@ impl PeerReview {
     #[must_use]
     pub fn review(reviewer_id: &str, proposal: &str) -> PeerReviewReport {
         let mut comments = vec![];
-        let mut correctness = 0.7;
+        let mut correctness: f64 = 0.7;
+        let mut maintainability: f64 = 0.8;
+        let mut efficiency: f64 = 0.8;
 
         if proposal.contains("TODO") || proposal.contains("FIXME") {
             correctness -= 0.2;
-            comments.push("Incomplete implementation detected (TODO found)".to_string());
+            comments.push("Incomplete implementation detected (TODO/FIXME found)".to_string());
+        }
+        if proposal.contains("unwrap()") || proposal.contains("expect(") {
+            correctness -= 0.1;
+            comments.push("Potential panic: unwrap/expect usage detected.".to_string());
+        }
+        if proposal.contains("clone()") {
+            efficiency -= 0.05;
+            comments.push("Unnecessary clone may indicate borrow issue.".to_string());
+        }
+        if proposal.contains("unsafe") {
+            correctness -= 0.15;
+            comments.push("Unsafe block present: requires manual safety justification.".to_string());
+        }
+        if !proposal.contains("///") && proposal.contains("pub fn") {
+            maintainability -= 0.1;
+            comments.push("Public function missing doc comment.".to_string());
         }
 
         PeerReviewReport {
             reviewer_id: reviewer_id.to_string(),
-            correctness,
-            efficiency: 0.8,
-            maintainability: 0.8,
+            correctness: correctness.clamp(0.0, 1.0),
+            efficiency: efficiency.clamp(0.0, 1.0),
+            maintainability: maintainability.clamp(0.0, 1.0),
             comments,
         }
     }
@@ -149,7 +218,7 @@ pub struct DynamicTeamComposer;
 impl DynamicTeamComposer {
     #[must_use]
     pub fn compose(
-        profiles: &HashMap<String, AgentProfile>,
+        profiles: &BTreeMap<String, AgentProfile>,
         task_category: &str,
     ) -> TeamComposition {
         let mut ranked: Vec<(&String, f64)> = profiles
@@ -175,9 +244,18 @@ impl DynamicTeamComposer {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub enum MetaStrategy {
+    #[default]
+    DirectImplementation,
+    DebateAndCritique,
+    StepByStepReasoning,
+    EnsembleVoting,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StrategyOutcome {
-    pub strategy_name: String,
+    pub strategy: MetaStrategy,
     pub quality_sum: f64,
     pub trial_count: u32,
 }
@@ -194,34 +272,110 @@ impl StrategyOutcome {
 }
 
 pub struct MetaStrategyOptimizer {
-    pub outcomes: HashMap<String, StrategyOutcome>,
+    pub outcomes: BTreeMap<MetaStrategy, StrategyOutcome>,
 }
 
 impl MetaStrategyOptimizer {
     pub fn new() -> Self {
-        Self { outcomes: HashMap::new() }
+        let mut outcomes = BTreeMap::new();
+        for strategy in [
+            MetaStrategy::DirectImplementation,
+            MetaStrategy::DebateAndCritique,
+            MetaStrategy::StepByStepReasoning,
+            MetaStrategy::EnsembleVoting,
+        ] {
+            outcomes.insert(strategy, StrategyOutcome { strategy, quality_sum: 0.0, trial_count: 0 });
+        }
+        Self { outcomes }
     }
 
-    pub fn record(&mut self, strategy: &str, quality: f64) {
-        let e = self.outcomes.entry(strategy.to_string()).or_default();
-        e.strategy_name = strategy.to_string();
+    pub fn record(&mut self, strategy: MetaStrategy, quality: f64) {
+        let e = self.outcomes.entry(strategy).or_insert(StrategyOutcome {
+            strategy,
+            quality_sum: 0.0,
+            trial_count: 0,
+        });
         e.quality_sum += quality;
         e.trial_count += 1;
     }
 
     #[must_use]
-    pub fn best_strategy(&self) -> Option<&str> {
+    pub fn best_strategy(&self) -> Option<MetaStrategy> {
         self.outcomes
             .values()
             .filter(|o| o.trial_count >= 3)
             .max_by(|a, b| a.avg_quality().total_cmp(&b.avg_quality()))
-            .map(|o| o.strategy_name.as_str())
+            .map(|o| o.strategy)
+    }
+
+    #[must_use]
+    pub fn select_best(&self, _task_category: TaskCategory) -> MetaStrategy {
+        let total_trials: u32 = self.outcomes.values().map(|o| o.trial_count).sum();
+        
+        // UCB1 for strategy selection
+        self.outcomes
+            .values()
+            .max_by(|a, b| {
+                let ucb_a = self.calculate_ucb(a, total_trials);
+                let ucb_b = self.calculate_ucb(b, total_trials);
+                ucb_a.total_cmp(&ucb_b)
+            })
+            .map(|o| o.strategy)
+            .unwrap_or(MetaStrategy::DirectImplementation)
+    }
+
+    fn calculate_ucb(&self, outcome: &StrategyOutcome, total_trials: u32) -> f64 {
+        if outcome.trial_count == 0 {
+            return f64::INFINITY;
+        }
+        let avg = outcome.avg_quality();
+        let exploration = (2.0 * (total_trials as f64 + 1.0).ln() / outcome.trial_count as f64).sqrt();
+        avg + exploration
     }
 }
 
 impl Default for MetaStrategyOptimizer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── SwarmPremiumCalculator ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct SwarmPremium {
+    pub task_type: String,
+    pub multi_agent_score: f64,
+    pub best_single_agent_score: f64,
+    pub premium_pct: f64,
+}
+
+pub struct SwarmPremiumCalculator;
+
+impl SwarmPremiumCalculator {
+    /// Compute how much better the multi-agent result was versus the best
+    /// single-agent score. `agent_scores` maps agent_id → quality score.
+    #[must_use]
+    pub fn compute(
+        task_type: &str,
+        multi_agent_score: f64,
+        agent_scores: &BTreeMap<String, f64>,
+    ) -> SwarmPremium {
+        let best_single = agent_scores
+            .values()
+            .cloned()
+            .fold(0.0_f64, f64::max);
+        let premium_pct = if best_single > 0.0 {
+            ((multi_agent_score - best_single) / best_single) * 100.0
+        } else {
+            0.0
+        };
+        SwarmPremium {
+            task_type: task_type.to_string(),
+            multi_agent_score,
+            best_single_agent_score: best_single,
+            premium_pct,
+        }
     }
 }
 
@@ -259,7 +413,7 @@ impl SkillRecord {
 
 #[derive(Debug, Clone, Default)]
 pub struct SkillProgressionTracker {
-    pub records: HashMap<(String, String), SkillRecord>, // (agent_id, task_type)
+    pub records: BTreeMap<(String, String), SkillRecord>, // (agent_id, task_type)
 }
 
 impl SkillProgressionTracker {
@@ -301,10 +455,10 @@ impl CapabilityGapScanner {
     /// Find task types where the best agent's score falls below `threshold`.
     #[must_use]
     pub fn scan(
-        profiles: &HashMap<String, AgentProfile>,
+        profiles: &BTreeMap<String, AgentProfile>,
         threshold: f64,
     ) -> Vec<CapabilityGap> {
-        let mut best_per_task: HashMap<String, f64> = HashMap::new();
+        let mut best_per_task: BTreeMap<String, f64> = BTreeMap::new();
         for profile in profiles.values() {
             for (cat, &score) in &profile.capabilities {
                 let key = format!("{cat:?}");
@@ -326,7 +480,7 @@ impl CapabilityGapScanner {
     }
 
     #[must_use]
-    pub fn scan_default(profiles: &HashMap<String, AgentProfile>) -> Vec<CapabilityGap> {
+    pub fn scan_default(profiles: &BTreeMap<String, AgentProfile>) -> Vec<CapabilityGap> {
         Self::scan(profiles, Self::DEFAULT_THRESHOLD)
     }
 }
@@ -336,7 +490,7 @@ impl CapabilityGapScanner {
 #[derive(Debug, Clone, Default)]
 pub struct ReviewerCalibrator {
     /// (reviewer_id) -> (true_positives, false_positives, false_negatives)
-    stats: HashMap<String, (u32, u32, u32)>,
+    stats: BTreeMap<String, (u32, u32, u32)>,
 }
 
 impl ReviewerCalibrator {
@@ -387,7 +541,7 @@ impl ProtocolArm {
             return f64::INFINITY;
         }
         let avg = self.total_reward / self.trials as f64;
-        let exploration = (2.0 * (total_trials as f64).ln() / self.trials as f64).sqrt();
+        let exploration = (2.0 * (total_trials as f64 + 1.0).ln() / self.trials as f64).sqrt();
         avg + exploration
     }
 }

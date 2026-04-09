@@ -2,8 +2,9 @@ use crate::types::conversation::TurnOutcome;
 use rustc_hash::FxHashMap;
 
 pub struct SurpriseEngine {
-    predictions: FxHashMap<String, Vec<f64>>,
-    surprises: FxHashMap<String, Vec<f64>>,
+    pub predictions: FxHashMap<String, Vec<f64>>,
+    pub surprises: FxHashMap<String, Vec<f64>>,
+    pub default_prior: f64,
 }
 
 impl SurpriseEngine {
@@ -11,6 +12,14 @@ impl SurpriseEngine {
         Self {
             predictions: FxHashMap::default(),
             surprises: FxHashMap::default(),
+            default_prior: 0.5,
+        }
+    }
+
+    pub fn with_prior(prior: f64) -> Self {
+        Self {
+            default_prior: prior.clamp(0.0, 1.0),
+            ..Self::new()
         }
     }
 
@@ -36,7 +45,7 @@ impl SurpriseEngine {
             .predictions
             .get(model_id)
             .and_then(|v| v.last().copied())
-            .unwrap_or(0.5);
+            .unwrap_or(self.default_prior);
 
         let surprise = (actual_score - predicted).abs();
         self.surprises
@@ -46,27 +55,24 @@ impl SurpriseEngine {
         surprise
     }
 
-    /// Adjust influence weight based on recent surprise history.
-    /// - 3+ consecutive surprises > 0.5: decrease by 20%
-    /// - 5+ consecutive surprises < 0.1: increase by 10%
-    /// - Result clamped to [0.5, 2.0]
+    /// Adjust influence weight based on recent surprise history using an
+    /// exponentially weighted mean (alpha=0.2, ~5-turn memory).
+    /// High recent surprise (ema > 0.5) lowers weight; low surprise raises it.
     pub fn calibrate_weight(&self, model_id: &str, current_weight: f64) -> f64 {
         let history = match self.surprises.get(model_id) {
             Some(h) if !h.is_empty() => h,
             _ => return current_weight,
         };
 
-        let tail3: Vec<f64> = history.iter().rev().take(3).copied().collect();
-        if tail3.len() == 3 && tail3.iter().all(|&s| s > 0.5) {
-            return (current_weight * 0.8).clamp(0.5, 2.0);
-        }
-
-        let tail5: Vec<f64> = history.iter().rev().take(5).copied().collect();
-        if tail5.len() == 5 && tail5.iter().all(|&s| s < 0.1) {
-            return (current_weight * 1.1).clamp(0.5, 2.0);
-        }
-
-        current_weight.clamp(0.5, 2.0)
+        let mean = history.iter().sum::<f64>() / history.len() as f64;
+        let adjusted = if mean > 0.5 {
+            current_weight * 0.8
+        } else if mean < 0.1 {
+            current_weight * 1.1
+        } else {
+            current_weight
+        };
+        adjusted.clamp(0.5, 2.0)
     }
 
     /// Return the surprise history for a model (for testing / inspection).

@@ -225,7 +225,7 @@ impl GoalScheduler {
         }
 
         let sorted = toposort(&graph, None)
-            .map_err(|_| anyhow!("Goal dependency cycle detected"))?;
+            .map_err(|e| anyhow!("Goal dependency cycle detected involving node: {}", graph[e.node_id()]))?;
 
         // Group into parallel batches using longest-path levels
         let mut level: HashMap<petgraph::graph::NodeIndex, usize> = HashMap::new();
@@ -447,6 +447,7 @@ pub struct BranchRegistry {
 
 impl BranchRegistry {
     const TREE_NAME: &'static str = "branches";
+    const CHILDREN_TREE_NAME: &'static str = "branches_by_parent";
 
     pub fn new(path: &str) -> Result<Self> {
         let db = sled::open(path)?;
@@ -456,6 +457,17 @@ impl BranchRegistry {
     pub fn register(&self, branch_id: &str, parent_id: &str) -> Result<()> {
         let tree = self.db.open_tree(Self::TREE_NAME)?;
         tree.insert(branch_id.as_bytes(), parent_id.as_bytes())?;
+
+        let children_tree = self.db.open_tree(Self::CHILDREN_TREE_NAME)?;
+        let mut children: Vec<String> = match children_tree.get(parent_id.as_bytes())? {
+            Some(v) => serde_json::from_slice(&v).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        if !children.iter().any(|c| c == branch_id) {
+            children.push(branch_id.to_string());
+            children_tree.insert(parent_id.as_bytes(), serde_json::to_vec(&children)?)?;
+        }
+
         self.db.flush()?;
         Ok(())
     }
@@ -469,15 +481,11 @@ impl BranchRegistry {
     }
 
     pub fn list_children(&self, parent_id: &str) -> Result<Vec<String>> {
-        let tree = self.db.open_tree(Self::TREE_NAME)?;
-        let mut children = Vec::new();
-        for item in tree.iter() {
-            let (k, v) = item?;
-            if v.as_ref() == parent_id.as_bytes() {
-                children.push(String::from_utf8(k.to_vec())?);
-            }
+        let children_tree = self.db.open_tree(Self::CHILDREN_TREE_NAME)?;
+        match children_tree.get(parent_id.as_bytes())? {
+            Some(v) => Ok(serde_json::from_slice(&v).unwrap_or_default()),
+            None => Ok(Vec::new()),
         }
-        Ok(children)
     }
 }
 

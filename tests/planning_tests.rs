@@ -1,9 +1,9 @@
 use crosstalk::engines::planning::{
-    BranchManager, CriticalPathAnalyzer, ContextPruner, DifficultyEstimator, GoalScheduler,
-    MilestoneDetector, PlanningEngine, SessionManager,
+    BranchManager, BranchRegistry, CriticalPathAnalyzer, ContextPruner, DifficultyEstimator,
+    GoalScheduler, MilestoneDetector, PlanningEngine, SessionManager,
 };
 use crosstalk::types::conversation::{ConversationState, Turn, TurnOutcome};
-use crosstalk::types::planning::{GoalNode, GoalStatus, GoalTree};
+use crosstalk::types::planning::{GoalNode, GoalStatus, GoalTree, SessionManifest};
 use tempfile::tempdir;
 
 fn make_node(id: &str, title: &str, status: GoalStatus) -> GoalNode {
@@ -266,7 +266,7 @@ fn fork_preserves_turn_history() {
 #[test]
 fn session_manager_save_and_load_roundtrip() {
     let dir = tempdir().unwrap();
-    let mut mgr = SessionManager::new(dir.path().to_str().unwrap()).unwrap();
+    let mgr = SessionManager::new(dir.path().to_str().unwrap()).unwrap();
     let mut state = ConversationState::new("my-session");
     state.turns.push(make_turn(0, TurnOutcome::TestsPassed));
     mgr.save("my-session", &state).unwrap();
@@ -285,7 +285,7 @@ fn session_manager_load_missing_returns_error() {
 #[test]
 fn session_manager_list_returns_saved_ids() {
     let dir = tempdir().unwrap();
-    let mut mgr = SessionManager::new(dir.path().to_str().unwrap()).unwrap();
+    let mgr = SessionManager::new(dir.path().to_str().unwrap()).unwrap();
     mgr.save("alpha", &ConversationState::new("alpha")).unwrap();
     mgr.save("beta", &ConversationState::new("beta")).unwrap();
     let mut ids = mgr.list().unwrap();
@@ -296,7 +296,7 @@ fn session_manager_list_returns_saved_ids() {
 #[test]
 fn session_manager_delete_removes_entry() {
     let dir = tempdir().unwrap();
-    let mut mgr = SessionManager::new(dir.path().to_str().unwrap()).unwrap();
+    let mgr = SessionManager::new(dir.path().to_str().unwrap()).unwrap();
     mgr.save("to-delete", &ConversationState::new("to-delete")).unwrap();
     mgr.delete("to-delete").unwrap();
     assert!(mgr.load("to-delete").is_err());
@@ -319,4 +319,86 @@ fn context_pruner_empty_state_returns_empty() {
     let sigma = ConversationState::new("empty");
     let pruned = ContextPruner::prune(&sigma, "root", 10);
     assert!(pruned.is_empty());
+}
+
+// ── Acceptance criteria: >50% token reduction ─────────────────────────────────
+
+#[test]
+fn context_pruner_reduces_by_more_than_50_percent() {
+    let mut sigma = ConversationState::new("prune-ratio");
+    for i in 0u32..30 {
+        sigma.turns.push(make_turn(i, TurnOutcome::Unknown));
+    }
+    let total = sigma.turns.len();
+    let pruned = ContextPruner::prune(&sigma, "nonexistent-goal", 5);
+    assert!(
+        pruned.len() * 2 <= total,
+        "pruned {} of {} turns — must reduce by >50%",
+        pruned.len(),
+        total
+    );
+}
+
+// ── Checksum roundtrip ─────────────────────────────────────────────────────────
+
+#[test]
+fn checksum_roundtrip_succeeds() {
+    let dir = tempdir().unwrap();
+    let mgr = SessionManager::new(dir.path().to_str().unwrap()).unwrap();
+    let sigma = ConversationState::new("ck-ok");
+    let ck = mgr.save_with_checksum("ck-ok", &sigma).unwrap();
+    let loaded = mgr.load_with_checksum("ck-ok", &ck).unwrap();
+    assert_eq!(loaded.session_id, "ck-ok");
+}
+
+#[test]
+fn checksum_mismatch_returns_error() {
+    let dir = tempdir().unwrap();
+    let mgr = SessionManager::new(dir.path().to_str().unwrap()).unwrap();
+    let sigma = ConversationState::new("ck-fail");
+    mgr.save_with_checksum("ck-fail", &sigma).unwrap();
+    let bad_ck = [0u8; 32];
+    let result = mgr.load_with_checksum("ck-fail", &bad_ck);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("Checksum mismatch"));
+}
+
+// ── SessionManifest ────────────────────────────────────────────────────────────
+
+#[test]
+fn manifest_save_and_load_roundtrip() {
+    let dir = tempdir().unwrap();
+    let mgr = SessionManager::new(dir.path().to_str().unwrap()).unwrap();
+    let manifest = SessionManifest {
+        author: "alice".to_string(),
+        created_at: 1_000_000,
+        total_turns: 42,
+        total_tokens_used: 100_000,
+        cost_estimate_usd: 1.23,
+    };
+    mgr.save_manifest(&manifest).unwrap();
+    let loaded = mgr.load_manifest("alice").unwrap();
+    assert_eq!(loaded.total_turns, 42);
+    assert!((loaded.cost_estimate_usd - 1.23).abs() < f64::EPSILON);
+}
+
+// ── BranchRegistry ────────────────────────────────────────────────────────────
+
+#[test]
+fn branch_registry_records_parent_lineage() {
+    let dir = tempdir().unwrap();
+    let reg = BranchRegistry::new(dir.path().to_str().unwrap()).unwrap();
+    reg.register("child-1", "parent-root").unwrap();
+    reg.register("child-2", "parent-root").unwrap();
+    assert_eq!(reg.parent_of("child-1").unwrap().as_deref(), Some("parent-root"));
+    let children = reg.list_children("parent-root").unwrap();
+    assert_eq!(children.len(), 2);
+}
+
+#[test]
+fn branch_manager_fork_creates_unique_session_id() {
+    let sigma = ConversationState::new("main");
+    let fork = BranchManager::fork(&sigma);
+    assert_ne!(fork.session_id, sigma.session_id);
+    assert!(fork.session_id.starts_with("main-fork-"));
 }

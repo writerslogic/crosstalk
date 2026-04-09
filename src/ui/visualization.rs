@@ -1,20 +1,199 @@
 use crate::types::conversation::ConversationState;
 use anyhow::Result;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use wgpu::util::DeviceExt;
 
-#[derive(Default)]
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
 pub struct GodView {
-    // wgpu handles would go here
     pub frame_count: u64,
+    instance: Option<wgpu::Instance>,
+    surface: Option<wgpu::Surface<'static>>,
+    device: Option<wgpu::Device>,
+    queue: Option<wgpu::Queue>,
+    render_pipeline: Option<wgpu::RenderPipeline>,
+}
+
+impl Default for GodView {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GodView {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            frame_count: 0,
+            instance: None,
+            surface: None,
+            device: None,
+            queue: None,
+            render_pipeline: None,
+        }
     }
 
-    pub async fn render_frame(&mut self, _sigma: &ConversationState) -> Result<()> {
+    pub async fn init_wgpu(&mut self, window: std::sync::Arc<winit::window::Window>) -> Result<()> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(), // Supports Metal, Vulkan, DX12, etc.
+            ..Default::default()
+        });
+        let surface = instance.create_surface(window)?;
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance, // Prefers Metal/GPU on Mac
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No suitable GPU or Metal adapter found"))?;
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default(), None)
+            .await?;
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("viz_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("viz.wgsl").into()),
+            });
+
+        let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render Pipeline Layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Bgra8UnormSrgb,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        self.instance = Some(instance);
+        self.surface = Some(surface);
+        self.device = Some(device);
+        self.queue = Some(queue);
+        self.render_pipeline = Some(render_pipeline);
+
+        Ok(())
+    }
+
+    pub async fn render_frame(&mut self, sigma: &ConversationState) -> Result<()> {
         self.frame_count += 1;
+        
+        let Some(ref device) = self.device else { return Ok(()) };
+        let Some(ref queue) = self.queue else { return Ok(()) };
+        let Some(ref surface) = self.surface else { return Ok(()) };
+        let Some(ref render_pipeline) = self.render_pipeline else { return Ok(()) };
+
+        let output = surface.get_current_texture()?;
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Render Encoder"),
+        });
+
+        // 1. Project Swarm State to 3D Vertices
+        let mut vertices = vec![];
+        let total_turns = sigma.turns.len() as f32;
+        
+        for (i, turn) in sigma.turns.iter().enumerate() {
+            let certainty = turn.certainty.unwrap_or(0.5);
+            let surprise = turn.surprise_signal.unwrap_or(0.5);
+            
+            // Map [Certainty, Surprise] -> [-1, 1] Normalized Device Coordinates
+            let x = (certainty as f32 * 2.0) - 1.0;
+            let y = (surprise as f32 * 2.0) - 1.0;
+            let z = (i as f32 / total_turns.max(1.0) * 2.0) - 1.0;
+            
+            // Color gradient from Sovereign Green to Electric Purple based on turn index
+            let color = [
+                0.0 + (i as f32 / total_turns.max(1.0) * 0.5),
+                1.0 - (i as f32 / total_turns.max(1.0) * 0.5),
+                0.53 + (i as f32 / total_turns.max(1.0) * 0.4),
+            ];
+
+            vertices.push(Vertex {
+                position: [x, y, z],
+                color,
+            });
+        }
+
+        if vertices.is_empty() {
+            vertices.push(Vertex { position: [0.0, 0.0, 0.0], color: [1.0, 1.0, 1.0] });
+        }
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.01, g: 0.01, b: 0.02, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            render_pass.set_pipeline(render_pipeline);
+            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            render_pass.draw(0..vertices.len() as u32, 0..1);
+        }
+
+        queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+
         Ok(())
     }
 }
@@ -56,6 +235,9 @@ impl ForceDirectedGraph {
     }
 
     pub fn compute_layout_step(&mut self) {
+        if self.nodes.is_empty() {
+            return;
+        }
         let area = 10000.0;
         let k = (area / self.nodes.len() as f32).sqrt();
 
@@ -95,6 +277,40 @@ impl ForceDirectedGraph {
             let dist = (node.dx * node.dx + node.dy * node.dy).sqrt().max(0.1);
             node.x += (node.dx / dist) * dist.min(temp);
             node.y += (node.dy / dist) * dist.min(temp);
+        }
+    }
+
+    pub fn update_from_sigma(&mut self, sigma: &ConversationState) {
+        let mut agent_map = HashMap::new();
+        for turn in &sigma.turns {
+            let id = turn.model_id.clone();
+            let weight = sigma.agent_weights.get(&id).copied().unwrap_or(1.0);
+            agent_map.insert(id.clone(), weight);
+        }
+
+        // Rebuild graph nodes from agents
+        self.nodes.clear();
+        let mut id_to_idx = HashMap::new();
+        for (id, weight) in agent_map {
+            id_to_idx.insert(id.clone(), self.nodes.len());
+            self.nodes.push(Node {
+                id,
+                x: rand::random::<f32>() * 100.0,
+                y: rand::random::<f32>() * 100.0,
+                dx: 0.0,
+                dy: 0.0,
+                weight: weight as f32,
+            });
+        }
+
+        // Rebuild edges based on turn sequence (influence)
+        self.edges.clear();
+        for window in sigma.turns.windows(2) {
+            let src_idx = id_to_idx.get(&window[0].model_id);
+            let tgt_idx = id_to_idx.get(&window[1].model_id);
+            if let (Some(&src), Some(&tgt)) = (src_idx, tgt_idx) {
+                self.edges.push(Edge { source: src, target: tgt, strength: 1.0 });
+            }
         }
     }
 }
@@ -153,22 +369,24 @@ impl HeatmapGenerator {
 pub struct TimelineManager {
     pub checkpoints: VecDeque<ConversationState>,
     pub cursor: usize,
+    index: HashMap<u32, usize>,
 }
 
 impl TimelineManager {
     pub fn new() -> Self {
-        Self { checkpoints: VecDeque::new(), cursor: 0 }
+        Self { checkpoints: VecDeque::new(), cursor: 0, index: HashMap::new() }
     }
 
     pub fn push(&mut self, state: ConversationState) {
+        let pos = self.checkpoints.len();
+        self.index.insert(state.iteration_index, pos);
         self.checkpoints.push_back(state);
     }
 
     #[must_use]
     pub fn seek(&self, iteration: u32) -> Option<&ConversationState> {
-        self.checkpoints
-            .iter()
-            .find(|s| s.iteration_index == iteration)
+        let pos = *self.index.get(&iteration)?;
+        self.checkpoints.get(pos)
     }
 
     #[must_use]
@@ -236,13 +454,14 @@ impl ReplayEngine {
         self.frames.get(self.cursor)
     }
 
+    /// Advance the cursor by `playback_speed` frames (rounded to nearest ≥1).
+    /// Returns `true` if the cursor actually moved (i.e. was not already at the end).
     pub fn advance(&mut self) -> bool {
-        if self.cursor + 1 < self.frames.len() {
-            self.cursor += 1;
-            true
-        } else {
-            false
-        }
+        let step = (self.playback_speed.round() as usize).max(1);
+        let next = (self.cursor + step).min(self.frames.len().saturating_sub(1));
+        let moved = next > self.cursor;
+        self.cursor = next;
+        moved
     }
 
     pub fn reset(&mut self) {
@@ -287,7 +506,7 @@ impl SvgExporter {
                 r,
                 node.x + width / 2.0 + r + 2.0,
                 node.y + height / 2.0 + 4.0,
-                node.id,
+                xml_escape(&node.id),
             ));
         }
 
@@ -306,7 +525,8 @@ impl SvgExporter {
         let cell_w = (width as f32 / heatmap.len().max(1) as f32).max(1.0);
 
         let mut svg = format!(
-            r##"<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="#0a0a0f"/><text x="4" y="14" font-size="12" fill="#fff">{artifact_name}</text>"##
+            r##"<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="#0a0a0f"/><text x="4" y="14" font-size="12" fill="#fff">{}</text>"##,
+            xml_escape(artifact_name),
         );
 
         for (i, &val) in heatmap.iter().enumerate() {
@@ -336,3 +556,4 @@ impl ThemeEngine {
         }
     }
 }
+

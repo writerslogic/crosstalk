@@ -21,7 +21,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ])
         .split(area);
 
-    // ── Row 0: σ State | μ Agents ──────────────────────────────────────────
     let top = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -70,7 +69,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(agents_para, top[1]);
 
-    // ── Row 1: Ghost Stream (65%) | Right panel (35%) ──────────────────────
     let center = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
@@ -78,6 +76,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     let ghost_style = focus_border(app, FocusedPane::GhostStream);
     let ghost = Paragraph::new(app.streaming_buffer.as_str())
+        .scroll((app.ghost_scroll as u16, 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -92,11 +91,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(center[1]);
 
-    // Artifacts list
     let art_style = focus_border(app, FocusedPane::Artifacts);
     let artifact_items: Vec<ListItem> = app
         .artifacts
         .iter()
+        .skip(app.artifact_scroll)
         .map(|(name, skeleton)| {
             if skeleton.is_empty() {
                 ListItem::new(name.as_str())
@@ -113,11 +112,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(artifacts_list, right[0]);
 
-    // Entropy heatmap
-    let ent_style = focus_border(app, FocusedPane::EntropyMap);
-    draw_entropy_heatmap(frame, app, right[1], ent_style);
+    draw_entropy_heatmap(frame, app, right[1], focus_border(app, FocusedPane::EntropyMap));
 
-    // ── Row 2: Convergence + Certainty gauges ──────────────────────────────
     let gauges = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -139,7 +135,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .ratio(cert);
     frame.render_widget(cert_gauge, gauges[1]);
 
-    // ── Row 3: Δα Diffs / Events ───────────────────────────────────────────
     let ev_style = focus_border(app, FocusedPane::Events);
     let visible: Vec<ListItem> = app
         .recent_events
@@ -155,120 +150,60 @@ pub fn draw(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(events_list, rows[3]);
 
-    // ── Row 4: Status bar ──────────────────────────────────────────────────
-    let fps_str = if app.fps > 0.0 {
-        format!("{:.0}fps", app.fps)
-    } else {
-        "---fps".to_string()
-    };
+    let fps_str = if app.fps > 0.0 { format!("{:.0}fps", app.fps) } else { "---fps".to_string() };
     let status = Paragraph::new(format!(
         " [Tab] Focus | [Ctrl+I] Inject | [j/k] Scroll | [g/G] Top/Bottom | [q] Quit | {fps_str} "
     ));
     frame.render_widget(status, rows[4]);
 
-    if app.showing_inject {
-        draw_inject_dialog(frame, &app.inject_buffer);
-    }
+    if app.showing_inject { draw_inject_dialog(frame, &app.inject_buffer); }
 }
 
-fn draw_entropy_heatmap(
-    frame: &mut Frame,
-    app: &App,
-    area: ratatui::layout::Rect,
-    border_style: Style,
-) {
+fn draw_entropy_heatmap(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, border_style: Style) {
     if app.entropy_scores.is_empty() || app.agent_list.is_empty() {
         let placeholder = Paragraph::new(" No disagreement data yet").block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Entropy Heatmap ")
-                .border_style(border_style),
+            Block::default().borders(Borders::ALL).title(" Entropy Heatmap ").border_style(border_style),
         );
         frame.render_widget(placeholder, area);
         return;
     }
 
-    // Header: "Artifact" + one column per agent
-    let header_cells: Vec<Cell> = std::iter::once(Cell::from("Artifact").style(
-        Style::default().add_modifier(Modifier::BOLD),
-    ))
+    let header_cells: Vec<Cell> = std::iter::once(Cell::from("Artifact").style(Style::default().add_modifier(Modifier::BOLD)))
     .chain(app.agent_list.iter().map(|a| {
-        // Truncate long agent IDs for display
         let label = if a.len() > 10 { &a[..10] } else { a.as_str() };
         Cell::from(label.to_string()).style(Style::default().add_modifier(Modifier::BOLD))
-    }))
-    .collect();
+    })).collect();
     let header = Row::new(header_cells).height(1);
 
-    let rows: Vec<Row> = app
-        .entropy_scores
-        .iter()
-        .map(|entry| {
-            let artifact_label = if entry.artifact.len() > 14 {
-                format!("{}…", &entry.artifact[..13])
-            } else {
-                entry.artifact.clone()
-            };
-            let mut cells: Vec<Cell> = vec![Cell::from(artifact_label)];
-            for agent_id in &app.agent_list {
-                let score = entry
-                    .agents
-                    .iter()
-                    .find(|(a, _)| a == agent_id)
-                    .map(|(_, s)| *s)
-                    .unwrap_or(0.0);
-                let color = heatmap_color(score);
-                let label = format!("{:.2}", score);
-                cells.push(Cell::from(label).style(Style::default().fg(color)));
-            }
-            Row::new(cells).height(1)
-        })
-        .collect();
+    let rows: Vec<Row> = app.entropy_scores.iter().skip(app.entropy_scroll).map(|entry| {
+        let artifact_label = if entry.artifact.len() > 14 { format!("{}...", &entry.artifact[..13]) } else { entry.artifact.clone() };
+        let mut cells: Vec<Cell> = vec![Cell::from(artifact_label)];
+        for agent_id in &app.agent_list {
+            let score = entry.agents.iter().find(|(a, _)| a == agent_id).map(|(_, s)| *s).unwrap_or(0.0);
+            let color = heatmap_color(score);
+            cells.push(Cell::from(format!("{:.2}", score)).style(Style::default().fg(color)));
+        }
+        Row::new(cells).height(1)
+    }).collect();
 
-    // Column widths: artifact name (fixed) + equal share for each agent
     let agent_count = app.agent_list.len().max(1);
-    let artifact_pct = 30u16;
-    let agent_pct = (70u16) / agent_count as u16;
-    let mut widths: Vec<Constraint> = vec![Constraint::Percentage(artifact_pct)];
-    for _ in 0..agent_count {
-        widths.push(Constraint::Percentage(agent_pct));
-    }
+    let mut widths: Vec<Constraint> = vec![Constraint::Percentage(30)];
+    for _ in 0..agent_count { widths.push(Constraint::Percentage(70 / agent_count as u16)); }
 
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Entropy Heatmap [0=agree 1=conflict] ")
-                .border_style(border_style),
-        );
+    let table = Table::new(rows, widths).header(header).block(
+        Block::default().borders(Borders::ALL).title(" Entropy Heatmap [0=agree 1=conflict] ").border_style(border_style),
+    );
     frame.render_widget(table, area);
 }
 
 fn heatmap_color(score: f64) -> Color {
-    if score > 0.7 {
-        Color::Red
-    } else if score > 0.3 {
-        Color::Yellow
-    } else {
-        Color::Green
-    }
+    if score > 0.7 { Color::Red } else if score > 0.3 { Color::Yellow } else { Color::Green }
 }
 
 fn gauge_color(ratio: f64) -> Color {
-    if ratio > 0.8 {
-        Color::Green
-    } else if ratio > 0.5 {
-        Color::Yellow
-    } else {
-        Color::Red
-    }
+    if ratio > 0.8 { Color::Green } else if ratio > 0.5 { Color::Yellow } else { Color::Red }
 }
 
 fn focus_border(app: &App, pane: FocusedPane) -> Style {
-    if app.focused_pane == pane {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default()
-    }
+    if app.focused_pane == pane { Style::default().fg(Color::Yellow) } else { Style::default() }
 }

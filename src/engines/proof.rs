@@ -7,6 +7,7 @@ pub struct ProofManager;
 impl ProofManager {
     #[must_use]
     pub fn generate_proof(artifact: &Artifact, properties: Vec<String>) -> ProofAttachment {
+        // Allow empty properties; hash will not commit to any specific claims
         let mut hasher = Sha256::new();
 
         // Tie proof to artifact content
@@ -30,10 +31,19 @@ impl ProofManager {
     #[must_use]
     pub fn to_lean4(attachment: &ProofAttachment) -> String {
         let props = attachment.proven_properties.join(", ");
-        let safe_name = attachment.artifact_name.replace(['.', '-'], "_");
+        let safe_name: String = attachment
+            .artifact_name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+            .collect();
+        let safe_name = if safe_name.starts_with(|c: char| c.is_ascii_digit()) {
+            format!("_{safe_name}")
+        } else {
+            safe_name
+        };
         format!(
-            "-- Proof for {}\ntheorem artifact_{}_integrity : True := by\n  -- Verified properties: {}\n  -- Proof Hash: {}\n  trivial\n",
-            attachment.artifact_name, safe_name, props, attachment.proof_hash
+            "-- Proof for {}\ntheorem artifact_{safe_name}_integrity (h : proof_hash = \"{}\") : True := by\n  -- Properties: {}\n  trivial\n",
+            attachment.artifact_name, attachment.proof_hash, props
         )
     }
 }

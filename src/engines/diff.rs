@@ -34,7 +34,7 @@ impl DiffEngine {
                         ChangeTag::Insert => "+",
                         ChangeTag::Equal => " ",
                     };
-                    let _ = write!(group_text, "{}{}", sign, change);
+                    let _ = write!(group_text, "{}{}", sign, change); // String writes are infallible
                 }
             }
 
@@ -83,7 +83,10 @@ impl DiffEngine {
 
                 let old_part = parts[1].trim_start_matches('-');
                 let old_info: Vec<&str> = old_part.split(',').collect();
-                let start_idx = old_info[0].parse::<usize>().unwrap_or(1).saturating_sub(1);
+                let start_idx = match old_info[0].parse::<usize>() {
+                    Ok(n) => n.saturating_sub(1),
+                    Err(_) => continue,
+                };
                 let old_len = if old_info.len() > 1 {
                     old_info[1].parse::<usize>().unwrap_or(0)
                 } else {
@@ -105,19 +108,17 @@ impl DiffEngine {
                     }
                 }
 
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    clippy::cast_possible_wrap
-                )]
-                let apply_pos = (start_idx as i32 + offset) as usize;
+                let signed_pos = (start_idx as i64) + (offset as i64);
+                if signed_pos < 0 || signed_pos > result_lines.len() as i64 {
+                    continue;
+                }
+                let apply_pos = signed_pos as usize;
                 let actual_old_len = old_len.min(result_lines.len().saturating_sub(apply_pos));
 
                 result_lines.splice(
                     apply_pos..apply_pos + actual_old_len,
                     new_hunk_content.clone(),
                 );
-                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                 let new_offset_change = new_hunk_content.len() as i32 - actual_old_len as i32;
                 offset += new_offset_change;
 
@@ -161,6 +162,6 @@ impl DiffEngine {
         }
         let diff = TextDiff::from_lines(a, b);
         let distance = diff.ratio(); // ratio() returns similarity 0.0 to 1.0
-        f64::from(1.0 - distance)
+        f64::from(1.0_f32 - distance)
     }
 }

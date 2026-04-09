@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 
 #[tokio::test]
 async fn test_continuous_auditor_spawns_and_receives() {
-    let (alert_tx, _alert_rx) = mpsc::channel::<AuditAlert>(32);
+    let (alert_tx, _alert_rx) = mpsc::unbounded_channel::<AuditAlert>();
     let tx = ContinuousAuditor::spawn(alert_tx);
 
     let mut state1 = ConversationState::new("audit-session");

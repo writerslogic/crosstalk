@@ -1,5 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SessionManifest {
+    pub author: String,
+    pub created_at: u64,
+    pub total_turns: u32,
+    pub total_tokens_used: u64,
+    pub cost_estimate_usd: f64,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum GoalStatus {
     Pending,
@@ -47,18 +56,20 @@ impl GoalTree {
     /// Returns `true` if the parent was found and the node was inserted.
     pub fn add_child(&mut self, parent_id: &str, node: GoalNode) -> bool {
         match &mut self.root {
-            Some(root) => Self::insert_child(root, parent_id, node),
+            Some(root) => Self::insert_child(root, parent_id, &mut Some(node)),
             None => false,
         }
     }
 
-    fn insert_child(current: &mut GoalNode, parent_id: &str, node: GoalNode) -> bool {
+    fn insert_child(current: &mut GoalNode, parent_id: &str, node: &mut Option<GoalNode>) -> bool {
         if current.id == parent_id {
-            current.children.push(node);
+            if let Some(n) = node.take() {
+                current.children.push(n);
+            }
             return true;
         }
         for child in &mut current.children {
-            if Self::insert_child(child, parent_id, node.clone()) {
+            if Self::insert_child(child, parent_id, node) {
                 return true;
             }
         }

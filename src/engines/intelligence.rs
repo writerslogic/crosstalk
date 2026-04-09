@@ -2,7 +2,7 @@ use crate::types::conversation::{ConversationState, TaskCategory, Turn, TurnOutc
 use crate::types::intelligence::{ModelProfile, PromptTemplate, RegressionAlert};
 use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::{mpsc, RwLock};
@@ -32,7 +32,7 @@ impl CheckpointService {
                     Some(_) = rx.recv() => {
                         ticker.tick().await;
                         while rx.try_recv().is_ok() {}
-                        let profiles_map: HashMap<String, ModelProfile> = profiles
+                        let profiles_map: BTreeMap<String, ModelProfile> = profiles
                             .iter()
                             .map(|entry| (entry.key().clone(), entry.value().clone()))
                             .collect();
@@ -82,6 +82,14 @@ impl Default for IntelligenceEngine {
     }
 }
 
+impl Drop for IntelligenceEngine {
+    fn drop(&mut self) {
+        if let Some(h) = self.checkpoint.handle.take() {
+            h.abort();
+        }
+    }
+}
+
 impl IntelligenceEngine {
     #[must_use]
     pub fn new() -> Self {
@@ -113,12 +121,16 @@ impl IntelligenceEngine {
     /// Asynchronous, non-blocking file read.
     pub async fn load_profiles(&self) -> Result<()> {
         if let Some(path) = &self.storage_path
-            && tokio::fs::try_exists(path).await.unwrap_or(false)
+            && match tokio::fs::try_exists(path).await {
+                Ok(v) => v,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(anyhow::anyhow!(e)),
+            }
         {
             let content = fs::read_to_string(path).await.context("Failed to read intelligence data")?;
             let data: serde_json::Value = serde_json::from_str(&content)?;
             if let Some(profiles) = data.get("profiles") {
-                let parsed: HashMap<String, ModelProfile> = serde_json::from_value(profiles.clone())?;
+                let parsed: BTreeMap<String, ModelProfile> = serde_json::from_value(profiles.clone())?;
                 for (k, v) in parsed {
                     self.profiles.insert(k, v);
                 }
@@ -143,7 +155,7 @@ impl IntelligenceEngine {
     pub fn update_profile(&self, turn: &Turn, quality_score: f64) {
         let mut profile = self.profiles.entry(turn.model_id.clone()).or_insert_with(|| ModelProfile {
             model_id: turn.model_id.clone(),
-            task_scores: HashMap::new(),
+            task_scores: BTreeMap::new(),
             total_turns: 0,
             last_updated: ConversationState::now(),
             latency_ms: Default::default(),
@@ -160,6 +172,9 @@ impl IntelligenceEngine {
     }
 
     pub fn update_profile_with_latency(&self, turn: &Turn, quality_score: f64, latency_ms: u64) {
+        // C-009: there is a TOCTOU window between update_profile (which drops the DashMap guard)
+        // and the get_mut below. Collapsing both into a single entry() closure would require
+        // LatencyPredictor to be callable without a separate record() step; deferred for now.
         self.update_profile(turn, quality_score);
         self.latency_predictor.record(&turn.model_id, latency_ms);
         if let Some(mut profile) = self.profiles.get_mut(&turn.model_id) {
@@ -184,7 +199,7 @@ impl IntelligenceEngine {
 
         for turn in recent_turns {
             if turn.model_id == model_id {
-                let score = QualityScorer::score(turn, &ConversationState::new("temp"));
+                let score = QualityScorer::score(turn);
                 recent_quality_sum += score;
                 valid_turns += 1;
             }
@@ -326,7 +341,7 @@ pub struct QualityScorer;
 
 impl QualityScorer {
     #[must_use]
-    pub fn score(turn: &Turn, _sigma: &ConversationState) -> f64 {
+    pub fn score(turn: &Turn) -> f64 {
         let mut score = 0.5;
 
         score += match turn.outcome {
@@ -532,7 +547,7 @@ impl PromptComposer {
             format!("{} | {:?} mean: {:.2} | {} turns", profile.model_id, cat, avg, profile.total_turns)
         };
 
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("task".to_string(), base_task.to_string());
         vars.insert("context".to_string(), context_str);
         vars.insert("profile_summary".to_string(), profile_summary);
@@ -639,7 +654,7 @@ impl LatencyPredictor {
     }
 
     pub fn predict_latency(&self, model_id: &str) -> u64 {
-        self.ema.get(model_id).map(|v| *v as u64).unwrap_or(0)
+        self.ema.get(model_id).map(|v| if v.is_finite() { *v as u64 } else { 0u64 }).unwrap_or(0)
     }
 
     pub fn is_high_variance(&self, model_id: &str) -> bool {

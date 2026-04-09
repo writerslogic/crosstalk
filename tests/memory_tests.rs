@@ -652,7 +652,7 @@ fn test_query_weighted_outcome_ranking() {
 // ============================================================================
 
 use crosstalk::engines::memory::{MemoryStore, SemanticClusterer};
-use crosstalk::types::memory::{DeletionLogEntry, MemoryStoreStats, SessionContext};
+use crosstalk::types::memory::SessionContext;
 
 fn make_turn(index: u32, content: &str, outcome: TurnOutcome) -> Turn {
     Turn {

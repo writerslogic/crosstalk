@@ -1,13 +1,18 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
+/// Spending tier that gates model selection and prompt verbosity.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetMode {
+    /// More than 20 % of session budget remaining.
     Normal,
+    /// Between 5 % and 20 % remaining; prefer cheaper models.
     CostReduction,
+    /// Below 5 % remaining; cheapest path only.
     Emergency,
 }
 
+/// Token counts for a single API call.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct TokenUsage {
     pub input_tokens: u32,
@@ -15,6 +20,7 @@ pub struct TokenUsage {
     pub total_tokens: u32,
 }
 
+/// Per-turn cost record stored in the [`BudgetLedger`].
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CostEntry {
     pub turn_id: u32,
@@ -25,6 +31,7 @@ pub struct CostEntry {
     pub timestamp: u64,
 }
 
+/// Tracks API spend across a session and derives the current [`BudgetMode`].
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct BudgetLedger {
     pub session_budget: f64,
@@ -35,7 +42,7 @@ pub struct BudgetLedger {
 impl BudgetLedger {
     #[must_use]
     pub fn remaining(&self) -> f64 {
-        self.session_budget - self.spent
+        (self.session_budget - self.spent).max(0.0)
     }
 
     #[must_use]
@@ -47,8 +54,16 @@ impl BudgetLedger {
     }
 
     #[must_use]
+    pub fn burn_rate_defined(&self) -> Option<f64> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        Some(self.spent / self.entries.len() as f64)
+    }
+
+    #[must_use]
     pub fn mode(&self) -> BudgetMode {
-        let pct = if self.session_budget > 0.0 {
+        let pct = if self.session_budget > f64::EPSILON {
             self.remaining() / self.session_budget
         } else {
             0.0
@@ -77,7 +92,7 @@ impl BudgetLedger {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ModelCapabilityMatrix {
-    pub scores: HashMap<String, HashMap<String, f64>>,
+    pub scores: BTreeMap<String, BTreeMap<String, f64>>,
 }
 
 impl ModelCapabilityMatrix {

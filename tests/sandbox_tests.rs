@@ -17,6 +17,8 @@ async fn test_sandbox_fuel_limit() {
     let config = SandboxConfig {
         memory_limit_bytes: 1024 * 1024,
         fuel_limit: 100, // Very low fuel limit
+        output_buffer_bytes: 1024 * 1024,
+        entry_point: None,
     };
 
     let wasm_bytes = invalid_wasm_bytes();
@@ -37,6 +39,8 @@ async fn test_sandbox_memory_limit() {
     let config = SandboxConfig {
         memory_limit_bytes: 1024, // 1KB memory limit
         fuel_limit: 10_000_000,
+        output_buffer_bytes: 1024 * 1024,
+        entry_point: None,
     };
 
     let wasm_bytes = invalid_wasm_bytes();
@@ -54,6 +58,8 @@ async fn test_sandbox_stdout_capture() {
     let config = SandboxConfig {
         memory_limit_bytes: 1024 * 1024,
         fuel_limit: 10_000_000,
+        output_buffer_bytes: 1024 * 1024,
+        entry_point: None,
     };
 
     let wasm_bytes = invalid_wasm_bytes();
@@ -85,7 +91,7 @@ async fn test_monte_carlo_trials() {
         content: "fn main() {}".to_string(),
         version: 1,
         history: vec![],
-        ast_versions: HashMap::new(),
+        ast_versions: std::collections::BTreeMap::new(),
         proof_attachments: vec![],
         metrics: Default::default(),
         skeleton: String::new(),
@@ -119,7 +125,7 @@ async fn test_monte_carlo_variance() {
         content: "fn main() {}".to_string(),
         version: 1,
         history: vec![],
-        ast_versions: HashMap::new(),
+        ast_versions: std::collections::BTreeMap::new(),
         proof_attachments: vec![],
         metrics: Default::default(),
         skeleton: String::new(),
@@ -329,7 +335,7 @@ fn diff_nodes_identical_versions_has_no_changes() {
 async fn execute_with_rollback_returns_snapshot_on_invalid_wasm() {
     let manager = SandboxManager::new().unwrap();
     let snapshot = ConversationState::new("snap-session");
-    let config = SandboxConfig { memory_limit_bytes: 1024 * 1024, fuel_limit: 10_000_000 };
+    let config = SandboxConfig { memory_limit_bytes: 1024 * 1024, fuel_limit: 10_000_000, output_buffer_bytes: 1024 * 1024, entry_point: None };
     let (result, rollback) = manager
         .execute_with_rollback(&[0xFF, 0xFF], &config, &snapshot)
         .await
@@ -353,7 +359,7 @@ async fn execute_with_rollback_rollback_is_none_on_success() {
     ];
     let manager = SandboxManager::new().unwrap();
     let snapshot = ConversationState::new("success-session");
-    let config = SandboxConfig { memory_limit_bytes: 1024 * 1024, fuel_limit: 10_000_000 };
+    let config = SandboxConfig { memory_limit_bytes: 1024 * 1024, fuel_limit: 10_000_000, output_buffer_bytes: 1024 * 1024, entry_point: None };
     let (_result, rollback) = manager
         .execute_with_rollback(&wasm_bytes, &config, &snapshot)
         .await

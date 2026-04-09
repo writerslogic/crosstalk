@@ -22,8 +22,10 @@ pub async fn run_event_loop(
         while let Ok(ev) = stream_rx.try_recv() {
             let mut a = app.lock().await;
             match ev {
-                StreamEvent::TokenReceived(token) => a.push_token(&token),
+                StreamEvent::TokenReceived { agent_id, token } => a.push_token(&agent_id, &token),
                 StreamEvent::TurnComplete(turn) => a.commit_turn(&turn),
+                StreamEvent::ConvergenceUpdated { p, certainty } => a.set_convergence(p, certainty),
+                StreamEvent::ArtifactsUpdated(list) => a.artifacts = list,
                 StreamEvent::CheckpointWritten(idx) => {
                     a.push_event(format!("Checkpoint i_{idx}"));
                 }

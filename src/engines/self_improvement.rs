@@ -6,7 +6,7 @@ use crate::types::self_improvement::{
     PostMortem, ProgressReport, PromptTemplate, SessionEvaluation, StrategyEntry,
 };
 use anyhow::{Result, anyhow};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 // ── SelfImprovementEngine ─────────────────────────────────────────────────────
@@ -16,7 +16,7 @@ pub struct SelfImprovementEngine;
 impl SelfImprovementEngine {
     #[must_use]
     pub fn evaluate_session(sigma: &ConversationState) -> SessionEvaluation {
-        let mut metrics = HashMap::with_capacity(5);
+        let mut metrics = BTreeMap::new();
         metrics.insert("turn_count".to_string(), sigma.turns.len() as f64);
         metrics.insert("convergence_p".to_string(), sigma.completion_probability);
         metrics.insert("cost_spent".to_string(), sigma.budget.spent);
@@ -39,7 +39,7 @@ impl SelfImprovementEngine {
         );
         metrics.insert(
             "cost_efficiency".to_string(),
-            if sigma.budget.spent > 0.0 {
+            if sigma.budget.spent > f64::EPSILON {
                 sigma.completion_probability / sigma.budget.spent
             } else {
                 0.0
@@ -58,9 +58,7 @@ impl SelfImprovementEngine {
 
 #[derive(Debug, Clone)]
 pub struct PerformanceTrendReport {
-    /// EMA value per metric name.
-    pub ema: HashMap<String, f64>,
-    /// Which metrics are trending up vs. down vs. flat.
+    pub ema: BTreeMap<String, f64>,
     pub improving: Vec<String>,
     pub degrading: Vec<String>,
     pub stable: Vec<String>,
@@ -69,37 +67,32 @@ pub struct PerformanceTrendReport {
 pub struct SelfEvaluationTrendAnalyzer;
 
 impl SelfEvaluationTrendAnalyzer {
-    const ALPHA: f64 = 0.3; // EMA smoothing factor
+    const ALPHA: f64 = 0.3;
 
-    /// Compute exponential moving averages for every metric across `evals`
-    /// (oldest first) and classify each metric's trend.
     #[must_use]
     pub fn analyze(evals: &[SessionEvaluation]) -> PerformanceTrendReport {
         if evals.is_empty() {
             return PerformanceTrendReport {
-                ema: HashMap::new(),
+                ema: BTreeMap::new(),
                 improving: vec![],
                 degrading: vec![],
                 stable: vec![],
             };
         }
 
-        // Collect all metric names
-        // BTreeSet for deterministic iteration order across runs.
         let mut all_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for e in evals {
             all_keys.extend(e.metrics.keys().cloned());
         }
 
-        let mut ema: HashMap<String, f64> = HashMap::new();
-        let mut first_values: HashMap<String, f64> = HashMap::new();
+        let mut ema: BTreeMap<String, f64> = BTreeMap::new();
+        let mut first_values: BTreeMap<String, f64> = BTreeMap::new();
 
         for key in &all_keys {
             let mut current_ema: Option<f64> = None;
             let mut first: Option<f64> = None;
             for eval in evals {
                 if let Some(&v) = eval.metrics.get(key) {
-                    // Skip NaN/Inf values to prevent silent propagation through EMA.
                     if !v.is_finite() {
                         continue;
                     }
@@ -132,8 +125,6 @@ impl SelfEvaluationTrendAnalyzer {
                 stable.push(key.clone());
             }
         }
-        // Vecs are already in BTreeSet (sorted) order because we iterated `ema` via sorted keys above,
-        // but ema is a HashMap so sort explicitly for determinism.
         improving.sort();
         degrading.sort();
         stable.sort();
@@ -147,7 +138,6 @@ impl SelfEvaluationTrendAnalyzer {
 pub struct HypothesisGenerator;
 
 impl HypothesisGenerator {
-    /// Generate hypotheses from metrics that show degradation.
     #[must_use]
     pub fn from_trend(report: &PerformanceTrendReport) -> Vec<ImprovementHypothesis> {
         report
@@ -171,7 +161,6 @@ impl HypothesisGenerator {
 pub struct HypothesisPrioritizer;
 
 impl HypothesisPrioritizer {
-    /// Sort hypotheses by `(expected_impact * confidence) / estimated_cost` descending.
     #[must_use]
     pub fn rank(mut hypotheses: Vec<ImprovementHypothesis>) -> Vec<ImprovementHypothesis> {
         hypotheses.sort_by(|a, b| b.priority().total_cmp(&a.priority()));
@@ -194,22 +183,19 @@ pub struct AbTestReport {
 
 #[derive(Debug, Default, Clone)]
 pub struct AbTestManager {
-    pub active_tests: HashMap<String, ImprovementHypothesis>,
+    pub active_tests: BTreeMap<String, ImprovementHypothesis>,
 }
 
 impl AbTestManager {
     #[must_use]
     pub fn new() -> Self {
-        Self { active_tests: HashMap::new() }
+        Self { active_tests: BTreeMap::new() }
     }
 
     pub fn register(&mut self, hypothesis: ImprovementHypothesis) {
         self.active_tests.insert(hypothesis.id.clone(), hypothesis);
     }
 
-    /// Welch's t-test (two-sample, unequal variance).
-    /// Returns `true` when p < 0.05 AND relative effect size > 5 %.
-    /// Uses a conservative piecewise t-critical value that is accurate for n >= 10.
     #[must_use]
     pub fn check_significance(control: &[f64], test: &[f64]) -> bool {
         let n_c = control.len() as f64;
@@ -222,21 +208,16 @@ impl AbTestManager {
         let var_c = control.iter().map(|&x| (x - mean_c).powi(2)).sum::<f64>() / (n_c - 1.0);
         let var_t = test.iter().map(|&x| (x - mean_t).powi(2)).sum::<f64>() / (n_t - 1.0);
         let se = ((var_c / n_c) + (var_t / n_t)).sqrt();
-        if se == 0.0 {
+        if se < f64::EPSILON {
             return false;
         }
         let t_stat = (mean_t - mean_c) / se;
-        // Conservative piecewise t-critical: t_{df, 0.025} for Welch df ≈ min(n_c, n_t) - 1.
-        // n < 15: df ≈ 14 → 2.145; n < 25: df ≈ 24 → 2.064; else converges to 2.00.
         let min_n = n_c.min(n_t);
         let t_critical = if min_n < 15.0 { 2.145 } else if min_n < 25.0 { 2.064 } else { 2.00 };
-        let effect = if mean_c.abs() > f64::EPSILON { (mean_t - mean_c) / mean_c.abs() } else { 0.0 };
+        let effect = (mean_t - mean_c) / mean_c.abs().max(1e-6);
         t_stat > t_critical && effect > 0.05
     }
 
-    /// Evaluate an A/B test, computing the full report with 95 % CI.
-    /// `effect_size` is the relative improvement ((test - control) / |control|) to
-    /// match the significance criterion used in `check_significance`.
     #[must_use]
     pub fn evaluate(hypothesis_id: &str, control: &[f64], test: &[f64]) -> AbTestReport {
         let significant = Self::check_significance(control, test);
@@ -244,8 +225,7 @@ impl AbTestManager {
         let n_t = test.len() as f64;
         let mean_c = if n_c > 0.0 { control.iter().sum::<f64>() / n_c } else { 0.0 };
         let mean_t = if n_t > 0.0 { test.iter().sum::<f64>() / n_t } else { 0.0 };
-        // Relative effect size — consistent with the significance threshold in check_significance.
-        let effect_size = if mean_c.abs() > f64::EPSILON { (mean_t - mean_c) / mean_c.abs() } else { 0.0 };
+        let effect_size = (mean_t - mean_c) / mean_c.abs().max(1e-6);
 
         let se_t = if n_t > 1.0 {
             let var = test.iter().map(|&x| (x - mean_t).powi(2)).sum::<f64>() / (n_t - 1.0);
@@ -272,13 +252,13 @@ impl AbTestManager {
 
 #[derive(Debug, Default, Clone)]
 pub struct PromptLibrary {
-    templates: HashMap<String, PromptTemplate>,
+    templates: BTreeMap<String, PromptTemplate>,
 }
 
 impl PromptLibrary {
     #[must_use]
     pub fn new() -> Self {
-        Self { templates: HashMap::new() }
+        Self { templates: BTreeMap::new() }
     }
 
     pub fn insert(&mut self, template: PromptTemplate) {
@@ -296,7 +276,6 @@ impl PromptLibrary {
         }
     }
 
-    /// Return the template with the highest mean quality score across its history.
     #[must_use]
     pub fn best_for_task(&self, task_type: &str) -> Option<&PromptTemplate> {
         self.templates
@@ -323,8 +302,6 @@ impl StrategyDatabase {
         self.entries.push(entry);
     }
 
-    /// Return the `k` nearest strategies to `query` by squared Euclidean distance,
-    /// sorted closest-first.
     #[must_use]
     pub fn knn(&self, query: &[f64], k: usize) -> Vec<&StrategyEntry> {
         let mut scored: Vec<(&StrategyEntry, f64)> = self
@@ -332,7 +309,7 @@ impl StrategyDatabase {
             .iter()
             .map(|e| (e, e.distance_sq(query)))
             .collect();
-        scored.sort_by(|(_, a), (_, b)| a.total_cmp(b));
+        scored.sort_unstable_by(|(_, a), (_, b)| a.total_cmp(b));
         scored.into_iter().take(k).map(|(e, _)| e).collect()
     }
 }
@@ -342,10 +319,6 @@ impl StrategyDatabase {
 pub struct PostMortemGenerator;
 
 impl PostMortemGenerator {
-    /// Generate a post-mortem when failure rate > 10 %.
-    ///
-    /// Identifies the first failing turn and classifies the root cause by
-    /// inspecting turn content for common error patterns.
     #[must_use]
     pub fn generate(sigma: &ConversationState) -> Option<PostMortem> {
         let total = sigma.turns.len();
@@ -370,10 +343,11 @@ impl PostMortemGenerator {
             return None;
         }
 
+        let failure_set: std::collections::HashSet<u32> = failures.iter().copied().collect();
         let first_failure = sigma
             .turns
             .iter()
-            .find(|t| failures.contains(&t.index))
+            .find(|t| failure_set.contains(&t.index))
             .map(|t| t.content.as_str())
             .unwrap_or("");
 
@@ -416,7 +390,6 @@ impl CalibrationTracker {
         self.records.push(rec);
     }
 
-    /// Expected Calibration Error over all records: mean absolute prediction error.
     #[must_use]
     pub fn ece(&self) -> f64 {
         if self.records.is_empty() {
@@ -430,7 +403,6 @@ impl CalibrationTracker {
         sum / self.records.len() as f64
     }
 
-    /// Returns `true` when ECE exceeds 10 % — recalibration needed.
     #[must_use]
     pub fn needs_recalibration(&self) -> bool {
         self.ece() > 0.10
@@ -441,13 +413,13 @@ impl CalibrationTracker {
 
 #[derive(Debug, Default, Clone)]
 pub struct ErrorBudgetLedger {
-    budgets: HashMap<String, ErrorBudget>,
+    budgets: BTreeMap<String, ErrorBudget>,
 }
 
 impl ErrorBudgetLedger {
     #[must_use]
     pub fn new() -> Self {
-        Self { budgets: HashMap::new() }
+        Self { budgets: BTreeMap::new() }
     }
 
     pub fn set_budget(&mut self, task_type: &str, allowed_rate: f64) {
@@ -463,21 +435,25 @@ impl ErrorBudgetLedger {
         );
     }
 
-    /// Record an outcome for `task_type`. `failed` = true when the turn failed.
     pub fn record_outcome(&mut self, task_type: &str, failed: bool) {
         let Some(budget) = self.budgets.get_mut(task_type) else {
             return;
         };
-        let alpha = 0.1; // EMA smoothing
+        if budget.allowed_rate < f64::EPSILON {
+            budget.enforcement_level = EnforcementLevel::Suspended;
+            budget.budget_remaining = 0.0;
+            return;
+        }
+        let alpha = 0.1;
         let obs = if failed { 1.0 } else { 0.0 };
         budget.actual_rate = alpha * obs + (1.0 - alpha) * budget.actual_rate;
         budget.budget_remaining =
-            ((budget.allowed_rate - budget.actual_rate) / budget.allowed_rate.max(f64::EPSILON))
+            ((budget.allowed_rate - budget.actual_rate) / budget.allowed_rate)
                 .clamp(0.0, 1.0);
-        budget.enforcement_level = if budget.budget_remaining < 0.2 {
-            EnforcementLevel::Strict
-        } else if budget.budget_remaining == 0.0 {
+        budget.enforcement_level = if budget.budget_remaining < f64::EPSILON {
             EnforcementLevel::Suspended
+        } else if budget.budget_remaining < 0.2 {
+            EnforcementLevel::Strict
         } else {
             EnforcementLevel::Normal
         };
@@ -502,7 +478,6 @@ impl BenchmarkSuite {
         Self { tasks: vec![] }
     }
 
-    /// Populate the suite with a representative set of 20 standardised tasks.
     #[must_use]
     pub fn with_standard_tasks() -> Self {
         let mut suite = Self::new();
@@ -561,7 +536,6 @@ impl BenchmarkSuite {
 pub struct DegradationHandler;
 
 impl DegradationHandler {
-    /// Default strategy table: maps each trigger to its preferred response.
     #[must_use]
     pub fn default_strategies() -> Vec<DegradationStrategy> {
         vec![
@@ -584,7 +558,6 @@ impl DegradationHandler {
         ]
     }
 
-    /// Resolve a trigger to its response using the provided strategy table.
     #[must_use]
     pub fn resolve(
         trigger: DegradationTrigger,
@@ -607,12 +580,6 @@ pub struct ContinuousLearner<'a> {
 }
 
 impl<'a> ContinuousLearner<'a> {
-    /// Run the post-session learning pipeline synchronously.
-    ///
-    /// Steps (in dependency order):
-    /// 1. Evaluate session and record a calibration observation.
-    /// 2. Record the session outcome in the error budget ledger.
-    /// 3. Record prompt quality for any templates used.
     pub fn run(
         &mut self,
         sigma: &ConversationState,
@@ -672,16 +639,10 @@ impl SafetyInterlock {
 pub struct SelfCodeModifier;
 
 impl SelfCodeModifier {
-    // Only patterns that are unambiguous token-level substitutions safe to apply
-    // via string replace. Patterns that require AST context (e.g. "&String" which
-    // appears in string literals and comments, or collect→iter which breaks non-Vec
-    // iterators) have been removed until tree-sitter-based transforms are available.
     const PATTERNS: &'static [(&'static str, &'static str)] = &[
         (".unwrap_or_else(|_| panic!())", ".unwrap()"),
     ];
 
-    /// Scan `current_content` for known sub-optimal patterns and return the
-    /// improved version, or an error if the file is protected or nothing matched.
     pub fn propose_improvement(file_path: &str, current_content: &str) -> Result<String> {
         if !SafetyInterlock::is_modification_allowed(file_path) {
             return Err(anyhow!("Modification rejected: {} is a protected file", file_path));
@@ -701,8 +662,6 @@ impl SelfCodeModifier {
         }
     }
 
-    /// Verify a proposed modification compiles by checking that it parses as valid UTF-8
-    /// and that safety interlocks are satisfied. Returns the diff character count on success.
     pub fn verify(file_path: &str, original: &str, proposed: &str) -> Result<usize> {
         if !SafetyInterlock::is_modification_allowed(file_path) {
             return Err(anyhow!("Verification rejected: {} is protected", file_path));
@@ -735,7 +694,6 @@ impl PromptEvolutionaryOptimizer {
         PromptMutation::InjectExamples,
     ];
 
-    /// Apply a single mutation to `template`, returning the mutated copy.
     #[must_use]
     pub fn mutate(template: &PromptTemplate, mutation: PromptMutation) -> PromptTemplate {
         let mut m = template.clone();
@@ -760,13 +718,11 @@ impl PromptEvolutionaryOptimizer {
         m
     }
 
-    /// Generate one mutant per mutation strategy from `parent`.
     #[must_use]
     pub fn generate_variants(parent: &PromptTemplate) -> Vec<PromptTemplate> {
         Self::MUTATIONS.iter().map(|&m| Self::mutate(parent, m)).collect()
     }
 
-    /// Tournament selection: return the template with the highest mean quality.
     #[must_use]
     pub fn select_winner(candidates: &[PromptTemplate]) -> Option<&PromptTemplate> {
         candidates.iter().max_by(|a, b| a.mean_quality().total_cmp(&b.mean_quality()))
@@ -778,9 +734,6 @@ impl PromptEvolutionaryOptimizer {
 pub struct CalibrationAdjuster;
 
 impl CalibrationAdjuster {
-    /// Fit a linear Platt scaling correction: `calibrated = a * raw + b`.
-    /// Uses ordinary least squares on (predicted_outcome, actual_outcome) pairs.
-    /// Returns `(a, b)` or `(1.0, 0.0)` when there is insufficient data.
     #[must_use]
     pub fn fit_platt(records: &[CalibrationRecord]) -> (f64, f64) {
         let n = records.len() as f64;
@@ -800,7 +753,6 @@ impl CalibrationAdjuster {
         (a, b)
     }
 
-    /// Apply the fitted correction to a raw predicted probability.
     #[must_use]
     pub fn apply(raw: f64, a: f64, b: f64) -> f64 {
         (a * raw + b).clamp(0.0, 1.0)
@@ -811,7 +763,7 @@ impl CalibrationAdjuster {
 
 #[derive(Debug, Default, Clone)]
 pub struct BenchmarkRegressionGuard {
-    baseline: HashMap<String, f64>,
+    baseline: BTreeMap<String, f64>,
 }
 
 impl BenchmarkRegressionGuard {
@@ -822,14 +774,10 @@ impl BenchmarkRegressionGuard {
         Self::default()
     }
 
-    /// Record the baseline score for a task before any modification.
     pub fn set_baseline(&mut self, task_id: &str, score: f64) {
         self.baseline.insert(task_id.to_string(), score);
     }
 
-    /// Compare `results` against the stored baseline.
-    /// Returns `Ok(())` when no task regresses by more than 5%.
-    /// Returns `Err` listing the regressing task IDs.
     pub fn check(&self, results: &[BenchmarkResult]) -> Result<()> {
         let regressions: Vec<String> = results
             .iter()
@@ -860,8 +808,6 @@ impl BenchmarkRegressionGuard {
 pub struct PostMortemLearner;
 
 impl PostMortemLearner {
-    /// Apply lessons from a post-mortem: update the prompt library and strategy
-    /// database so the same failure is less likely to recur.
     pub fn apply(
         mortem: &PostMortem,
         library: &mut PromptLibrary,
@@ -909,14 +855,14 @@ impl PostMortemLearner {
 
 #[derive(Debug, Default, Clone)]
 pub struct RuntimeParameterAdjuster {
-    pub parameters: HashMap<String, f64>,
+    pub parameters: BTreeMap<String, f64>,
     pub history: Vec<ParameterAdjustment>,
 }
 
 impl RuntimeParameterAdjuster {
     #[must_use]
     pub fn new() -> Self {
-        let mut params = HashMap::new();
+        let mut params = BTreeMap::new();
         params.insert("min_quality_score".to_string(), 0.5);
         params.insert("convergence_threshold".to_string(), 0.98);
         params.insert("regression_alert_ratio".to_string(), 0.9);
@@ -924,7 +870,6 @@ impl RuntimeParameterAdjuster {
         Self { parameters: params, history: vec![] }
     }
 
-    /// Adjust `parameter` to `new_value` if the A/B report shows significant improvement.
     pub fn apply_if_significant(
         &mut self,
         parameter: &str,
@@ -961,19 +906,22 @@ impl RuntimeParameterAdjuster {
 pub struct ProgressReporter;
 
 impl ProgressReporter {
-    /// Build a progress report from `sigma`, given an `expected_turns` budget.
     #[must_use]
     pub fn report(sigma: &ConversationState, expected_turns: u32) -> ProgressReport {
         let completed = sigma.turns.len() as u32;
         let p = sigma.completion_probability;
 
-        // Estimate velocity from the last two turns' contribution to completion probability.
-        // Uses the per-turn average only when we have enough data; avoids the error of
-        // dividing the current P by total turns (which assumes P started at 0).
-        let estimated_remaining = if p > 0.0 && p < 1.0 && completed >= 2 {
-            let velocity = p / completed as f64;
-            if velocity > 0.0 {
-                Some(((1.0 - p) / velocity).ceil() as u32)
+        // Exponential decay model for completion prediction:
+        // P(t) = 1 - exp(-k * t)
+        // k = -ln(1 - P) / t
+        let estimated_remaining = if p > 0.01 && p < 0.99 && completed >= 2 {
+            let k = -(1.0 - p).ln() / completed as f64;
+            if k > f64::EPSILON {
+                // To find t_final where P(t_final) = 0.999 (effective completion):
+                // 0.999 = 1 - exp(-k * t_final) => exp(-k * t_final) = 0.001
+                // -k * t_final = ln(0.001) => t_final = -ln(0.001) / k
+                let t_final = -0.001f64.ln() / k;
+                Some((t_final.ceil() as u32).saturating_sub(completed))
             } else {
                 None
             }
@@ -1029,7 +977,6 @@ impl LearningEffectivenessMonitor {
         });
     }
 
-    /// Mean improvement delta across all recorded outcomes.
     #[must_use]
     pub fn mean_delta(&self) -> f64 {
         if self.outcomes.is_empty() {
@@ -1038,7 +985,6 @@ impl LearningEffectivenessMonitor {
         self.outcomes.iter().map(|o| o.delta()).sum::<f64>() / self.outcomes.len() as f64
     }
 
-    /// Outcomes where `after > before`.
     #[must_use]
     pub fn effective_actions(&self) -> Vec<&LearningOutcome> {
         self.outcomes.iter().filter(|o| o.delta() > 0.0).collect()
@@ -1050,7 +996,6 @@ impl LearningEffectivenessMonitor {
 pub struct EscalationContextBuilder;
 
 impl EscalationContextBuilder {
-    /// Build a `HandoffPackage` summarising why the session failed and what was tried.
     #[must_use]
     pub fn build(
         sigma: &ConversationState,
@@ -1112,6 +1057,144 @@ impl EscalationContextBuilder {
             last_successful_turn: last_successful,
             recommended_next_action: recommended.to_string(),
             context_snapshot,
+        }
+    }
+}
+
+// ── FileWriter ────────────────────────────────────────────────────────────────
+
+const BLOCKED_FILENAMES: &[&str] = &[
+    ".env", ".env.local", ".env.production", "Cargo.lock",
+    ".gitignore", ".git-credentials", "id_rsa", "id_ed25519",
+];
+const BLOCKED_DIRS: &[&str] = &[".git", "target", ".cargo", ".ssh"];
+const ALLOWED_EXTENSIONS: &[&str] = &[
+    "rs", "toml", "md", "json", "yaml", "yml", "sh", "txt",
+];
+
+pub enum WriteOutcome {
+    /// File was written (and passed `cargo check`).
+    Written(std::path::PathBuf),
+    /// Write was skipped due to a safety gate.
+    Skipped(&'static str),
+    /// File was written but `cargo check` failed; original restored.
+    VerificationFailed(String),
+}
+
+pub struct FileWriter {
+    root: std::path::PathBuf,
+}
+
+impl FileWriter {
+    pub fn new(root: std::path::PathBuf) -> Self {
+        Self { root }
+    }
+
+    pub fn from_env() -> Self {
+        let root = std::env::var("CROSSTALK_PROJECT_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
+        Self { root }
+    }
+
+    pub async fn write_artifact(&self, name: &str, content: &str) -> Result<WriteOutcome> {
+        let rel = std::path::Path::new(name);
+
+        if rel.is_absolute() {
+            return Ok(WriteOutcome::Skipped("absolute path rejected"));
+        }
+        for component in rel.components() {
+            if matches!(component, std::path::Component::ParentDir) {
+                return Ok(WriteOutcome::Skipped("path traversal rejected"));
+            }
+        }
+
+        let ext = match rel.extension().and_then(|e| e.to_str()) {
+            Some(e) => e,
+            None => return Ok(WriteOutcome::Skipped("no file extension")),
+        };
+        if !ALLOWED_EXTENSIONS.contains(&ext) {
+            return Ok(WriteOutcome::Skipped("extension not in allowlist"));
+        }
+
+        if let Some(fname) = rel.file_name().and_then(|n| n.to_str())
+            && BLOCKED_FILENAMES.contains(&fname)
+        {
+            return Ok(WriteOutcome::Skipped("blocked filename"));
+        }
+
+        for component in rel.components() {
+            if let std::path::Component::Normal(c) = component
+                && let Some(s) = c.to_str()
+                && BLOCKED_DIRS.contains(&s)
+            {
+                return Ok(WriteOutcome::Skipped("blocked directory"));
+            }
+        }
+
+        if !SafetyInterlock::is_modification_allowed(name) {
+            return Ok(WriteOutcome::Skipped("SafetyInterlock: protected file"));
+        }
+
+        let abs_path = self.root.join(rel);
+
+        if let Some(parent) = abs_path.parent() {
+            std::fs::create_dir_all(parent)?;
+            // After directory creation, canonicalize parent to detect symlink escapes
+            let canonical_parent = std::fs::canonicalize(parent)?;
+            let canonical_root = std::fs::canonicalize(&self.root)?;
+            if !canonical_parent.starts_with(&canonical_root) {
+                return Ok(WriteOutcome::Skipped("symlink escape detected"));
+            }
+        }
+
+        // Back up the original so we can restore on verification failure.
+        let backup_path = abs_path.with_extension(format!("{ext}.crosstalk_bak"));
+        let had_original = abs_path.exists();
+        if had_original {
+            std::fs::copy(&abs_path, &backup_path)?;
+        }
+
+        // Atomic write: temp → rename.
+        let tmp_path = abs_path.with_extension(format!("{ext}.crosstalk_tmp"));
+        std::fs::write(&tmp_path, content.as_bytes())?;
+        std::fs::rename(&tmp_path, &abs_path)?;
+
+        // Verify the project still compiles.
+        let check = tokio::process::Command::new("cargo")
+            .args(["check", "--quiet", "--message-format=short"])
+            .current_dir(&self.root)
+            .output()
+            .await;
+
+        match check {
+            Ok(out) if out.status.success() => {
+                let _ = std::fs::remove_file(&backup_path);
+                Ok(WriteOutcome::Written(abs_path))
+            }
+            Ok(out) => {
+                // Restore original.
+                if had_original {
+                    let _ = std::fs::copy(&backup_path, &abs_path);
+                    let _ = std::fs::remove_file(&backup_path);
+                } else {
+                    let _ = std::fs::remove_file(&abs_path);
+                }
+                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                Ok(WriteOutcome::VerificationFailed(stderr))
+            }
+            Err(e) => {
+                // Can't run cargo — restore and propagate.
+                if had_original {
+                    let _ = std::fs::copy(&backup_path, &abs_path);
+                    let _ = std::fs::remove_file(&backup_path);
+                } else {
+                    let _ = std::fs::remove_file(&abs_path);
+                }
+                Err(anyhow::anyhow!("cargo check failed to launch: {e}"))
+            }
         }
     }
 }

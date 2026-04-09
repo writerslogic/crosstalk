@@ -14,15 +14,14 @@ impl HashChain {
     /// Replaces non-deterministic JSON with Bincode (Note: Ensure ConversationState uses BTreeMap, not HashMap).
     pub fn compute(sigma: &ConversationState, previous_hash: &[u8; 32]) -> Result<[u8; 32]> {
         let mut hasher = Sha256::new();
-        
-        // Bincode is a binary format that avoids whitespace variance and JSON key-ordering issues,
-        // provided the underlying data structures are deterministic (Vectors and BTreeMaps).
-        let serialized = bincode::serialize(sigma)
+        // Zero state_hash before serializing to break the circular dependency.
+        // The hash is a commitment over state content, not over itself.
+        let mut sigma_for_hash = sigma.clone();
+        sigma_for_hash.state_hash = [0u8; 32];
+        let serialized = bincode::serialize(&sigma_for_hash)
             .context("Failed to deterministically serialize state for hashing")?;
-            
         hasher.update(&serialized);
         hasher.update(previous_hash);
-        
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&hasher.finalize());
         Ok(hash)
@@ -68,6 +67,35 @@ impl InvariantChecker {
 
         Ok(())
     }
+
+    /// Triggers formal verification of core invariants using Verus.
+    /// This executes 'verus' on the specification files in the verus/ directory.
+    /// Returns Ok(()) if verification passes, or an error with Verus output if it fails.
+    pub async fn verify_all_with_verus() -> Result<()> {
+        let proof_files = ["verus/state.rs", "verus/hash_chain.rs", "verus/invariant_checker.rs"];
+        
+        for file in proof_files {
+            if !Path::new(file).exists() {
+                return Err(anyhow!("Verus proof file not found: {}", file));
+            }
+            
+            let output = tokio::process::Command::new("verus")
+                .arg(file)
+                .output()
+                .await
+                .context("Failed to execute verus binary. Ensure verus is in PATH.")?;
+            
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                return Err(anyhow!(
+                    "Verus verification failed for {}:\nSTDOUT: {}\nSTDERR: {}",
+                    file, stdout, stderr
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -83,7 +111,7 @@ pub struct ContinuousAuditor;
 impl ContinuousAuditor {
     /// Spawns a lock-free background actor.
     /// Removes the Arc<Mutex<Receiver>> anti-pattern to ensure zero-contention channel processing.
-    pub fn spawn(alert_tx: mpsc::Sender<AuditAlert>) -> mpsc::Sender<ConversationState> {
+    pub fn spawn(alert_tx: mpsc::UnboundedSender<AuditAlert>) -> mpsc::Sender<ConversationState> {
         let (tx, mut rx) = mpsc::channel::<ConversationState>(100);
 
         // The Receiver is moved directly into the spawned task, granting it exclusive ownership.
@@ -101,7 +129,7 @@ impl ContinuousAuditor {
                             expected_hash: _expected,
                             actual_hash: sigma.state_hash,
                             timestamp: ConversationState::now(),
-                        }).await;
+                        });
                         // Do NOT update last_hash; preserve last valid anchor
                     }
                     Err(_) => {}
@@ -113,6 +141,8 @@ impl ContinuousAuditor {
     }
 }
 
+const TAUTOLOGY_SIMILARITY_THRESHOLD: f64 = 0.95;
+
 pub struct TautologyFilter;
 
 impl TautologyFilter {
@@ -120,7 +150,7 @@ impl TautologyFilter {
     /// against prior historical turns.
     pub fn is_tautological(content: &str, history: &[String]) -> bool {
         let content_trimmed = content.trim();
-        
+
         // Fast-path identical check
         for prev in history {
             if content_trimmed == prev.trim() {
@@ -140,7 +170,9 @@ impl TautologyFilter {
             let vec_prev = Self::get_3gram_freq(prev);
             let mag_prev = vec_prev.values().map(|f| f * f).sum::<f64>().sqrt();
 
-            if mag_prev == 0.0 { continue; }
+            if mag_prev == 0.0 {
+                continue;
+            }
 
             let mut dot_product = 0.0;
             for (gram, freq) in &vec_new {
@@ -150,9 +182,8 @@ impl TautologyFilter {
             }
 
             let similarity = dot_product / (mag_new * mag_prev);
-            
-            // If the agent is generating text that is 95% structurally identical, it is looping.
-            if similarity > 0.95 {
+
+            if similarity > TAUTOLOGY_SIMILARITY_THRESHOLD {
                 return true;
             }
         }

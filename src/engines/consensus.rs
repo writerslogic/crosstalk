@@ -38,20 +38,18 @@ impl CertaintyAnalyzer {
         ];
 
         let content_lower = content.to_lowercase();
-        let mut score: f64 = 0.7;
 
-        for term in hedging_terms {
-            if content_lower.contains(term) {
-                score -= 0.1;
-            }
-        }
-        for term in strong_terms {
-            if content_lower.contains(term) {
-                score += 0.05;
-            }
-        }
+        let hedging_count = hedging_terms.iter().filter(|&&t| content_lower.contains(t)).count();
+        let hedging_penalty = (hedging_count.min(4) as f64) * 0.1;
 
-        score -= volatility * 0.2;
+        let strong_bonus: f64 = strong_terms
+            .iter()
+            .filter(|&&t| content_lower.contains(t))
+            .count() as f64
+            * 0.05;
+
+        let adj_volatility = volatility.clamp(0.0, 1.0);
+        let score = 0.7 - hedging_penalty + strong_bonus - adj_volatility * 0.2;
         score.clamp(0.1, 1.0)
     }
 }
@@ -117,6 +115,14 @@ impl NashSolver {
                     accepted: false,
                 });
             }
+
+            let round_converged = current_resolutions.windows(2).all(|w| w[0] == w[1]);
+            if round_converged {
+                for r in rounds.iter_mut().filter(|r| r.round_index == round as u32) {
+                    r.accepted = true;
+                }
+                break;
+            }
             prev_resolutions = current_resolutions;
         }
 
@@ -160,23 +166,28 @@ impl NashSolver {
                 .map(|(_, _, t)| t.to_string())
                 .unwrap_or_default(),
             ResolutionStrategy::Mediation => {
-                let all_words: Vec<Vec<&str>> = proposals
+                if proposals.is_empty() {
+                    return String::new();
+                }
+
+                let all_words: Vec<std::collections::HashSet<&str>> = proposals
                     .iter()
                     .map(|(_, _, t)| t.split_whitespace().collect())
                     .collect();
-                let common: Vec<&&str> = if let Some(first) = all_words.first() {
-                    first
-                        .iter()
-                        .filter(|w| all_words.iter().all(|words| words.contains(w)))
-                        .collect()
-                } else {
-                    vec![]
-                };
-                if common.is_empty() {
-                    proposals[0].2.to_string()
-                } else {
-                    common.iter().map(|w| **w).collect::<Vec<_>>().join(" ")
-                }
+
+                // Return the proposal with the most overlap with all others (most central).
+                proposals
+                    .iter()
+                    .max_by_key(|(_, _, t)| {
+                        let words: std::collections::HashSet<&str> =
+                            t.split_whitespace().collect();
+                        all_words
+                            .iter()
+                            .map(|other| words.intersection(other).count())
+                            .sum::<usize>()
+                    })
+                    .map(|(_, _, t)| t.to_string())
+                    .unwrap_or_default()
             }
         }
     }
@@ -215,6 +226,9 @@ pub struct KalmanConvergence {
 }
 
 impl KalmanConvergence {
+    const PROCESS_NOISE: f64 = 0.01;
+    const MEASUREMENT_NOISE: f64 = 0.1;
+
     #[must_use]
     pub fn new(initial_p: f64) -> Self {
         Self {
@@ -228,18 +242,16 @@ impl KalmanConvergence {
     ///
     /// Returns the updated `p_c` estimate.
     pub fn update(&mut self, measurement: f64) -> f64 {
-        const PROCESS_NOISE: f64 = 0.01;
-        const MEASUREMENT_NOISE: f64 = 0.1;
-
         // Predict step: propagate variance forward.
-        self.variance += PROCESS_NOISE;
+        self.variance += Self::PROCESS_NOISE;
 
         // Update step.
-        let innovation_covariance = self.variance + MEASUREMENT_NOISE;
+        let innovation_covariance = self.variance + Self::MEASUREMENT_NOISE;
         let kalman_gain = self.variance / innovation_covariance;
         self.innovation = measurement - self.p_c;
         self.p_c += kalman_gain * self.innovation;
         self.variance *= 1.0 - kalman_gain;
+        self.variance = self.variance.max(1e-10);
 
         self.p_c.clamp(0.0, 1.0)
     }
@@ -267,7 +279,7 @@ impl InfluenceWeightManager {
     /// Compute weights using a flat average of certainty × outcome factor.
     /// Delegates to `calculate_weights_with_recency` with a 0.9 decay factor.
     #[must_use]
-    pub fn calculate_weights(sigma: &ConversationState) -> HashMap<String, f64> {
+    pub fn calculate_weights(sigma: &ConversationState) -> std::collections::BTreeMap<String, f64> {
         Self::calculate_weights_with_recency(sigma, 0.9)
     }
 
@@ -280,9 +292,9 @@ impl InfluenceWeightManager {
     pub fn calculate_weights_with_recency(
         sigma: &ConversationState,
         decay: f64,
-    ) -> HashMap<String, f64> {
+    ) -> std::collections::BTreeMap<String, f64> {
         let n = sigma.turns.len();
-        let mut agent_stats: HashMap<String, (f64, f64)> = HashMap::new();
+        let mut agent_stats: std::collections::BTreeMap<String, (f64, f64)> = std::collections::BTreeMap::new();
 
         for (i, turn) in sigma.turns.iter().enumerate() {
             let steps_ago = (n - 1).saturating_sub(i);
@@ -327,7 +339,7 @@ impl InfluenceWeightManager {
 
     /// Return agents sorted by weight descending, highest-influence first.
     #[must_use]
-    pub fn rank(weights: &HashMap<String, f64>) -> Vec<(String, f64)> {
+    pub fn rank(weights: &std::collections::BTreeMap<String, f64>) -> Vec<(String, f64)> {
         let mut sorted: Vec<(String, f64)> = weights
             .iter()
             .map(|(k, v)| (k.clone(), *v))
@@ -358,7 +370,7 @@ impl PayoffCalculator {
 
         let base = if has_metrics {
             let complexity_penalty = (m.cyclomatic_complexity as f64 * 0.015).min(0.25);
-            let coupling_penalty = (m.coupling as f64 * 0.008).min(0.15);
+            let coupling_penalty = (m.coupling_factor as f64 * 0.008).min(0.15);
             let comment_bonus = (m.comment_density * 0.15).min(0.12);
             let size_bonus = (m.line_count as f64 / 600.0).min(0.12);
             0.65 + comment_bonus + size_bonus - complexity_penalty - coupling_penalty

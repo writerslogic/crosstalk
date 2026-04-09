@@ -1,6 +1,7 @@
 use crate::types::consensus::MergeVote;
 use crate::types::conversation::Turn;
 use anyhow::{anyhow, Result};
+use crossbeam::deque::{Injector, Steal, Worker};
 use dashmap::DashMap;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,7 @@ pub enum NodeStatus {
     WaitingMerge,
     Complete,
     Failed,
+    Idle,
 }
 
 /// A simulated network interface for Raft peer-to-peer communication.
@@ -40,6 +42,7 @@ pub struct SwarmController {
     pub nodes: Arc<DashMap<NodeId, NodeStatus>>,
     pub state_tx: broadcast::Sender<Turn>,
     pub work_notify: Arc<Notify>,
+    pub task_queue: Arc<Injector<SubTask>>,
     task_spawner: mpsc::Sender<tokio::task::JoinHandle<()>>,
 }
 
@@ -69,17 +72,19 @@ impl SwarmController {
             nodes: Arc::new(DashMap::new()),
             state_tx,
             work_notify: Arc::new(Notify::new()),
+            task_queue: Arc::new(Injector::new()),
             task_spawner,
         }
     }
 
-    /// Spawns a node with a fully implemented, event-driven worker loop.
+    /// Spawns a node with a fully implemented, event-driven worker loop and work-stealing support.
     pub async fn spawn_node(&self, node_id: impl Into<NodeId>) -> Result<()> {
         let id: NodeId = node_id.into();
         self.nodes.insert(Arc::clone(&id), NodeStatus::Spawning);
 
         let nodes_ref = Arc::clone(&self.nodes);
         let id_clone = Arc::clone(&id);
+        let injector = Arc::clone(&self.task_queue);
         
         // Subscribe to the global turn broadcaster before spawning
         let mut turn_rx = self.state_tx.subscribe();
@@ -87,20 +92,40 @@ impl SwarmController {
 
         let worker_handle = tokio::spawn(async move {
             nodes_ref.insert(id_clone.clone(), NodeStatus::Running);
+            let local_queue = Worker::new_fifo();
 
-            // WORKER LOOP: Actively listen for global turns and local notifications
+            // WORKER LOOP: Actively listen for global turns, local notifications, and steal tasks
             loop {
+                // Attempt to pull a task from global injector or steal from peers (simplified)
+                let task = local_queue.pop().or_else(|| {
+                    match injector.steal_batch_and_pop(&local_queue) {
+                        Steal::Success(t) => Some(t),
+                        _ => None,
+                    }
+                });
+
+                if let Some(sub_task) = task {
+                    nodes_ref.insert(id_clone.clone(), NodeStatus::Running);
+                    // Process the sub-task
+                    tokio::time::sleep(Duration::from_millis(100 * sub_task.estimated_turns as u64)).await;
+                    nodes_ref.insert(id_clone.clone(), NodeStatus::WaitingMerge);
+                    continue;
+                }
+
+                nodes_ref.insert(id_clone.clone(), NodeStatus::Idle);
+
                 tokio::select! {
                     // 1. Process incoming turns from the Swarm
                     Ok(_turn) = turn_rx.recv() => {
                         // Simulate heavy distributed workload
                         tokio::time::sleep(Duration::from_millis(50)).await;
-
                         nodes_ref.insert(id_clone.clone(), NodeStatus::WaitingMerge);
                     }
 
-                    // 2. React to out-of-band network notifications
-                    _ = notify_ref.notified() => {}
+                    // 2. React to out-of-band network notifications or work availability
+                    _ = notify_ref.notified() => {
+                        // Continue to next loop iteration to attempt task stealing
+                    }
 
                     // 3. Graceful shutdown condition (e.g., channel closed)
                     else => {
@@ -116,6 +141,13 @@ impl SwarmController {
             .send(worker_handle)
             .await
             .map_err(|_| anyhow!("Critical: Swarm Supervisor died"))
+    }
+
+    pub fn submit_tasks(&self, tasks: Vec<SubTask>) {
+        for task in tasks {
+            self.task_queue.push(task);
+        }
+        self.work_notify.notify_waiters();
     }
 
     pub fn broadcast_turn(&self, turn: Turn) -> Result<usize> {
@@ -291,7 +323,7 @@ impl AgentAssigner {
         }
         let best_agent = capabilities
             .iter()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(id, _)| id.clone())
             .unwrap_or_default();
 
@@ -314,7 +346,7 @@ impl AgentAssigner {
                     .get(&t.id)
                     .and_then(|caps| {
                         caps.iter()
-                            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                            .max_by(|a, b| a.1.total_cmp(b.1))
                             .map(|(id, _)| id.clone())
                     })
                     .unwrap_or_default();
@@ -390,6 +422,7 @@ impl ProgressMonitor {
 
         for entry in nodes.iter() {
             match entry.value() {
+                NodeStatus::Idle => {},
                 NodeStatus::Running | NodeStatus::Spawning => running += 1,
                 NodeStatus::WaitingMerge => waiting_merge += 1,
                 NodeStatus::Complete => complete += 1,

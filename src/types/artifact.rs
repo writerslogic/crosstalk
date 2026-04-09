@@ -1,8 +1,10 @@
 use crate::engines::quality::ArtifactMetrics;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+/// A versioned, language-tagged code artifact tracked across session turns.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Artifact {
     pub name: String,
     pub language: String,
@@ -10,7 +12,7 @@ pub struct Artifact {
     pub version: u32,
     pub history: Vec<ArtifactDiff>,
     #[serde(default)]
-    pub ast_versions: HashMap<String, Vec<(u32, String)>>,
+    pub ast_versions: BTreeMap<String, Vec<(u32, String)>>,
     #[serde(default)]
     pub proof_attachments: Vec<ProofAttachment>,
     #[serde(default)]
@@ -19,6 +21,7 @@ pub struct Artifact {
     pub skeleton: String,
 }
 
+/// A unified-diff record capturing the change between two artifact versions.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ArtifactDiff {
     pub original_version: u32,
@@ -26,6 +29,19 @@ pub struct ArtifactDiff {
     pub diff_text: String,
 }
 
+impl ArtifactDiff {
+    pub fn validate(&self) -> Result<()> {
+        if self.diff_text.len() > 1024 * 1024 {
+            return Err(anyhow!("diff_text exceeds 1MB limit"));
+        }
+        if self.diff_text.contains('\0') {
+            return Err(anyhow!("diff_text contains null bytes"));
+        }
+        Ok(())
+    }
+}
+
+/// A Verus proof result attached to an artifact, recording which properties were verified.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProofAttachment {
     pub artifact_name: String,

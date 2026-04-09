@@ -1,7 +1,8 @@
 use crate::types::conversation::TurnOutcome;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
+/// A single turn stored in the LanceDB vector table for semantic recall.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MemoryRecord {
     pub turn_id: u32,
@@ -79,7 +80,7 @@ pub struct SessionContext {
     pub last_recall_time: Option<u64>,
     pub linked_sessions: Vec<String>,
     pub total_turns: u32,
-    pub outcome_summary: HashMap<TurnOutcome, u32>,
+    pub outcome_summary: BTreeMap<TurnOutcome, u32>,
 }
 
 impl SessionContext {
@@ -95,7 +96,7 @@ impl SessionContext {
             last_recall_time: None,
             linked_sessions: Vec::new(),
             total_turns: 0,
-            outcome_summary: HashMap::new(),
+            outcome_summary: BTreeMap::new(),
         }
     }
 
@@ -105,6 +106,9 @@ impl SessionContext {
     }
 
     pub fn link_session(&mut self, prior_session_id: &str) {
+        if self.linked_sessions.len() >= 100 {
+            return;
+        }
         if !self.linked_sessions.contains(&prior_session_id.to_string()) {
             self.linked_sessions.push(prior_session_id.to_string());
         }
