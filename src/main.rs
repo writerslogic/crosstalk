@@ -160,16 +160,20 @@ async fn main() -> anyhow::Result<()> {
     io::stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-    // 8. Main TUI render loop
+    // 9. Main TUI render loop with signal handling
+    let sigterm = tokio::signal::ctrl_c();
+    tokio::pin!(sigterm);
     loop {
+        tokio::select! {
+            _ = &mut sigterm => break,
+            _ = tokio::time::sleep(Duration::from_millis(16)) => {}
+        }
         let mut app_guard = app.lock().await;
         if app_guard.shutdown {
             break;
         }
         app_guard.tick_fps();
         terminal.draw(|f| render::draw(f, &app_guard))?;
-        drop(app_guard);
-        tokio::time::sleep(Duration::from_millis(16)).await;
     }
 
     disable_raw_mode()?;
