@@ -5,7 +5,7 @@ use anyhow::Result;
 use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sysinfo::System;
 use tokio::sync::{Semaphore, broadcast};
 
@@ -351,5 +351,37 @@ impl BatchScheduler {
     #[must_use]
     pub fn available_permits(&self) -> usize {
         self.semaphore.available_permits()
+    }
+}
+
+pub struct RequestRateLimiter {
+    requests_per_minute: u32,
+    timestamps: HashMap<String, Vec<Instant>>,
+}
+
+impl RequestRateLimiter {
+    pub fn new(requests_per_minute: u32) -> Self {
+        Self {
+            requests_per_minute,
+            timestamps: HashMap::new(),
+        }
+    }
+
+    pub async fn wait_for_permit(&mut self, model_id: &str) {
+        let now = Instant::now();
+        let window = Duration::from_secs(60);
+        let entries = self.timestamps.entry(model_id.to_string()).or_default();
+        entries.retain(|t| now.duration_since(*t) < window);
+
+        if entries.len() >= self.requests_per_minute as usize {
+            if let Some(oldest) = entries.first() {
+                let wait = window.saturating_sub(now.duration_since(*oldest));
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+            }
+            entries.retain(|t| Instant::now().duration_since(*t) < window);
+        }
+        entries.push(Instant::now());
     }
 }
