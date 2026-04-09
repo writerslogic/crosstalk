@@ -19,17 +19,23 @@ pub async fn run_event_loop(
     mut stream_rx: mpsc::Receiver<StreamEvent>,
 ) -> Result<()> {
     loop {
-        while let Ok(ev) = stream_rx.try_recv() {
+        // Single lock acquisition: drain all pending stream events + check shutdown
+        {
             let mut a = app.lock().await;
-            match ev {
-                StreamEvent::TokenReceived { agent_id, token } => a.push_token(&agent_id, &token),
-                StreamEvent::TurnComplete(turn) => a.commit_turn(&turn),
-                StreamEvent::ConvergenceUpdated { p, certainty } => a.set_convergence(p, certainty),
-                StreamEvent::ArtifactsUpdated(list) => a.artifacts = list,
-                StreamEvent::CheckpointWritten(idx) => {
-                    a.push_event(format!("Checkpoint i_{idx}"));
+            while let Ok(ev) = stream_rx.try_recv() {
+                match ev {
+                    StreamEvent::TokenReceived { agent_id, token } => a.push_token(&agent_id, &token),
+                    StreamEvent::TurnComplete(turn) => a.commit_turn(&turn),
+                    StreamEvent::ConvergenceUpdated { p, certainty } => a.set_convergence(p, certainty),
+                    StreamEvent::ArtifactsUpdated(list) => a.artifacts = list,
+                    StreamEvent::CheckpointWritten(idx) => {
+                        a.push_event(format!("Checkpoint i_{idx}"));
+                    }
+                    StreamEvent::Error(msg) => a.push_event(format!("Error: {msg}")),
                 }
-                StreamEvent::Error(msg) => a.push_event(format!("Error: {msg}")),
+            }
+            if a.shutdown {
+                return Ok(());
             }
         }
 
@@ -42,18 +48,14 @@ pub async fn run_event_loop(
         })
         .await??;
 
-        let Some(ev) = kb else {
-            if app.lock().await.shutdown {
-                return Ok(());
-            }
-            continue;
-        };
+        let Some(ev) = kb else { continue };
 
         let Event::Key(key) = ev else { continue };
         if key.kind != KeyEventKind::Press {
             continue;
         }
 
+        // Single lock acquisition: process key + derive action
         let action = {
             let mut a = app.lock().await;
 
@@ -149,10 +151,6 @@ pub async fn run_event_loop(
                 let _ = ctrl_tx.send(second).await;
             }
             Action::None => {}
-        }
-
-        if app.lock().await.shutdown {
-            return Ok(());
         }
     }
 }
