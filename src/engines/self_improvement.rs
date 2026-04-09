@@ -1140,20 +1140,20 @@ impl FileWriter {
         }
 
         let abs_path = self.root.join(rel);
-        let canonical_root = std::fs::canonicalize(&self.root)?;
+        let canonical_root = tokio::fs::canonicalize(&self.root).await?;
 
         // Validate existing path ancestors BEFORE creating directories.
         // This closes the TOCTOU window where a symlink in an existing
         // parent could escape the project root during create_dir_all.
         {
             let mut ancestor = abs_path.clone();
-            while !ancestor.exists() {
+            while tokio::fs::metadata(&ancestor).await.is_err() {
                 if !ancestor.pop() {
                     break;
                 }
             }
-            if ancestor.exists() {
-                let canonical_ancestor = std::fs::canonicalize(&ancestor)?;
+            if tokio::fs::metadata(&ancestor).await.is_ok() {
+                let canonical_ancestor = tokio::fs::canonicalize(&ancestor).await?;
                 if !canonical_ancestor.starts_with(&canonical_root) {
                     return Ok(WriteOutcome::Skipped("symlink escape detected"));
                 }
@@ -1161,29 +1161,33 @@ impl FileWriter {
         }
 
         if let Some(parent) = abs_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
 
         // Re-canonicalize after directory creation to catch any remaining escapes
-        let canonical_abs = std::fs::canonicalize(&abs_path).or_else(|_| {
-            std::fs::canonicalize(abs_path.parent().unwrap_or(&self.root))
-                .map(|p| p.join(abs_path.file_name().unwrap_or_default()))
-        })?;
+        let canonical_abs = match tokio::fs::canonicalize(&abs_path).await {
+            Ok(p) => p,
+            Err(_) => {
+                let parent = abs_path.parent().unwrap_or(&self.root);
+                let cp = tokio::fs::canonicalize(parent).await?;
+                cp.join(abs_path.file_name().unwrap_or_default())
+            }
+        };
         if !canonical_abs.starts_with(&canonical_root) {
             return Ok(WriteOutcome::Skipped("symlink escape detected"));
         }
 
         // Back up the original so we can restore on verification failure.
         let backup_path = canonical_abs.with_extension(format!("{ext}.crosstalk_bak"));
-        let had_original = canonical_abs.exists();
+        let had_original = tokio::fs::metadata(&canonical_abs).await.is_ok();
         if had_original {
-            std::fs::copy(&canonical_abs, &backup_path)?;
+            tokio::fs::copy(&canonical_abs, &backup_path).await?;
         }
 
-        // Atomic write: temp → rename.
+        // Atomic write: temp -> rename.
         let tmp_path = canonical_abs.with_extension(format!("{ext}.crosstalk_tmp"));
-        std::fs::write(&tmp_path, content.as_bytes())?;
-        std::fs::rename(&tmp_path, &canonical_abs)?;
+        tokio::fs::write(&tmp_path, content.as_bytes()).await?;
+        tokio::fs::rename(&tmp_path, &canonical_abs).await?;
 
         // Verify the project still compiles.
         let check = tokio::process::Command::new("cargo")
@@ -1194,27 +1198,27 @@ impl FileWriter {
 
         match check {
             Ok(out) if out.status.success() => {
-                let _ = std::fs::remove_file(&backup_path);
+                let _ = tokio::fs::remove_file(&backup_path).await;
                 Ok(WriteOutcome::Written(canonical_abs))
             }
             Ok(out) => {
                 // Restore original.
                 if had_original {
-                    std::fs::copy(&backup_path, &canonical_abs)?;
-                    let _ = std::fs::remove_file(&backup_path);
+                    tokio::fs::copy(&backup_path, &canonical_abs).await?;
+                    let _ = tokio::fs::remove_file(&backup_path).await;
                 } else {
-                    let _ = std::fs::remove_file(&canonical_abs);
+                    let _ = tokio::fs::remove_file(&canonical_abs).await;
                 }
                 let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
                 Ok(WriteOutcome::VerificationFailed(stderr))
             }
             Err(e) => {
-                // Can't run cargo — restore and propagate.
+                // Can't run cargo; restore and propagate.
                 if had_original {
-                    std::fs::copy(&backup_path, &abs_path)?;
-                    let _ = std::fs::remove_file(&backup_path);
+                    tokio::fs::copy(&backup_path, &abs_path).await?;
+                    let _ = tokio::fs::remove_file(&backup_path).await;
                 } else {
-                    let _ = std::fs::remove_file(&abs_path);
+                    let _ = tokio::fs::remove_file(&abs_path).await;
                 }
                 Err(anyhow::anyhow!("cargo check failed to launch: {e}"))
             }
