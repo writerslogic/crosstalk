@@ -346,11 +346,7 @@ pub async fn run_model_selector() -> Result<Vec<String>> {
                     .build()
                     .unwrap_or_else(|_| reqwest::Client::new());
 
-                let url = if auth_style_val == 2 {
-                    format!("{}?key={}", list_url, api_key)
-                } else {
-                    list_url.to_string()
-                };
+                let url = list_url.to_string();
 
                 let mut req = client.get(&url);
                 if auth_style_val == 0 {
@@ -359,6 +355,8 @@ pub async fn run_model_selector() -> Result<Vec<String>> {
                     req = req
                         .header("x-api-key", &api_key)
                         .header("anthropic-version", "2023-06-01");
+                } else if auth_style_val == 2 {
+                    req = req.header("x-goog-api-key", &api_key);
                 }
 
                 let ids = async {

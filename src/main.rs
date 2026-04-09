@@ -103,7 +103,15 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Arc::new(Mutex::new(App::new(session_id)));
 
-    // 6. Spawn background tasks
+    // 6. Set panic hook before spawning any tasks
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode().ok();
+        let _ = io::stdout().execute(LeaveAlternateScreen);
+        prev_hook(info);
+    }));
+
+    // 7. Spawn background tasks
     let sigma_orch = Arc::clone(&sigma);
     let app_orch = Arc::clone(&app);
     let iterations = args.iterations;
@@ -147,14 +155,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = run_event_loop(event_app, ctrl_tx, event_rx).await;
     });
 
-    // 7. Initialize TUI
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode().ok();
-        let _ = io::stdout().execute(LeaveAlternateScreen);
-        prev_hook(info);
-    }));
-
+    // 8. Initialize TUI
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;

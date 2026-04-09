@@ -1070,7 +1070,7 @@ const BLOCKED_FILENAMES: &[&str] = &[
 ];
 const BLOCKED_DIRS: &[&str] = &[".git", ".github", ".gitlab", "target", ".cargo", ".ssh"];
 const ALLOWED_EXTENSIONS: &[&str] = &[
-    "rs", "toml", "md", "json", "yaml", "yml", "sh", "txt",
+    "rs", "toml", "md", "json", "yaml", "yml", "txt",
 ];
 
 pub enum WriteOutcome {
@@ -1200,7 +1200,7 @@ impl FileWriter {
             Ok(out) => {
                 // Restore original.
                 if had_original {
-                    let _ = std::fs::copy(&backup_path, &canonical_abs);
+                    std::fs::copy(&backup_path, &canonical_abs)?;
                     let _ = std::fs::remove_file(&backup_path);
                 } else {
                     let _ = std::fs::remove_file(&canonical_abs);
@@ -1211,7 +1211,7 @@ impl FileWriter {
             Err(e) => {
                 // Can't run cargo — restore and propagate.
                 if had_original {
-                    let _ = std::fs::copy(&backup_path, &abs_path);
+                    std::fs::copy(&backup_path, &abs_path)?;
                     let _ = std::fs::remove_file(&backup_path);
                 } else {
                     let _ = std::fs::remove_file(&abs_path);

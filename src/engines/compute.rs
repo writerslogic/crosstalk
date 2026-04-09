@@ -271,7 +271,7 @@ impl RateLimitManager {
         if attempts == 0 {
             return Duration::ZERO;
         }
-        let base_secs = 2u64.pow(attempts).min(60) as f64;
+        let base_secs = 2u64.saturating_pow(attempts).min(60) as f64;
         let jitter: f64 = rand::rng().random_range(-0.25..=0.25);
         let secs = (base_secs * (1.0 + jitter)).max(0.1);
         Duration::from_secs_f64(secs)
@@ -341,8 +341,11 @@ impl BatchScheduler {
         }
     }
 
-    pub async fn acquire(&self) -> tokio::sync::SemaphorePermit<'_> {
-        self.semaphore.acquire().await.expect("semaphore closed")
+    pub async fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>, anyhow::Error> {
+        self.semaphore
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("inference semaphore closed"))
     }
 
     #[must_use]

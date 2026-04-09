@@ -362,42 +362,22 @@ impl MemoryStore {
         while let Some(batch_res) = stream.next().await {
             let batch = batch_res?;
 
-            let turn_ids = batch
-                .column_by_name("turn_id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .unwrap();
-            let session_ids = batch
-                .column_by_name("session_id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let content_hashes = batch
-                .column_by_name("content_hash")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let timestamps = batch
-                .column_by_name("timestamp")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap();
-            let metadata = batch
-                .column_by_name("metadata")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let distances = batch
-                .column_by_name("_distance")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .unwrap();
+            macro_rules! col {
+                ($name:expr, $ty:ty) => {
+                    batch
+                        .column_by_name($name)
+                        .ok_or_else(|| anyhow!("missing column: {}", $name))?
+                        .as_any()
+                        .downcast_ref::<$ty>()
+                        .ok_or_else(|| anyhow!("column {} has wrong type", $name))?
+                };
+            }
+            let turn_ids = col!("turn_id", UInt32Array);
+            let session_ids = col!("session_id", StringArray);
+            let content_hashes = col!("content_hash", StringArray);
+            let timestamps = col!("timestamp", UInt64Array);
+            let metadata = col!("metadata", StringArray);
+            let distances = col!("_distance", Float32Array);
 
             for i in 0..batch.num_rows() {
                 let similarity = 1.0 / (1.0 + distances.value(i) as f64);

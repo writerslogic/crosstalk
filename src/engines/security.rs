@@ -4,6 +4,7 @@ use rand::Rng;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use zeroize::Zeroizing;
 use std::sync::{Arc, OnceLock};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -179,7 +180,7 @@ impl TurnSigner {
     #[must_use]
     pub fn new() -> Self {
         let mut rng = rand::rng();
-        let bytes: [u8; 32] = rng.random();
+        let bytes = Zeroizing::new(<[u8; 32]>::from(rng.random::<[u8; 32]>()));
         let signing_key = SigningKey::from_bytes(&bytes);
         Self { signing_key }
     }

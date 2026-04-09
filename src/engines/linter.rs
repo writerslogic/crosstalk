@@ -103,11 +103,12 @@ impl LinterGuard {
 
         let uid = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
+            .map(|d| d.as_nanos())
             .unwrap_or(0);
+        let pid = std::process::id();
         let dir = std::env::temp_dir().join("crosstalk-linter");
         tokio::fs::create_dir_all(&dir).await?;
-        let src = dir.join(format!("artifact_{uid}.rs"));
+        let src = dir.join(format!("artifact_{pid}_{uid}.rs"));
         tokio::fs::write(&src, &artifact.content).await?;
 
         let src_str = src.to_str()

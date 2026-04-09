@@ -61,6 +61,9 @@ impl QualityEngine {
     }
 
     fn compute_ast_metrics(content: &str, module_lookup: &[String]) -> (u32, u32) {
+        if content.len() > 10_000_000 {
+            return (1, 0);
+        }
         let mut complexity = 1u32;
         let mut dependencies = HashSet::new();
 
