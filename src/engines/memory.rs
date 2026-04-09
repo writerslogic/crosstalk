@@ -91,6 +91,12 @@ fn embed_text(text: &str) -> Vec<f32> {
     embed_text_hash(text)
 }
 
+async fn embed_text_async(text: String) -> Vec<f32> {
+    tokio::task::spawn_blocking(move || embed_text(&text))
+        .await
+        .unwrap_or_else(|_| embed_text_hash(""))
+}
+
 fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
@@ -815,7 +821,7 @@ impl MemoryBridge {
         self.records.entry(session_id.to_string()).or_default().push(record);
     }
 
-    pub fn recall_relevant(
+    pub async fn recall_relevant(
         &mut self,
         current_session_id: &str,
         query_text: &str,
@@ -829,7 +835,7 @@ impl MemoryBridge {
             ctx.last_recall_turn = Some(current_turn);
         }
 
-        let query_emb = embed_text(query_text);
+        let query_emb = embed_text_async(query_text.to_string()).await;
         let mut scored: Vec<(MemoryRecord, f64)> = self
             .records
             .values()

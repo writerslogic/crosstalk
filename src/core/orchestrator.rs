@@ -196,6 +196,7 @@ impl Orchestrator {
             bridge.open_session(pre_session_id.clone());
             memory_examples = bridge
                 .recall_relevant(&pre_session_id, "latest turn context", 3, pre_turn_idx)
+                .await
                 .unwrap_or_default();
         }
 
