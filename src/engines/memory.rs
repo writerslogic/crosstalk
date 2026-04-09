@@ -430,16 +430,35 @@ impl MemoryStore {
         }
     }
 
+    fn session_filter(session_id: &str) -> Result<String> {
+        Self::validate_session_id(session_id)?;
+        Ok(format!("session_id = '{session_id}'"))
+    }
+
+    fn turn_session_filter(turn_id: u32, session_id: &str) -> Result<String> {
+        Self::validate_session_id(session_id)?;
+        Ok(format!("turn_id = {turn_id} AND session_id = '{session_id}'"))
+    }
+
+    fn turn_ids_filter(turn_ids: &[u32]) -> String {
+        let ids_str = turn_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("turn_id IN ({ids_str})")
+    }
+
     async fn scan_session(
         &self,
         table_name: &str,
         session_id: &str,
     ) -> Result<Vec<MemoryRecord>> {
-        Self::validate_session_id(session_id)?;
+        let filter = Self::session_filter(session_id)?;
         let table = self.get_or_create_table(table_name).await?;
         let mut stream = table
             .query()
-            .only_if(format!("session_id = '{session_id}'"))
+            .only_if(filter)
             .execute()
             .await?;
 
@@ -534,10 +553,10 @@ impl MemoryStore {
         }
 
         if !bundle.records.is_empty() {
-            Self::validate_session_id(session_id)?;
+            let filter = Self::session_filter(session_id)?;
             let table = self.get_or_create_table(DEFAULT_TABLE).await?;
             table
-                .delete(&format!("session_id = '{session_id}'"))
+                .delete(&filter)
                 .await
                 .context("Failed to clear existing records before restore")?;
             self.insert_raw(DEFAULT_TABLE, bundle.records).await?;
@@ -547,10 +566,10 @@ impl MemoryStore {
     }
 
     pub async fn forget(&mut self, turn_id: u32, session_id: &str) -> Result<()> {
-        Self::validate_session_id(session_id)?;
+        let filter = Self::turn_session_filter(turn_id, session_id)?;
         let table = self.get_or_create_table(DEFAULT_TABLE).await?;
         table
-            .delete(&format!("turn_id = {turn_id} AND session_id = '{session_id}'"))
+            .delete(&filter)
             .await
             .context("Failed to delete record")?;
 
@@ -585,16 +604,11 @@ impl MemoryStore {
             return Ok(vec![]);
         }
 
-        let ids_str = turn_ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-
+        let filter = Self::turn_ids_filter(&turn_ids);
         let table = self.get_or_create_table(DEFAULT_TABLE).await?;
         let mut stream = table
             .query()
-            .only_if(format!("turn_id IN ({ids_str})"))
+            .only_if(filter)
             .execute()
             .await?;
 

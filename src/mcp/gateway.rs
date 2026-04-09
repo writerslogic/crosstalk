@@ -322,6 +322,15 @@ static CRITICAL_TOOLS: &[(&str, Option<&str>)] = &[
     ("cargo", Some("clean")),
 ];
 
+/// Pre-validated parameters for a tool execution, allowing the actual
+/// invocation to run without holding the gateway lock.
+pub struct PreparedToolCall {
+    pub tool_name: String,
+    pub bin: String,
+    pub cli_args: Vec<String>,
+    pub timeout: Duration,
+}
+
 pub struct McpGateway {
     pub tools: HashMap<String, McpTool>,
     pub permissions: PermissionManager,
@@ -371,10 +380,61 @@ impl McpGateway {
                 let mut transport = JsonRpcTransport::new(stream);
                 while let Ok(Some(msg)) = transport.next_message().await {
                     if let Ok(req) = serde_json::from_str::<JsonRpcRequest>(&msg) {
-                        let result = {
+                        let result = if req.method == "tools/call" {
+                            let name = req.params["name"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string();
+                            let args = req.params["arguments"].clone();
+
+                            let prepared = {
+                                let mut g = gateway.lock().await;
+                                g.prepare_tool_call("default_agent", &name, args).await
+                            };
+
+                            match prepared {
+                                Ok(prep) => {
+                                    let tool_name = prep.tool_name;
+                                    let tool_timeout = prep.timeout;
+                                    let bin = prep.bin;
+                                    let cli_args = prep.cli_args;
+
+                                    let fut = tokio::task::spawn_blocking(move || {
+                                        CliBridge::invoke(&bin, cli_args, None)
+                                    });
+
+                                    match timeout(tool_timeout, fut).await {
+                                        Ok(join_result) => {
+                                            let invoke_result = join_result
+                                                .map_err(|e| anyhow!("{}", e));
+                                            match invoke_result {
+                                                Ok(tool_res) => {
+                                                    let mut g = gateway.lock().await;
+                                                    g.timeout_manager.record_success(&tool_name);
+                                                    tool_res.and_then(|r| {
+                                                        serde_json::to_value(r)
+                                                            .map_err(|e| anyhow!("{}", e))
+                                                    })
+                                                }
+                                                Err(e) => Err(e),
+                                            }
+                                        }
+                                        Err(_) => {
+                                            let mut g = gateway.lock().await;
+                                            let timeout_result =
+                                                g.record_tool_timeout(&tool_name, tool_timeout);
+                                            serde_json::to_value(timeout_result)
+                                                .map_err(|e| anyhow!("{}", e))
+                                        }
+                                    }
+                                }
+                                Err(e) => Err(e),
+                            }
+                        } else {
                             let mut g = gateway.lock().await;
                             g.handle_request("default_agent", req).await
                         };
+
                         match result {
                             Ok(res) => {
                                 let _ = transport
@@ -553,6 +613,74 @@ impl McpGateway {
                     elapsed_ms: tool_timeout.as_millis() as u64,
                 })
             }
+        }
+    }
+
+    /// Validate permissions and extract execution parameters without running
+    /// the tool. Used by `run_server` to release the gateway lock before execution.
+    pub async fn prepare_tool_call(
+        &mut self,
+        agent_id: &str,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<PreparedToolCall> {
+        if self.timeout_manager.is_disabled(name) {
+            return Err(anyhow!("Tool {} is disabled due to repeated timeouts", name));
+        }
+
+        if let Err(e) = self.permissions.check_with_reason(agent_id, name, &args) {
+            return Err(anyhow!("Permission denied: {}", e));
+        }
+
+        let needs_confirmation = self.is_critical_tool(name, &args)
+            || matches!(
+                self.permissions.tiers.get(agent_id),
+                Some(PermissionTier::CriticalConfirmation(_))
+            );
+
+        if needs_confirmation && !self.prompt_confirmation(name, &args).await {
+            return Err(anyhow!(
+                "Execution of critical tool '{}' was not confirmed by user",
+                name
+            ));
+        }
+
+        if !self.tools.contains_key(name) {
+            return Err(anyhow!("Tool not found: {}", name));
+        }
+
+        let cli_args: Vec<String> = args["args"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect();
+
+        let tool_timeout = self.timeout_manager.duration_for(name);
+
+        Ok(PreparedToolCall {
+            tool_name: name.to_string(),
+            bin: name.to_string(),
+            cli_args,
+            timeout: tool_timeout,
+        })
+    }
+
+    /// Record a tool timeout and build the corresponding `ToolResult`.
+    pub fn record_tool_timeout(&mut self, tool_name: &str, tool_timeout: Duration) -> ToolResult {
+        let now_disabled = self.timeout_manager.record_timeout(tool_name);
+        let count = self.timeout_manager.failure_count(tool_name);
+        ToolResult {
+            tool_name: tool_name.to_string(),
+            success: false,
+            output: String::new(),
+            error: Some(format!(
+                "Timeout after {}s (occurrence {}){}",
+                tool_timeout.as_secs(),
+                count,
+                if now_disabled { " -- tool disabled" } else { "" }
+            )),
+            elapsed_ms: tool_timeout.as_millis() as u64,
         }
     }
 

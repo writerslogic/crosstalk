@@ -157,13 +157,20 @@ impl LinterGuard {
     // ── Private helpers ──────────────────────────────────────────────────────
 
     async fn run_clippy(workspace_dir: &str) -> Result<LintReport> {
-        let resolved = Path::new(workspace_dir)
-            .canonicalize()
-            .map_err(|e| anyhow!("Cannot resolve workspace path '{}': {}", workspace_dir, e))?;
-        if !resolved.is_dir() {
-            return Err(anyhow!("Workspace path is not a directory: {}", workspace_dir));
-        }
-        if !resolved.join("Cargo.toml").exists() {
+        let ws = workspace_dir.to_string();
+        let resolved = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf> {
+            let p = Path::new(&ws)
+                .canonicalize()
+                .map_err(|e| anyhow!("Cannot resolve workspace path '{}': {}", ws, e))?;
+            if !p.is_dir() {
+                return Err(anyhow!("Workspace path is not a directory: {}", ws));
+            }
+            Ok(p)
+        })
+        .await
+        .map_err(|e| anyhow!("spawn_blocking join error: {}", e))??;
+
+        if tokio::fs::metadata(resolved.join("Cargo.toml")).await.is_err() {
             return Ok(LintReport { warnings: vec![], errors: vec![], passed: true });
         }
 

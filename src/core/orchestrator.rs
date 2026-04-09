@@ -335,7 +335,8 @@ impl Orchestrator {
 
         let mut results_fut = futures::future::join_all(tasks);
         let mut final_results = Vec::new();
-        let mut rx_guard = self.control_rx.lock().await;
+        let control_rx = &self.control_rx;
+        let mut ctrl_open = true;
 
         loop {
             tokio::select! {
@@ -353,15 +354,15 @@ impl Orchestrator {
                     }
                     break;
                 }
-                Some(signal) = rx_guard.recv() => {
+                signal = async { control_rx.lock().await.recv().await }, if ctrl_open => {
                     match signal {
-                        ControlSignal::Pause => { let _ = paused_tx.send(true); },
-                        ControlSignal::Resume => { let _ = paused_tx.send(false); },
-                        ControlSignal::Shutdown => return Ok(false),
-                        ControlSignal::Inject(text) => {
+                        Some(ControlSignal::Pause) => { let _ = paused_tx.send(true); },
+                        Some(ControlSignal::Resume) => { let _ = paused_tx.send(false); },
+                        Some(ControlSignal::Shutdown) => return Ok(false),
+                        Some(ControlSignal::Inject(text)) => {
                             let _ = self.event_tx.send(StreamEvent::TokenReceived { agent_id: "User".to_string(), token: text }).await;
                         }
-                        ControlSignal::Rewind(index) => {
+                        Some(ControlSignal::Rewind(index)) => {
                             if let Ok(Some(restored)) = self.state_manager.restore(index) {
                                 let mut s = sigma_lock.lock().await;
                                 *s = restored;
@@ -369,11 +370,11 @@ impl Orchestrator {
                                 return Ok(true);
                             }
                         }
+                        None => { ctrl_open = false; },
                     }
                 }
             }
         }
-        drop(rx_guard);
 
         let weights = InfluenceWeightManager::calculate_weights_with_recency(&*sigma_lock.lock().await, 0.9);
         
