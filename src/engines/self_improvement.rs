@@ -1142,25 +1142,29 @@ impl FileWriter {
 
         if let Some(parent) = abs_path.parent() {
             std::fs::create_dir_all(parent)?;
-            // After directory creation, canonicalize parent to detect symlink escapes
-            let canonical_parent = std::fs::canonicalize(parent)?;
-            let canonical_root = std::fs::canonicalize(&self.root)?;
-            if !canonical_parent.starts_with(&canonical_root) {
-                return Ok(WriteOutcome::Skipped("symlink escape detected"));
-            }
+        }
+
+        // Canonicalize final path to detect symlink escapes
+        let canonical_root = std::fs::canonicalize(&self.root)?;
+        let canonical_abs = std::fs::canonicalize(&abs_path).or_else(|_| {
+            std::fs::canonicalize(abs_path.parent().unwrap_or(&self.root))
+                .map(|p| p.join(abs_path.file_name().unwrap_or_default()))
+        })?;
+        if !canonical_abs.starts_with(&canonical_root) {
+            return Ok(WriteOutcome::Skipped("symlink escape detected"));
         }
 
         // Back up the original so we can restore on verification failure.
-        let backup_path = abs_path.with_extension(format!("{ext}.crosstalk_bak"));
-        let had_original = abs_path.exists();
+        let backup_path = canonical_abs.with_extension(format!("{ext}.crosstalk_bak"));
+        let had_original = canonical_abs.exists();
         if had_original {
-            std::fs::copy(&abs_path, &backup_path)?;
+            std::fs::copy(&canonical_abs, &backup_path)?;
         }
 
         // Atomic write: temp → rename.
-        let tmp_path = abs_path.with_extension(format!("{ext}.crosstalk_tmp"));
+        let tmp_path = canonical_abs.with_extension(format!("{ext}.crosstalk_tmp"));
         std::fs::write(&tmp_path, content.as_bytes())?;
-        std::fs::rename(&tmp_path, &abs_path)?;
+        std::fs::rename(&tmp_path, &canonical_abs)?;
 
         // Verify the project still compiles.
         let check = tokio::process::Command::new("cargo")
@@ -1172,15 +1176,15 @@ impl FileWriter {
         match check {
             Ok(out) if out.status.success() => {
                 let _ = std::fs::remove_file(&backup_path);
-                Ok(WriteOutcome::Written(abs_path))
+                Ok(WriteOutcome::Written(canonical_abs))
             }
             Ok(out) => {
                 // Restore original.
                 if had_original {
-                    let _ = std::fs::copy(&backup_path, &abs_path);
+                    let _ = std::fs::copy(&backup_path, &canonical_abs);
                     let _ = std::fs::remove_file(&backup_path);
                 } else {
-                    let _ = std::fs::remove_file(&abs_path);
+                    let _ = std::fs::remove_file(&canonical_abs);
                 }
                 let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
                 Ok(WriteOutcome::VerificationFailed(stderr))

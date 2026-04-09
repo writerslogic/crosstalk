@@ -22,20 +22,20 @@ pub struct NixManager {
 }
 
 impl NixManager {
-    pub fn new(deps: Vec<String>) -> Self {
-        Self {
-            deps,
-            cache_dir: PathBuf::from("/tmp/.crosstalk-nix-cache"),
-            ttl_secs: CACHE_TTL_SECS,
-        }
-    }
-
-    pub fn generate_flake(&self) -> Result<String> {
-        for dep in &self.deps {
+    pub fn new(deps: Vec<String>) -> Result<Self> {
+        for dep in &deps {
             if !dep.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
                 return Err(anyhow!("invalid dependency name: {}", dep));
             }
         }
+        Ok(Self {
+            deps,
+            cache_dir: PathBuf::from("/tmp/.crosstalk-nix-cache"),
+            ttl_secs: CACHE_TTL_SECS,
+        })
+    }
+
+    pub fn generate_flake(&self) -> Result<String> {
         let deps_str = self
             .deps
             .iter()
