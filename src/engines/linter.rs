@@ -174,6 +174,10 @@ impl LinterGuard {
             return Ok(LintReport { warnings: vec![], errors: vec![], passed: true });
         }
 
+        if tokio::fs::metadata(resolved.join("build.rs")).await.is_ok() {
+            return Err(anyhow!("Refusing to lint workspace containing build.rs (arbitrary code execution risk)"));
+        }
+
         let child = Command::new("cargo")
             .current_dir(&resolved)
             .args([

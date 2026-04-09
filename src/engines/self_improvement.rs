@@ -1066,8 +1066,9 @@ impl EscalationContextBuilder {
 const BLOCKED_FILENAMES: &[&str] = &[
     ".env", ".env.local", ".env.production", "Cargo.lock",
     ".gitignore", ".git-credentials", "id_rsa", "id_ed25519",
+    "build.rs", "Cargo.toml",
 ];
-const BLOCKED_DIRS: &[&str] = &[".git", "target", ".cargo", ".ssh"];
+const BLOCKED_DIRS: &[&str] = &[".git", ".github", ".gitlab", "target", ".cargo", ".ssh"];
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "json", "yaml", "yml", "sh", "txt",
 ];
@@ -1139,13 +1140,31 @@ impl FileWriter {
         }
 
         let abs_path = self.root.join(rel);
+        let canonical_root = std::fs::canonicalize(&self.root)?;
+
+        // Validate existing path ancestors BEFORE creating directories.
+        // This closes the TOCTOU window where a symlink in an existing
+        // parent could escape the project root during create_dir_all.
+        {
+            let mut ancestor = abs_path.clone();
+            while !ancestor.exists() {
+                if !ancestor.pop() {
+                    break;
+                }
+            }
+            if ancestor.exists() {
+                let canonical_ancestor = std::fs::canonicalize(&ancestor)?;
+                if !canonical_ancestor.starts_with(&canonical_root) {
+                    return Ok(WriteOutcome::Skipped("symlink escape detected"));
+                }
+            }
+        }
 
         if let Some(parent) = abs_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Canonicalize final path to detect symlink escapes
-        let canonical_root = std::fs::canonicalize(&self.root)?;
+        // Re-canonicalize after directory creation to catch any remaining escapes
         let canonical_abs = std::fs::canonicalize(&abs_path).or_else(|_| {
             std::fs::canonicalize(abs_path.parent().unwrap_or(&self.root))
                 .map(|p| p.join(abs_path.file_name().unwrap_or_default()))
