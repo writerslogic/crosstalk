@@ -24,11 +24,7 @@ pub struct ReasoningEngine;
 impl ReasoningEngine {
     #[must_use]
     pub fn select_structure(task: TaskCategory, _agent_id: &str) -> TurnStructure {
-        match task {
-            TaskCategory::Research => TurnStructure::Symbolic,
-            TaskCategory::CodeGeneration => TurnStructure::CodeFirst,
-            _ => TurnStructure::StepByStep,
-        }
+        task.preferred_structure()
     }
 
     /// Single-pass, $O(N)$, zero-regex state machine.

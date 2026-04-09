@@ -25,6 +25,7 @@ use ort::{CoreMLExecutionProvider, CPUExecutionProvider};
 const EMBEDDING_DIM: usize = 384;
 const DEFAULT_TABLE: &str = "memory";
 const GZIP_THRESHOLD: usize = 10 * 1024 * 1024;
+const KMEANS_ITERATIONS: usize = 50;
 
 fn normalize_vector(vec: &[f32]) -> Vec<f32> {
     let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -973,7 +974,7 @@ impl SemanticClusterer {
             .collect();
         let mut assignments = vec![0usize; embeddings.len()];
 
-        for _ in 0..20 {
+        for _ in 0..KMEANS_ITERATIONS {
             let mut changed = false;
             for (i, emb) in embeddings.iter().enumerate() {
                 let nearest = centroids
@@ -1038,7 +1039,7 @@ impl SemanticClusterer {
 
         let mut assignments = vec![0usize; turns.len()];
 
-        for _ in 0..50 {
+        for _ in 0..KMEANS_ITERATIONS {
             let mut changed = false;
 
             for (i, emb) in embeddings.iter().enumerate() {

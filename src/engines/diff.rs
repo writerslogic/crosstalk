@@ -104,7 +104,12 @@ impl DiffEngine {
                 let mut new_hunk_content = vec![];
                 for h_line in hunk_lines {
                     if h_line.starts_with(' ') || h_line.starts_with('+') {
-                        new_hunk_content.push(h_line[1..].to_string());
+                        let content = if h_line.len() > 1 {
+                            h_line[1..].to_string()
+                        } else {
+                            String::new()
+                        };
+                        new_hunk_content.push(content);
                     }
                 }
 

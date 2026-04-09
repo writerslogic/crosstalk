@@ -47,6 +47,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
+const MAX_SESSION_TURNS: usize = 1000;
+
 /// All computed data for one artifact change, assembled outside the sigma lock.
 struct PreparedArtifactChange {
     name: String,
@@ -844,6 +846,10 @@ impl Orchestrator {
             timestamp: turn.timestamp,
         };
         ComputeManager::manage_budget(sigma, cost_entry);
+
+        if sigma.turns.len() >= MAX_SESSION_TURNS {
+            return Err(anyhow::anyhow!("Session turn limit ({}) exceeded", MAX_SESSION_TURNS));
+        }
 
         sigma.turns.push(turn.clone());
         sigma.iteration_index += 1;

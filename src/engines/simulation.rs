@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rand::{Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rng};
 use rand::rngs::SmallRng;
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -169,7 +169,7 @@ impl MonteCarloRunner {
             structural_impact,
         };
 
-        let seed = 42u64;
+        let seed = rng().random::<u64>();
         let stats = tokio::task::spawn_blocking(move || {
             Self::run_variance_trials(&sim_artifact, &sim_diff, trials.max(1), seed)
         })

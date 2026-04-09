@@ -3,7 +3,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::Rng;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use zeroize::Zeroizing;
 use std::sync::{Arc, OnceLock};
 use std::path::{Path, PathBuf};
@@ -73,6 +73,22 @@ impl SecretScanner {
 pub struct ShellSanity;
 
 impl ShellSanity {
+    const ALLOWED_BINS: &'static [&'static str] = &[
+        "cargo",
+        "rustc",
+        "git",
+        "ls",
+        "cat",
+        "grep",
+        "rustfmt",
+        "clippy",
+        "tree-sitter",
+    ];
+
+    const DANGEROUS_BINS: &'static [&'static str] = &[
+        "rm", "curl", "wget", "nc", "netcat", "dd", "mkfs"
+    ];
+
     #[must_use]
     pub fn is_dangerous(cmd: &str) -> bool {
         let tokens = Self::tokenize(cmd);
@@ -81,32 +97,18 @@ impl ShellSanity {
         }
 
         let bin = &tokens[0];
-        let allowlist: HashSet<&str> = [
-            "cargo",
-            "rustc",
-            "git",
-            "ls",
-            "cat",
-            "grep",
-            "rustfmt",
-            "clippy",
-            "tree-sitter",
-        ]
-        .into_iter()
-        .collect();
 
         // Identify the binary name even if it's an absolute path
         let bin_path = std::path::Path::new(bin);
         let bin_name = bin_path.file_name().and_then(|s| s.to_str()).unwrap_or(bin);
 
-        if !allowlist.contains(bin_name) {
+        if !Self::ALLOWED_BINS.contains(&bin_name) {
             return true;
         }
 
         // Secondary check for dangerous patterns within any token or redirection
-        let dangerous_bins = ["rm", "curl", "wget", "nc", "netcat", "dd", "mkfs"];
         for token in &tokens {
-            if dangerous_bins.iter().any(|&db| token == db) {
+            if Self::DANGEROUS_BINS.iter().any(|&db| db == token.as_str()) {
                 return true;
             }
             if token.contains(">")

@@ -1113,17 +1113,19 @@ impl FileWriter {
         }
 
         let ext = match rel.extension().and_then(|e| e.to_str()) {
-            Some(e) => e,
+            Some(e) => e.to_lowercase(),
             None => return Ok(WriteOutcome::Skipped("no file extension")),
         };
-        if !ALLOWED_EXTENSIONS.contains(&ext) {
+        if !ALLOWED_EXTENSIONS.iter().any(|&a| a == ext.as_str()) {
             return Ok(WriteOutcome::Skipped("extension not in allowlist"));
         }
 
-        if let Some(fname) = rel.file_name().and_then(|n| n.to_str())
-            && BLOCKED_FILENAMES.contains(&fname)
-        {
-            return Ok(WriteOutcome::Skipped("blocked filename"));
+        if let Some(fname) = rel.file_name().and_then(|n| n.to_str()) {
+            if BLOCKED_FILENAMES.contains(&fname)
+                || BLOCKED_FILENAMES.iter().any(|&blocked| fname.starts_with(blocked))
+            {
+                return Ok(WriteOutcome::Skipped("blocked filename"));
+            }
         }
 
         for component in rel.components() {

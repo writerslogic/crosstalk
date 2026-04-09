@@ -191,8 +191,14 @@ impl PluginManager {
     }
 
     pub fn run_on_turn(&self, sigma: &mut ConversationState) -> Result<()> {
+        let mut errors = Vec::new();
         for entry in self.plugins.iter() {
-            entry.value().on_turn(sigma)?;
+            if let Err(e) = entry.value().on_turn(sigma) {
+                errors.push(format!("{}: {}", entry.key(), e));
+            }
+        }
+        if !errors.is_empty() {
+            return Err(anyhow::anyhow!("Plugin errors: {}", errors.join("; ")));
         }
         Ok(())
     }

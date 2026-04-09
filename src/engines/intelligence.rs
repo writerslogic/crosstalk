@@ -196,12 +196,16 @@ impl IntelligenceEngine {
         let profile = self.profiles.get(model_id)?;
         let mut recent_quality_sum = 0.0;
         let mut valid_turns = 0;
+        let mut category_counts: std::collections::HashMap<TaskCategory, usize> = std::collections::HashMap::new();
 
         for turn in recent_turns {
             if turn.model_id == model_id {
                 let score = QualityScorer::score(turn);
                 recent_quality_sum += score;
                 valid_turns += 1;
+                if let Some(cat) = turn.task_category {
+                    *category_counts.entry(cat).or_insert(0) += 1;
+                }
             }
         }
 
@@ -215,9 +219,14 @@ impl IntelligenceEngine {
         };
 
         if recent_avg < baseline * 0.9 {
+            let task_category = category_counts
+                .into_iter()
+                .max_by_key(|(_, count)| *count)
+                .map(|(cat, _)| cat)
+                .unwrap_or(TaskCategory::Research);
             return Some(RegressionAlert {
                 agent_id: model_id.to_string(),
-                task_category: TaskCategory::CodeGeneration,
+                task_category,
                 baseline_mean: baseline,
                 recent_mean: recent_avg,
                 severity: (baseline - recent_avg) / baseline,
@@ -327,13 +336,7 @@ impl IntelligenceEngine {
 
     #[must_use]
     pub fn estimate_tokens(category: TaskCategory) -> u32 {
-        match category {
-            TaskCategory::Architecture => 2500,
-            TaskCategory::Research => 2200,
-            TaskCategory::CodeGeneration => 2000,
-            TaskCategory::Refactoring => 1800,
-            TaskCategory::Debugging | TaskCategory::Testing => 1500,
-        }
+        category.token_estimate()
     }
 }
 
@@ -354,11 +357,15 @@ impl QualityScorer {
             TurnOutcome::Rejected => -0.4,
         };
 
-        if turn.content.contains("```") {
+        if turn.content.matches("```").count() >= 2 {
             score += 0.05;
         }
 
-        if turn.content.contains("evidence") || turn.content.contains("proof") {
+        let has_evidence = turn.content.split_whitespace().any(|w| {
+            let word = w.trim_matches(|c: char| !c.is_alphanumeric());
+            word.eq_ignore_ascii_case("evidence") || word.eq_ignore_ascii_case("proof")
+        });
+        if has_evidence {
             score += 0.05;
         }
 

@@ -259,6 +259,9 @@ impl ForceDirectedGraph {
 
         // 2. Attractive forces
         for edge in &self.edges {
+            if edge.source >= self.nodes.len() || edge.target >= self.nodes.len() {
+                continue;
+            }
             let dx = self.nodes[edge.source].x - self.nodes[edge.target].x;
             let dy = self.nodes[edge.source].y - self.nodes[edge.target].y;
             let dist = (dx * dx + dy * dy).sqrt().max(0.1);

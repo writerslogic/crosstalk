@@ -53,6 +53,26 @@ pub enum TaskCategory {
     Testing,
 }
 
+impl TaskCategory {
+    pub fn preferred_structure(self) -> TurnStructure {
+        match self {
+            TaskCategory::Research => TurnStructure::Symbolic,
+            TaskCategory::CodeGeneration => TurnStructure::CodeFirst,
+            _ => TurnStructure::StepByStep,
+        }
+    }
+
+    pub fn token_estimate(self) -> u32 {
+        match self {
+            TaskCategory::Architecture => 2500,
+            TaskCategory::Research => 2200,
+            TaskCategory::CodeGeneration => 2000,
+            TaskCategory::Refactoring => 1800,
+            TaskCategory::Debugging | TaskCategory::Testing => 1500,
+        }
+    }
+}
+
 /// A single model response within a session, including its diff, metadata, and
 /// cryptographic signature.
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -30,8 +30,20 @@ pub struct ArtifactDiff {
 }
 
 impl ArtifactDiff {
+    const MAX_DIFF_SIZE: usize = 1024 * 1024;
+
+    pub fn new(original_version: u32, new_version: u32, diff_text: String) -> Result<Self> {
+        if diff_text.len() > Self::MAX_DIFF_SIZE {
+            return Err(anyhow!("diff_text exceeds 1MB limit"));
+        }
+        if diff_text.contains('\0') {
+            return Err(anyhow!("diff_text contains null bytes"));
+        }
+        Ok(ArtifactDiff { original_version, new_version, diff_text })
+    }
+
     pub fn validate(&self) -> Result<()> {
-        if self.diff_text.len() > 1024 * 1024 {
+        if self.diff_text.len() > Self::MAX_DIFF_SIZE {
             return Err(anyhow!("diff_text exceeds 1MB limit"));
         }
         if self.diff_text.contains('\0') {
