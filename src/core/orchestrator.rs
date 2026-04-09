@@ -181,6 +181,13 @@ impl Orchestrator {
         })
     }
 
+    async fn emit(&self, event: StreamEvent) -> Result<()> {
+        self.event_tx
+            .send(event)
+            .await
+            .map_err(|_| anyhow::anyhow!("event channel closed"))
+    }
+
     pub async fn run_turn(&self, sigma_lock: Arc<Mutex<ConversationState>>) -> Result<bool> {
         let (pre_session_id, pre_turn_idx, pre_recent_turns) = {
             let s = sigma_lock.lock().await;
@@ -299,7 +306,7 @@ impl Orchestrator {
                         Err(e) => {
                             let e = anyhow::anyhow!("Agent {agent_id} failure: {e:?}");
                             if is_rate_limited(&e) && attempt < 3 {
-                                let _ = event_tx.send(StreamEvent::TokenReceived { agent_id: agent_id.clone(), token: format!("\n[{agent_id}] rate-limited, retrying in {}s...\n", delay_ms / 1000) }).await;
+                                event_tx.send(StreamEvent::TokenReceived { agent_id: agent_id.clone(), token: format!("\n[{agent_id}] rate-limited, retrying in {}s...\n", delay_ms / 1000) }).await?;
                                 continue;
                             }
                             return Err(e);
@@ -313,13 +320,13 @@ impl Orchestrator {
                         match stream.next().await {
                             Some(Ok(chunk)) => {
                                 response.push_str(&chunk);
-                                let _ = event_tx.send(StreamEvent::TokenReceived { agent_id: agent_id.clone(), token: chunk }).await;
+                                event_tx.send(StreamEvent::TokenReceived { agent_id: agent_id.clone(), token: chunk }).await?;
                             }
                             Some(Err(e)) => {
                                 let e = anyhow::anyhow!("Agent {agent_id} stream error: {e:?}");
                                 if is_rate_limited(&e) && attempt < 3 {
                                     hit_rate_limit = true;
-                                    let _ = event_tx.send(StreamEvent::TokenReceived { agent_id: agent_id.clone(), token: format!("\n[{agent_id}] rate-limited mid-stream, retrying in {}s...\n", delay_ms / 1000) }).await;
+                                    event_tx.send(StreamEvent::TokenReceived { agent_id: agent_id.clone(), token: format!("\n[{agent_id}] rate-limited mid-stream, retrying in {}s...\n", delay_ms / 1000) }).await?;
                                 } else {
                                     return Err(e);
                                 }
@@ -348,7 +355,7 @@ impl Orchestrator {
                         match r {
                             Ok(val) => final_results.push(val),
                             Err(e) => {
-                                let _ = self.event_tx.send(StreamEvent::Error(format!("Agent dropped: {}", e))).await;
+                                self.emit(StreamEvent::Error(format!("Agent dropped: {}", e))).await?;
                             }
                         }
                     }
@@ -363,13 +370,13 @@ impl Orchestrator {
                         Some(ControlSignal::Resume) => { let _ = paused_tx.send(false); },
                         Some(ControlSignal::Shutdown) => return Ok(false),
                         Some(ControlSignal::Inject(text)) => {
-                            let _ = self.event_tx.send(StreamEvent::TokenReceived { agent_id: "User".to_string(), token: text }).await;
+                            self.emit(StreamEvent::TokenReceived { agent_id: "User".to_string(), token: text }).await?;
                         }
                         Some(ControlSignal::Rewind(index)) => {
                             if let Ok(Some(restored)) = self.state_manager.restore(index) {
                                 let mut s = sigma_lock.lock().await;
                                 *s = restored;
-                                let _ = self.event_tx.send(StreamEvent::TokenReceived { agent_id: "System".to_string(), token: format!("\n[Rewound to iteration {}]\n", index) }).await;
+                                self.emit(StreamEvent::TokenReceived { agent_id: "System".to_string(), token: format!("\n[Rewound to iteration {}]\n", index) }).await?;
                                 return Ok(true);
                             }
                         }
@@ -460,10 +467,10 @@ impl Orchestrator {
                 }
                 None => {
                     retry_count += 1;
-                    let _ = self.event_tx.send(StreamEvent::TokenReceived { 
+                    self.emit(StreamEvent::TokenReceived { 
                         agent_id: "System".to_string(), 
                         token: format!("\n[Self-Healing] Synthesis failed validation. Attempting hot-patch cycle {}/3...\n", retry_count) 
-                    }).await;
+                    }).await?;
 
                     // Re-dispatch to swarm with error context
                     let corrective_prompt = format!(
@@ -487,7 +494,7 @@ impl Orchestrator {
                                 match stream.next().await {
                                     Some(Ok(chunk)) => {
                                         resp.push_str(&chunk);
-                                        let _ = event_tx.send(StreamEvent::TokenReceived { agent_id: agent_id.clone(), token: chunk }).await;
+                                        event_tx.send(StreamEvent::TokenReceived { agent_id: agent_id.clone(), token: chunk }).await?;
                                     }
                                     _ => break,
                                 }
@@ -529,10 +536,10 @@ impl Orchestrator {
         }
 
         let Some((changes, turn_outcome, final_response)) = final_prepared else {
-            let _ = self.event_tx.send(StreamEvent::TokenReceived { 
+            self.emit(StreamEvent::TokenReceived { 
                 agent_id: "System".to_string(), 
                 token: "\n[Self-Healing Failed] Could not converge on a valid synthesis after 3 attempts. Aborting turn.\n".to_string() 
-            }).await;
+            }).await?;
             return Ok(false);
         };
 
@@ -870,7 +877,7 @@ impl Orchestrator {
         let next_p = kalman.update(measurement);
         self.completion_probability.store(next_p.to_bits(), Ordering::Release);
         sigma.completion_probability = next_p;
-        let _ = self.event_tx.send(StreamEvent::ConvergenceUpdated { p: next_p, certainty }).await;
+        self.emit(StreamEvent::ConvergenceUpdated { p: next_p, certainty }).await?;
 
         if let Err(e) = InvariantChecker::check_all(sigma) {
             sigma.artifacts = artifact_snapshot;
@@ -919,29 +926,29 @@ impl Orchestrator {
             counters.insert(agent_id.to_string(), 0);
         }
         self.state_manager.checkpoint(sigma)?;
-        let _ = self.event_tx.send(StreamEvent::CheckpointWritten(current_i)).await;
+        self.emit(StreamEvent::CheckpointWritten(current_i)).await?;
 
         for (name, _) in &turn.diffs {
             if let Some(artifact) = sigma.artifacts.get(name) {
                 match self.file_writer.write_artifact(&artifact.name, &artifact.content).await {
                     Ok(WriteOutcome::Written(path)) => {
-                        let _ = self.event_tx.send(StreamEvent::TokenReceived {
+                        self.emit(StreamEvent::TokenReceived {
                             agent_id: "System".to_string(),
                             token: format!("[write] {}\n", path.display()),
-                        }).await;
+                        }).await?;
                     }
                     Ok(WriteOutcome::Skipped(_)) => {}
                     Ok(WriteOutcome::VerificationFailed(stderr)) => {
-                        let _ = self.event_tx.send(StreamEvent::TokenReceived {
+                        self.emit(StreamEvent::TokenReceived {
                             agent_id: "System".to_string(),
                             token: format!("[write] {name}: verification failed, original restored\n{stderr}"),
-                        }).await;
+                        }).await?;
                     }
                     Err(e) => {
-                        let _ = self.event_tx.send(StreamEvent::TokenReceived {
+                        self.emit(StreamEvent::TokenReceived {
                             agent_id: "System".to_string(),
                             token: format!("[write] error writing {name}: {e}\n"),
-                        }).await;
+                        }).await?;
                     }
                 }
             }
@@ -975,24 +982,22 @@ impl Orchestrator {
             .iter()
             .map(|(name, a)| (name.clone(), a.skeleton.clone()))
             .collect();
-        let _ = self.event_tx.send(StreamEvent::ArtifactsUpdated(artifact_snapshot)).await;
+        self.emit(StreamEvent::ArtifactsUpdated(artifact_snapshot)).await?;
 
-        let _ = self
-            .event_tx
-            .send(StreamEvent::TokenReceived {
+        self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
                 token: format!(
                     "\n[Turn Complete | P(C): {:.2} | Hash: {:02x?}]\n",
                     next_p, &sigma.state_hash[..4]
                 ),
             })
-            .await;
-        let _ = self.event_tx.send(StreamEvent::TurnComplete(turn.clone())).await;
+            .await?;
+        self.emit(StreamEvent::TurnComplete(turn.clone())).await?;
 
         {
             let mut audit_rx: MutexGuard<'_, mpsc::UnboundedReceiver<AuditAlert>> = self.audit_rx.lock().await;
             while let Ok(alert) = audit_rx.try_recv() {
-                let _ = self.event_tx.send(StreamEvent::TokenReceived {
+                self.emit(StreamEvent::TokenReceived {
                     agent_id: "System".to_string(),
                     token: format!(
                         "[audit] Hash mismatch at iteration {}: expected {:02x?}, got {:02x?}",
@@ -1000,7 +1005,7 @@ impl Orchestrator {
                         &alert.expected_hash[..4],
                         &alert.actual_hash[..4]
                     ),
-                }).await;
+                }).await?;
                 if let Ok(Some(safe_state)) = self
                     .state_manager
                     .restore(alert.iteration_index.saturating_sub(1))
@@ -1052,13 +1057,13 @@ impl Orchestrator {
             let eval = SelfImprovementEngine::evaluate_session(sigma);
             let report = AnalyticsEngine::generate_report(sigma);
             let exec_summary = ConvergenceReport::generate(sigma);
-            let _ = self.event_tx.send(StreamEvent::TokenReceived {
+            self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
                 token: format!(
                     "[self-improve] {:?} | [analytics] {:?} | [release] {}",
                     eval, report, exec_summary
                 ),
-            }).await;
+            }).await?;
             self.session_memory_map
                 .lock()
                 .await
