@@ -44,6 +44,7 @@ pub struct SwarmController {
     pub work_notify: Arc<Notify>,
     pub task_queue: Arc<Injector<SubTask>>,
     task_spawner: mpsc::Sender<tokio::task::JoinHandle<()>>,
+    supervisor_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SwarmController {
@@ -53,7 +54,7 @@ impl SwarmController {
         let (task_spawner, mut task_rx) = mpsc::channel(100);
 
         // SUPERVISOR (Reaper)
-        tokio::spawn(async move {
+        let supervisor_handle = tokio::spawn(async move {
             let mut join_set = JoinSet::new();
             loop {
                 tokio::select! {
@@ -74,6 +75,14 @@ impl SwarmController {
             work_notify: Arc::new(Notify::new()),
             task_queue: Arc::new(Injector::new()),
             task_spawner,
+            supervisor_handle: Some(supervisor_handle),
+        }
+    }
+
+    pub async fn shutdown(mut self) {
+        drop(self.task_spawner);
+        if let Some(handle) = self.supervisor_handle.take() {
+            let _ = handle.await;
         }
     }
 
