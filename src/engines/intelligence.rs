@@ -196,7 +196,7 @@ impl IntelligenceEngine {
         let profile = self.profiles.get(model_id)?;
         let mut recent_quality_sum = 0.0;
         let mut valid_turns = 0;
-        let mut category_counts: std::collections::HashMap<TaskCategory, usize> = std::collections::HashMap::new();
+        let mut task_category = TaskCategory::Research;
 
         for turn in recent_turns {
             if turn.model_id == model_id {
@@ -204,7 +204,7 @@ impl IntelligenceEngine {
                 recent_quality_sum += score;
                 valid_turns += 1;
                 if let Some(cat) = turn.task_category {
-                    *category_counts.entry(cat).or_insert(0) += 1;
+                    task_category = cat;
                 }
             }
         }
@@ -219,11 +219,6 @@ impl IntelligenceEngine {
         };
 
         if recent_avg < baseline * 0.9 {
-            let task_category = category_counts
-                .into_iter()
-                .max_by_key(|(_, count)| *count)
-                .map(|(cat, _)| cat)
-                .unwrap_or(TaskCategory::Research);
             return Some(RegressionAlert {
                 agent_id: model_id.to_string(),
                 task_category,
@@ -361,11 +356,8 @@ impl QualityScorer {
             score += 0.05;
         }
 
-        let has_evidence = turn.content.split_whitespace().any(|w| {
-            let word = w.trim_matches(|c: char| !c.is_alphanumeric());
-            word.eq_ignore_ascii_case("evidence") || word.eq_ignore_ascii_case("proof")
-        });
-        if has_evidence {
+        let lower = turn.content.to_lowercase();
+        if lower.contains("evidence") || lower.contains("proof") {
             score += 0.05;
         }
 
