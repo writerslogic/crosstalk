@@ -672,13 +672,14 @@ impl DuplicationDetector {
 pub struct Section {
     pub name: String,
     pub pattern: String,
+    compiled: Option<regex::Regex>,
 }
 
 #[derive(Debug, Clone)]
 pub struct StructureTemplate {
     pub artifact_type: String,
     pub required_sections: Vec<Section>,
-    pub forbidden_patterns: Vec<String>,
+    pub forbidden_patterns: Vec<(String, Option<regex::Regex>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -692,19 +693,22 @@ pub struct StructureEnforcer;
 impl StructureEnforcer {
     #[must_use]
     pub fn rust_template() -> StructureTemplate {
+        let mk_section = |name: &str, pattern: &str| Section {
+            name: name.to_string(),
+            compiled: regex::Regex::new(pattern).ok(),
+            pattern: pattern.to_string(),
+        };
+        let mk_forbidden = |pattern: &str| {
+            let compiled = regex::Regex::new(pattern).ok();
+            (pattern.to_string(), compiled)
+        };
         StructureTemplate {
             artifact_type: "rust".to_string(),
             required_sections: vec![
-                Section {
-                    name: "module_doc".to_string(),
-                    pattern: r"^//[/!]".to_string(),
-                },
-                Section {
-                    name: "test_module".to_string(),
-                    pattern: r"#\[cfg\(test\)\]".to_string(),
-                },
+                mk_section("module_doc", r"^//[/!]"),
+                mk_section("test_module", r"#\[cfg\(test\)\]"),
             ],
-            forbidden_patterns: vec![r"panic!\s*\(.*todo".to_string()],
+            forbidden_patterns: vec![mk_forbidden(r"panic!\s*\(.*todo")],
         }
     }
 
@@ -713,9 +717,7 @@ impl StructureEnforcer {
         let mut violations = Vec::new();
 
         for section in &template.required_sections {
-            let Ok(re) = regex::Regex::new(&section.pattern) else {
-                continue;
-            };
+            let Some(re) = &section.compiled else { continue };
             if !re.is_match(content) {
                 violations.push(StructureViolation {
                     rule: section.name.clone(),
@@ -724,10 +726,8 @@ impl StructureEnforcer {
             }
         }
 
-        for pat in &template.forbidden_patterns {
-            let Ok(re) = regex::Regex::new(pat) else {
-                continue;
-            };
+        for (pat, compiled) in &template.forbidden_patterns {
+            let Some(re) = compiled else { continue };
             if re.is_match(content) {
                 violations.push(StructureViolation {
                     rule: "forbidden_pattern".to_string(),

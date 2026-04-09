@@ -46,7 +46,13 @@ fn get_embedder() -> Option<&'static TextEmbedding> {
                 ],
                 ..Default::default()
             };
-            TextEmbedding::try_new(options).ok()
+            match TextEmbedding::try_new(options) {
+                Ok(model) => Some(model),
+                Err(e) => {
+                    eprintln!("[memory] fastembed model init failed, falling back to hash embeddings: {e}");
+                    None
+                }
+            }
         })
         .as_ref()
 }
