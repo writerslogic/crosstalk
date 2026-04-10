@@ -212,11 +212,11 @@ impl IntelligenceEngine {
         if valid_turns == 0 { return None; }
         let recent_avg = recent_quality_sum / valid_turns as f64;
 
-        let baseline = if profile.task_scores.is_empty() {
-            0.5
-        } else {
-            profile.task_scores.values().map(|avg| avg.mean).sum::<f64>() / profile.task_scores.len() as f64
-        };
+        let baseline = profile
+            .task_scores
+            .get(&task_category)
+            .map(|s| s.mean)
+            .unwrap_or(0.5);
 
         if recent_avg < baseline * 0.9 {
             return Some(RegressionAlert {
@@ -357,7 +357,9 @@ impl QualityScorer {
         }
 
         let lower = turn.content.to_lowercase();
-        if lower.contains("evidence") || lower.contains("proof") {
+        let has_evidence = lower.split(|c: char| !c.is_alphabetic())
+            .any(|w| w == "evidence" || w == "proof");
+        if has_evidence {
             score += 0.05;
         }
 

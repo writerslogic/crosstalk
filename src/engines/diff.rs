@@ -50,11 +50,13 @@ impl DiffEngine {
             diff_text.push_str(&group_text);
         }
 
-        ArtifactDiff {
+        let diff = ArtifactDiff {
             original_version: version,
             new_version: version + 1,
             diff_text,
-        }
+        };
+        diff.validate().ok();
+        diff
     }
 
     /// Reconstructs the new content by applying the patch to the base.
