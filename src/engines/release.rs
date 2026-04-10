@@ -131,10 +131,11 @@ impl CpopVerifier {
         }
         let mut last_hash = [0u8; 32];
         for state in states {
-            if !HashChain::verify(state, &last_hash, &state.state_hash).unwrap_or(false) {
-                return false;
+            match HashChain::verify(state, &last_hash, &state.state_hash) {
+                Ok(true) => last_hash = state.state_hash,
+                Ok(false) => return false,
+                Err(_) => return false,
             }
-            last_hash = state.state_hash;
         }
         true
     }

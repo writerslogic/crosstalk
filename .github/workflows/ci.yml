@@ -49,8 +49,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
-      - name: Test
-        run: cargo test --workspace
+      - name: Test (lib)
+        run: cargo test --lib --workspace
+
+      - name: Test (integration + doc)
+        run: cargo test --workspace --test '*' --doc
 
       # Verus formal proofs are NOT run here. They require a pinned nightly
       # toolchain and Z3, which would add significant CI overhead. See VERUS.md
