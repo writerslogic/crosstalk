@@ -5,12 +5,17 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-fn write_cache_entry(path: &PathBuf, created_at: i64, env: &HashMap<String, String>) {
+fn write_cache_entry(
+    path: &PathBuf,
+    created_at: i64,
+    env: &HashMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap();
+        fs::create_dir_all(parent)?;
     }
     let entry = serde_json::json!({ "created_at": created_at, "env": env });
-    fs::write(path, serde_json::to_vec(&entry).unwrap()).unwrap();
+    fs::write(path, serde_json::to_vec(&entry)?)?;
+    Ok(())
 }
 
 #[test]
@@ -50,7 +55,7 @@ fn test_cache_hit_returns_fast() {
     env.insert("PATH".to_string(), "/nix/store/bin".to_string());
 
     let now = chrono::Utc::now().timestamp();
-    write_cache_entry(&cache_path, now, &env);
+    write_cache_entry(&cache_path, now, &env).expect("write cache entry");
 
     let result = mgr.synthesize().unwrap();
     assert_eq!(result.get("PATH").map(|s| s.as_str()), Some("/nix/store/bin"));
@@ -65,7 +70,7 @@ fn test_cache_expired_is_miss() {
     let cache_path = tmp.path().join(format!("{}.json", cache_key_for(&["git"])));
     let stale_ts = chrono::Utc::now().timestamp() - 7200;
     let env: HashMap<String, String> = HashMap::new();
-    write_cache_entry(&cache_path, stale_ts, &env);
+    write_cache_entry(&cache_path, stale_ts, &env).expect("write cache entry");
 
     // Without nix installed the synthesize call will fail (cache miss -> nix required).
     // We only verify the cache was NOT returned (i.e. we hit an error, not the stale data).
@@ -97,7 +102,7 @@ fn test_get_env_from_cache() {
     let mut env = HashMap::new();
     env.insert("MY_VAR".to_string(), "hello".to_string());
     let now = chrono::Utc::now().timestamp();
-    write_cache_entry(&cache_path, now, &env);
+    write_cache_entry(&cache_path, now, &env).expect("write cache entry");
 
     assert_eq!(mgr.get_env("MY_VAR").as_deref(), Some("hello"));
     assert_eq!(mgr.get_env("NOT_PRESENT"), None);
