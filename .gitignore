@@ -2,3 +2,4 @@
 .env
 .crosstalk_db
 **/*.rs.bk
+.todo-runner/
