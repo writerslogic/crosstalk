@@ -689,8 +689,8 @@ fn test_memory_bridge_push_increments_record_count() {
     assert_eq!(bridge.total_record_count(), 2);
 }
 
-#[test]
-fn test_memory_bridge_cross_session_recall_returns_records_from_all_sessions() {
+#[tokio::test]
+async fn test_memory_bridge_cross_session_recall_returns_records_from_all_sessions() {
     let mut bridge = MemoryBridge::new();
     bridge.open_session("alpha".to_string());
     bridge.open_session("beta".to_string());
@@ -699,6 +699,7 @@ fn test_memory_bridge_cross_session_recall_returns_records_from_all_sessions() {
 
     let results = bridge
         .recall_relevant("alpha", "sorting algorithm", 5, 0)
+        .await
         .unwrap();
     let sessions: Vec<&str> = results.iter().map(|r| r.session_id.as_str()).collect();
     assert!(
@@ -707,8 +708,8 @@ fn test_memory_bridge_cross_session_recall_returns_records_from_all_sessions() {
     );
 }
 
-#[test]
-fn test_memory_bridge_ranking_prefers_tests_passed() {
+#[tokio::test]
+async fn test_memory_bridge_ranking_prefers_tests_passed() {
     let mut bridge = MemoryBridge::new();
     bridge.open_session("s".to_string());
     bridge.push_record("s", make_record(1, "s", "refactor parser module", false));
@@ -716,6 +717,7 @@ fn test_memory_bridge_ranking_prefers_tests_passed() {
 
     let results = bridge
         .recall_relevant("s", "refactor parser module", 2, 0)
+        .await
         .unwrap();
     assert_eq!(results.len(), 2);
     assert!(
@@ -724,26 +726,26 @@ fn test_memory_bridge_ranking_prefers_tests_passed() {
     );
 }
 
-#[test]
-fn test_memory_bridge_max_one_recall_per_turn() {
+#[tokio::test]
+async fn test_memory_bridge_max_one_recall_per_turn() {
     let mut bridge = MemoryBridge::new();
     bridge.open_session("s".to_string());
     bridge.push_record("s", make_record(1, "s", "some content", false));
 
-    let first = bridge.recall_relevant("s", "some content", 5, 42).unwrap();
-    let second = bridge.recall_relevant("s", "some content", 5, 42).unwrap();
+    let first = bridge.recall_relevant("s", "some content", 5, 42).await.unwrap();
+    let second = bridge.recall_relevant("s", "some content", 5, 42).await.unwrap();
     assert!(!first.is_empty(), "first recall should return results");
     assert!(second.is_empty(), "second recall for same turn should return empty");
 }
 
-#[test]
-fn test_memory_bridge_different_turns_both_recall() {
+#[tokio::test]
+async fn test_memory_bridge_different_turns_both_recall() {
     let mut bridge = MemoryBridge::new();
     bridge.open_session("s".to_string());
     bridge.push_record("s", make_record(1, "s", "content", false));
 
-    let r0 = bridge.recall_relevant("s", "content", 5, 0).unwrap();
-    let r1 = bridge.recall_relevant("s", "content", 5, 1).unwrap();
+    let r0 = bridge.recall_relevant("s", "content", 5, 0).await.unwrap();
+    let r1 = bridge.recall_relevant("s", "content", 5, 1).await.unwrap();
     assert!(!r0.is_empty());
     assert!(!r1.is_empty(), "recall on a new turn index should work");
 }

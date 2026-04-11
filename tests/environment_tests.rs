@@ -20,7 +20,7 @@ fn write_cache_entry(
 
 #[test]
 fn test_generate_flake_contains_deps() {
-    let mgr = NixManager::new(vec!["git".to_string(), "curl".to_string()]);
+    let mgr = NixManager::new(vec!["git".to_string(), "curl".to_string()]).unwrap();
     let flake = mgr.generate_flake().unwrap();
     assert!(flake.contains("pkgs.git"), "flake missing pkgs.git");
     assert!(flake.contains("pkgs.curl"), "flake missing pkgs.curl");
@@ -28,7 +28,7 @@ fn test_generate_flake_contains_deps() {
 
 #[test]
 fn test_generate_flake_uses_current_system() {
-    let mgr = NixManager::new(vec![]);
+    let mgr = NixManager::new(vec![]).unwrap();
     let flake = mgr.generate_flake().unwrap();
     assert!(
         flake.contains("builtins.currentSystem"),
@@ -38,7 +38,7 @@ fn test_generate_flake_uses_current_system() {
 
 #[test]
 fn test_generate_flake_empty_deps() {
-    let mgr = NixManager::new(vec![]);
+    let mgr = NixManager::new(vec![]).unwrap();
     let flake = mgr.generate_flake().unwrap();
     assert!(flake.contains("devShells"), "flake missing devShells output");
     assert!(flake.contains("mkShell"), "flake missing mkShell call");
@@ -47,7 +47,7 @@ fn test_generate_flake_empty_deps() {
 #[test]
 fn test_cache_hit_returns_fast() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut mgr = NixManager::new(vec!["git".to_string()]);
+    let mut mgr = NixManager::new(vec!["git".to_string()]).unwrap();
     mgr.cache_dir = tmp.path().to_path_buf();
 
     let cache_path = tmp.path().join(format!("{}.json", cache_key_for(&["git"])));
@@ -64,7 +64,7 @@ fn test_cache_hit_returns_fast() {
 #[test]
 fn test_cache_expired_is_miss() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut mgr = NixManager::new(vec!["git".to_string()]);
+    let mut mgr = NixManager::new(vec!["git".to_string()]).unwrap();
     mgr.cache_dir = tmp.path().to_path_buf();
 
     let cache_path = tmp.path().join(format!("{}.json", cache_key_for(&["git"])));
@@ -88,14 +88,14 @@ fn test_get_env_returns_none_for_unknown() {
     if which::which("nix").is_err() {
         return;
     }
-    let mgr = NixManager::new(vec![]);
+    let mgr = NixManager::new(vec![]).unwrap();
     assert_eq!(mgr.get_env("CROSSTALK_DOES_NOT_EXIST_XYZ"), None);
 }
 
 #[test]
 fn test_get_env_from_cache() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut mgr = NixManager::new(vec!["git".to_string()]);
+    let mut mgr = NixManager::new(vec!["git".to_string()]).unwrap();
     mgr.cache_dir = tmp.path().to_path_buf();
 
     let cache_path = tmp.path().join(format!("{}.json", cache_key_for(&["git"])));
