@@ -108,7 +108,7 @@ impl ShellSanity {
 
         // Secondary check for dangerous patterns within any token or redirection
         for token in &tokens {
-            if Self::DANGEROUS_BINS.iter().any(|&db| db == token.as_str()) {
+            if Self::DANGEROUS_BINS.contains(&token.as_str()) {
                 return true;
             }
             if token.contains(">")
@@ -182,7 +182,7 @@ impl TurnSigner {
     #[must_use]
     pub fn new() -> Self {
         let mut rng = rand::rng();
-        let bytes = Zeroizing::new(<[u8; 32]>::from(rng.random::<[u8; 32]>()));
+        let bytes = Zeroizing::new(rng.random::<[u8; 32]>());
         let signing_key = SigningKey::from_bytes(&bytes);
         Self { signing_key }
     }

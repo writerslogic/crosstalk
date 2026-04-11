@@ -193,18 +193,16 @@ impl SelectState {
     fn move_up(&mut self) {
         if self.cursor == 0 { return; }
         self.cursor -= 1;
-        if matches!(self.items.get(self.cursor), Some(Item::Header { .. })) {
-            if self.cursor > 0 { self.cursor -= 1; }
-        }
+        if matches!(self.items.get(self.cursor), Some(Item::Header { .. }))
+            && self.cursor > 0 { self.cursor -= 1; }
         self.clamp_scroll();
     }
 
     fn move_down(&mut self) {
         if self.cursor + 1 >= self.items.len() { return; }
         self.cursor += 1;
-        if matches!(self.items.get(self.cursor), Some(Item::Header { .. })) {
-            if self.cursor + 1 < self.items.len() { self.cursor += 1; }
-        }
+        if matches!(self.items.get(self.cursor), Some(Item::Header { .. }))
+            && self.cursor + 1 < self.items.len() { self.cursor += 1; }
         self.clamp_scroll();
     }
 
@@ -407,8 +405,8 @@ pub async fn run_model_selector() -> Result<Vec<String>> {
             }
         }
 
-        if event::poll(std::time::Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
+        if event::poll(std::time::Duration::from_millis(50))?
+            && let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -427,7 +425,6 @@ pub async fn run_model_selector() -> Result<Vec<String>> {
                     _ => {}
                 }
             }
-        }
     };
 
     disable_raw_mode()?;

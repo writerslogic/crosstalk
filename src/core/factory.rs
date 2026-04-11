@@ -66,7 +66,7 @@ impl ModelFactory {
             let m_lower = m.to_lowercase();
             let mut found = false;
             if m_lower.starts_with("gpt") || m_lower.starts_with("o1") || m_lower.starts_with("o3") { if env::var("OPENAI_API_KEY").is_ok() { found = true; } }
-            else { for (name, key) in all_keys { if m_lower.contains(&name.to_lowercase()) { if env::var(key).is_ok() { found = true; break; } } } }
+            else { for (name, key) in all_keys { if m_lower.contains(&name.to_lowercase()) && env::var(key).is_ok() { found = true; break; } } }
             if !found && env::var("OPENROUTER_API_KEY").is_err() { return Err(anyhow!("Model {} is unrecognized and no OPENROUTER_API_KEY was found.", m)); }
         }
         Ok(())

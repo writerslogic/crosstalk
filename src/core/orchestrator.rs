@@ -519,7 +519,7 @@ impl Orchestrator {
                     }
                     let results = futures::future::join_all(tasks).await;
                     let mut new_proposals = Vec::new();
-                    for r in results { if let Ok(res) = r { new_proposals.push(res); } }
+                    for res in results.into_iter().flatten() { new_proposals.push(res); }
                     
                     if new_proposals.is_empty() { break; }
 
@@ -1314,8 +1314,8 @@ impl Orchestrator {
             if content_lines.is_empty() { continue; }
 
             // First-line comment may carry the filename
-            if name.is_empty() {
-                if let Some(fname) = Self::extract_comment_filename(content_lines[0]) {
+            if name.is_empty()
+                && let Some(fname) = Self::extract_comment_filename(content_lines[0]) {
                     name = fname;
                     content_lines.remove(0);
                     // drop optional blank separator line
@@ -1323,15 +1323,13 @@ impl Orchestrator {
                         content_lines.remove(0);
                     }
                 }
-            }
 
             // Infer lang from filename extension if still unknown
-            if (lang.is_empty() || lang == "text" || lang == "plaintext") && !name.is_empty() {
-                if let Some(ext) = name.rsplit('.').next() {
+            if (lang.is_empty() || lang == "text" || lang == "plaintext") && !name.is_empty()
+                && let Some(ext) = name.rsplit('.').next() {
                     let inferred = Self::ext_to_lang(ext);
                     if !inferred.is_empty() { lang = inferred.to_string(); }
                 }
-            }
 
             if lang.is_empty() { continue; }
 
