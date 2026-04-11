@@ -70,7 +70,7 @@ fn rollback_does_not_leave_rollback_marker_on_success() {
     })
     .unwrap();
 
-    let checkpoints = mgr.list_checkpoints();
+    let checkpoints = mgr.list_checkpoints().unwrap();
     assert!(
         checkpoints.iter().all(|&idx| idx != u32::MAX),
         "no rollback marker key should persist after success"
@@ -87,5 +87,5 @@ fn rollback_does_not_leave_rollback_marker_on_failure() {
         Err(anyhow::anyhow!("fail"))
     });
 
-    assert_eq!(mgr.list_checkpoints().len(), 0);
+    assert_eq!(mgr.list_checkpoints().unwrap().len(), 0);
 }

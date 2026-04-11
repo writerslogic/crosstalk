@@ -1,6 +1,6 @@
 use crate::types::conversation::{ConversationState, Turn};
 use crate::types::planning::{GoalNode, GoalStatus, GoalTree, Milestone, SessionManifest};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use petgraph::algo::toposort;
 use petgraph::graph::DiGraph;
 use sha2::{Digest, Sha256};
@@ -460,7 +460,8 @@ impl BranchRegistry {
 
         let children_tree = self.db.open_tree(Self::CHILDREN_TREE_NAME)?;
         let mut children: Vec<String> = match children_tree.get(parent_id.as_bytes())? {
-            Some(v) => serde_json::from_slice(&v).unwrap_or_default(),
+            Some(v) => serde_json::from_slice(&v)
+                .with_context(|| format!("corrupt children blob for parent {parent_id}"))?,
             None => Vec::new(),
         };
         if !children.iter().any(|c| c == branch_id) {
@@ -483,7 +484,8 @@ impl BranchRegistry {
     pub fn list_children(&self, parent_id: &str) -> Result<Vec<String>> {
         let children_tree = self.db.open_tree(Self::CHILDREN_TREE_NAME)?;
         match children_tree.get(parent_id.as_bytes())? {
-            Some(v) => Ok(serde_json::from_slice(&v).unwrap_or_default()),
+            Some(v) => Ok(serde_json::from_slice(&v)
+                .with_context(|| format!("corrupt children blob for parent {parent_id}"))?),
             None => Ok(Vec::new()),
         }
     }

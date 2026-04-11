@@ -1,6 +1,6 @@
 use crate::types::events::{ControlSignal, StreamEvent};
 use crate::ui::app::{App, AppMode};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::sync::Arc;
 use std::time::Duration;
@@ -140,15 +140,27 @@ pub async fn run_event_loop(
 
         match action {
             Action::Shutdown => {
-                let _ = ctrl_tx.send(ControlSignal::Shutdown).await;
+                ctrl_tx
+                    .send(ControlSignal::Shutdown)
+                    .await
+                    .context("failed to send Shutdown control signal")?;
                 return Ok(());
             }
             Action::Send(signal) => {
-                let _ = ctrl_tx.send(signal).await;
+                ctrl_tx
+                    .send(signal)
+                    .await
+                    .context("failed to send control signal")?;
             }
             Action::SendTwo(first, second) => {
-                let _ = ctrl_tx.send(first).await;
-                let _ = ctrl_tx.send(second).await;
+                ctrl_tx
+                    .send(first)
+                    .await
+                    .context("failed to send first control signal")?;
+                ctrl_tx
+                    .send(second)
+                    .await
+                    .context("failed to send second control signal")?;
             }
             Action::None => {}
         }

@@ -83,18 +83,24 @@ impl StateManager {
         }
     }
 
-    pub fn list_checkpoints(&self) -> Vec<u32> {
-        self.db
-            .scan_prefix("state:")
-            .filter_map(|r| r.ok())
-            .filter_map(|(k, _)| {
-                std::str::from_utf8(&k)
-                    .ok()?
-                    .strip_prefix("state:")?
-                    .parse::<u32>()
-                    .ok()
-            })
-            .collect()
+    pub fn list_checkpoints(&self) -> Result<Vec<u32>> {
+        let mut out = Vec::new();
+        for entry in self.db.scan_prefix("state:") {
+            let (k, _) = entry.context("failed to scan checkpoint entry")?;
+            let key = std::str::from_utf8(&k)
+                .with_context(|| format!("non-utf8 checkpoint key: {:?}", k.as_ref()))?;
+            let Some(suffix) = key.strip_prefix("state:") else {
+                continue;
+            };
+            if suffix.ends_with(":rollback") {
+                continue;
+            }
+            let idx = suffix
+                .parse::<u32>()
+                .with_context(|| format!("invalid checkpoint index in key: {key}"))?;
+            out.push(idx);
+        }
+        Ok(out)
     }
 }
 
