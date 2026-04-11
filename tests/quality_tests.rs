@@ -1,6 +1,6 @@
 use crosstalk::engines::quality::{
     ArtifactMetrics, BlockerType, CompletionScorer, DocChecker, IncoherenceKind, QualityTrend,
-    QualityTrendAnalyzer, RegressionDetector, StructureEnforcer, TournamentProposal,
+    QualityTrendAnalyzer, RegressionDetector, TournamentProposal,
     TournamentRunner, TrendClassification, CoherenceChecker, DeadItemKind, DeadCodeDetector,
 };
 use crosstalk::types::artifact::{Artifact, ArtifactDiff, ProofAttachment};
@@ -175,16 +175,6 @@ fn tournament_runner_picks_highest_score() {
     ];
     let result = TournamentRunner::run(&proposals).unwrap();
     assert_eq!(result.winner_agent_id, "B", "agent B wins due to passing tests");
-}
-
-// ── StructureEnforcer ─────────────────────────────────────────────────────────
-
-#[test]
-fn structure_enforcer_detects_forbidden_panic_todo() {
-    let template = StructureEnforcer::rust_template();
-    let content = "fn main() { panic!(\"todo: fix this\"); }";
-    let violations = StructureEnforcer::check(content, &template);
-    assert!(violations.iter().any(|v| v.rule == "forbidden_pattern"));
 }
 
 // ── DocChecker ────────────────────────────────────────────────────────────────

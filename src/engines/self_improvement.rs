@@ -209,7 +209,8 @@ impl AbTestManager {
         let var_t = test.iter().map(|&x| (x - mean_t).powi(2)).sum::<f64>() / (n_t - 1.0);
         let se = ((var_c / n_c) + (var_t / n_t)).sqrt();
         if se < f64::EPSILON {
-            return false;
+            let effect = (mean_t - mean_c) / mean_c.abs().max(1e-6);
+            return effect > 0.05;
         }
         let t_stat = (mean_t - mean_c) / se;
         let min_n = n_c.min(n_t);
