@@ -43,8 +43,8 @@ pub struct SwarmController {
     pub state_tx: broadcast::Sender<Turn>,
     pub work_notify: Arc<Notify>,
     pub task_queue: Arc<Injector<SubTask>>,
-    task_spawner: mpsc::Sender<tokio::task::JoinHandle<()>>,
-    supervisor_handle: Option<tokio::task::JoinHandle<()>>,
+    task_spawner: std::sync::Mutex<Option<mpsc::Sender<tokio::task::JoinHandle<()>>>>,
+    supervisor_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl SwarmController {
@@ -74,15 +74,28 @@ impl SwarmController {
             state_tx,
             work_notify: Arc::new(Notify::new()),
             task_queue: Arc::new(Injector::new()),
-            task_spawner,
-            supervisor_handle: Some(supervisor_handle),
+            task_spawner: std::sync::Mutex::new(Some(task_spawner)),
+            supervisor_handle: std::sync::Mutex::new(Some(supervisor_handle)),
         }
     }
 
-    pub async fn shutdown(mut self) {
-        drop(self.task_spawner);
-        if let Some(handle) = self.supervisor_handle.take() {
-            let _ = handle.await;
+    pub async fn shutdown(&self) {
+        {
+            let mut guard = match self.task_spawner.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            guard.take();
+        }
+        let handle = {
+            let mut guard = match self.supervisor_handle.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            guard.take()
+        };
+        if let Some(h) = handle {
+            let _ = h.await;
         }
     }
 
@@ -146,7 +159,17 @@ impl SwarmController {
             nodes_ref.insert(id_clone, NodeStatus::Complete);
         });
 
-        self.task_spawner
+        let sender = {
+            let guard = match self.task_spawner.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| anyhow!("Critical: Swarm Supervisor shut down"))?
+        };
+        sender
             .send(worker_handle)
             .await
             .map_err(|_| anyhow!("Critical: Swarm Supervisor died"))

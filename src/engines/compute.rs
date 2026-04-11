@@ -356,32 +356,47 @@ impl BatchScheduler {
 
 pub struct RequestRateLimiter {
     requests_per_minute: u32,
-    timestamps: HashMap<String, Vec<Instant>>,
+    timestamps: std::sync::Mutex<HashMap<String, Vec<Instant>>>,
 }
 
 impl RequestRateLimiter {
     pub fn new(requests_per_minute: u32) -> Self {
         Self {
             requests_per_minute,
-            timestamps: HashMap::new(),
+            timestamps: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    pub async fn wait_for_permit(&mut self, model_id: &str) {
-        let now = Instant::now();
+    pub async fn wait_for_permit(&self, model_id: &str) {
         let window = Duration::from_secs(60);
-        let entries = self.timestamps.entry(model_id.to_string()).or_default();
-        entries.retain(|t| now.duration_since(*t) < window);
-
-        if entries.len() >= self.requests_per_minute as usize {
-            if let Some(oldest) = entries.first() {
-                let wait = window.saturating_sub(now.duration_since(*oldest));
-                if !wait.is_zero() {
-                    tokio::time::sleep(wait).await;
-                }
+        let wait_duration = {
+            let mut guard = match self.timestamps.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            let entries = guard.entry(model_id.to_string()).or_default();
+            let now = Instant::now();
+            entries.retain(|t| now.duration_since(*t) < window);
+            if entries.len() >= self.requests_per_minute as usize {
+                entries
+                    .first()
+                    .map(|t| window.saturating_sub(now.duration_since(*t)))
+                    .unwrap_or(Duration::ZERO)
+            } else {
+                entries.push(now);
+                Duration::ZERO
             }
-            entries.retain(|t| Instant::now().duration_since(*t) < window);
+        };
+        if !wait_duration.is_zero() {
+            tokio::time::sleep(wait_duration).await;
+            let mut guard = match self.timestamps.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            let entries = guard.entry(model_id.to_string()).or_default();
+            let now = Instant::now();
+            entries.retain(|t| now.duration_since(*t) < window);
+            entries.push(now);
         }
-        entries.push(Instant::now());
     }
 }

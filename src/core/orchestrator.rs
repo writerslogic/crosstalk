@@ -2,7 +2,7 @@ use crate::core::agent_trait::PromptAgent;
 use crate::core::state::StateManager;
 use crate::engines::analytics::AnalyticsEngine;
 use crate::engines::collective_intelligence::{CollectiveIntelligenceEngine, EnsembleEngine};
-use crate::engines::compute::ComputeManager;
+use crate::engines::compute::{ComputeManager, RequestRateLimiter};
 use crate::engines::consensus::{
     CertaintyAnalyzer, InfluenceWeightManager, KalmanConvergence,
 };
@@ -92,6 +92,7 @@ pub struct Orchestrator {
     session_ctx: Mutex<SessionContext>,
     rollback_counters: Mutex<BTreeMap<String, u32>>,
     skip_until: Mutex<BTreeMap<String, u32>>,
+    rate_limiter: Arc<RequestRateLimiter>,
 }
 
 fn is_rate_limited(e: &anyhow::Error) -> bool {
@@ -178,7 +179,17 @@ impl Orchestrator {
                 );
                 m
             })),
+            rate_limiter: Arc::new(RequestRateLimiter::new(
+                std::env::var("CROSSTALK_RPM")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(60),
+            )),
         })
+    }
+
+    pub async fn shutdown(&self) {
+        self.swarm.shutdown().await;
     }
 
     async fn emit(&self, event: StreamEvent) -> Result<()> {
@@ -292,6 +303,7 @@ impl Orchestrator {
             let prompt = prompt.clone();
             let event_tx = self.event_tx.clone();
             let mut p_rx = paused_rx.clone();
+            let rate_limiter = Arc::clone(&self.rate_limiter);
 
             tasks.push(async move {
                 let mut delay_ms = 1_000u64;
@@ -301,6 +313,7 @@ impl Orchestrator {
                         delay_ms = (delay_ms * 2).min(30_000);
                     }
 
+                    rate_limiter.wait_for_permit(&agent_id).await;
                     let mut stream = match agent.stream_prompt(&prompt).await {
                         Ok(s) => s,
                         Err(e) => {
@@ -427,30 +440,30 @@ impl Orchestrator {
 
         let secrets = SecretScanner::scan(&response);
         if !secrets.is_empty() {
-            let _ = self
-                .event_tx
-                .send(StreamEvent::TokenReceived { agent_id: "System".to_string(), token: "\n[Blocked: Security Violation]\n".to_string() })
-                .await;
+            self.emit(StreamEvent::TokenReceived {
+                agent_id: "System".to_string(),
+                token: "\n[Blocked: Security Violation]\n".to_string(),
+            })
+            .await?;
             return Ok(false);
         }
 
         if TautologyFilter::is_tautological(&response, &history_contents) {
-            let _ = self
-                .event_tx
-                .send(StreamEvent::TokenReceived { agent_id: "System".to_string(), token: "\n[Pruned: Tautology]\n".to_string() })
-                .await;
+            self.emit(StreamEvent::TokenReceived {
+                agent_id: "System".to_string(),
+                token: "\n[Pruned: Tautology]\n".to_string(),
+            })
+            .await?;
             return Ok(false);
         }
 
         let fallacies = FallacyDetector::scan(&response);
         if !fallacies.is_empty() {
-            let _ = self
-                .event_tx
-                .send(StreamEvent::TokenReceived { agent_id: "System".to_string(), token: format!(
-                    "\n[Warning: {} fallacies detected]\n",
-                    fallacies.len()
-                ) })
-                .await;
+            self.emit(StreamEvent::TokenReceived {
+                agent_id: "System".to_string(),
+                token: format!("\n[Warning: {} fallacies detected]\n", fallacies.len()),
+            })
+            .await?;
         }
 
         // Phase 4: Validate and prepare artifact changes — no lock held.
@@ -485,8 +498,10 @@ impl Orchestrator {
                         let p = corrective_prompt.clone();
                         let event_tx = self.event_tx.clone();
                         let mut p_rx = paused_rx.clone();
+                        let rate_limiter = Arc::clone(&self.rate_limiter);
 
                         tasks.push(async move {
+                            rate_limiter.wait_for_permit(&agent_id).await;
                             let mut stream = agent.stream_prompt(&p).await.map_err(|e| anyhow::anyhow!("Agent {agent_id} failure: {e:?}"))?;
                             let mut resp = String::new();
                             loop {
@@ -589,24 +604,21 @@ impl Orchestrator {
 
         for (name, (lang, new_content)) in proposed {
             if let Err(e) = AstValidator::validate(&new_content, &lang) {
-                let _ = self
-                    .event_tx
-                    .send(StreamEvent::TokenReceived { agent_id: "System".to_string(), token: format!(
-                        "[diff] artifact \"{name}\" rejected: AST validation failed: {e}"
-                    ) })
-                    .await;
+                self.emit(StreamEvent::TokenReceived {
+                    agent_id: "System".to_string(),
+                    token: format!("[diff] artifact \"{name}\" rejected: AST validation failed: {e}"),
+                })
+                .await?;
                 return Ok(None);
             }
 
             let dups = QualityEngine::detect_duplication(&new_content, snapshot);
             if !dups.is_empty() {
-                let _ = self
-                    .event_tx
-                    .send(StreamEvent::TokenReceived { agent_id: "System".to_string(), token: format!(
-                        "[quality] duplication detected for \"{name}\": {:?}",
-                        dups
-                    ) })
-                    .await;
+                self.emit(StreamEvent::TokenReceived {
+                    agent_id: "System".to_string(),
+                    token: format!("[quality] duplication detected for \"{name}\": {:?}", dups),
+                })
+                .await?;
             }
 
             let default_artifact = Arc::new(Artifact {
@@ -773,20 +785,18 @@ impl Orchestrator {
             let mut se = self.surprise_engine.lock().await;
             se.record_prediction(agent_id, certainty);
             let s = se.compute_surprise(agent_id, turn_outcome);
-            if s > 0.5 {
-                let _ = self
-                    .event_tx
-                    .send(StreamEvent::TokenReceived { agent_id: "System".to_string(), token: format!(
-                        "[sandbox] High Surprise detected: {:.2}",
-                        s
-                    ) })
-                    .await;
-            }
             let current_w = sigma.agent_weights.get(agent_id).copied().unwrap_or(1.0);
             let new_w = se.calibrate_weight(agent_id, current_w);
             sigma.agent_weights.insert(agent_id.to_string(), new_w);
             s
         };
+        if surprise > 0.5 {
+            self.emit(StreamEvent::TokenReceived {
+                agent_id: "System".to_string(),
+                token: format!("[sandbox] High Surprise detected: {:.2}", surprise),
+            })
+            .await?;
+        }
 
         let mut turn = Turn {
             index: sigma.iteration_index,
@@ -814,25 +824,29 @@ impl Orchestrator {
             (base - surprise_penalty).max(0.0)
         };
         {
-            let intell = self.intelligence.lock().await;
-            let recent_turns: Vec<Turn> = sigma
-                .turns
-                .iter()
-                .rev()
-                .take(5)
-                .cloned()
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            if let Some(alert) = intell.detect_regression(agent_id, &recent_turns) {
-                let _ = self
-                    .event_tx
-                    .send(StreamEvent::TokenReceived { agent_id: "System".to_string(), token: format!(
+            let alert_info = {
+                let intell = self.intelligence.lock().await;
+                let recent_turns: Vec<Turn> = sigma
+                    .turns
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                intell.detect_regression(agent_id, &recent_turns)
+            };
+            if let Some(alert) = alert_info {
+                self.emit(StreamEvent::TokenReceived {
+                    agent_id: "System".to_string(),
+                    token: format!(
                         "[intelligence] Regression detected for {}: {:.2} -> {:.2}",
                         alert.agent_id, alert.baseline_mean, alert.recent_mean
-                    ) })
-                    .await;
+                    ),
+                })
+                .await?;
             }
         }
 
@@ -894,19 +908,17 @@ impl Orchestrator {
                 }
                 exceeded
             };
-            let _ = self
-                .event_tx
-                .send(StreamEvent::TokenReceived { agent_id: "System".to_string(), token: format!(
-                    "[rollback] Invariant violation: {e}"
-                ) })
-                .await;
+            self.emit(StreamEvent::TokenReceived {
+                agent_id: "System".to_string(),
+                token: format!("[rollback] Invariant violation: {e}"),
+            })
+            .await?;
             if should_skip {
-                let _ = self
-                    .event_tx
-                    .send(StreamEvent::TokenReceived { agent_id: "System".to_string(), token: format!(
-                        "[rollback] Agent {agent_id} exceeded consecutive rollbacks"
-                    ) })
-                    .await;
+                self.emit(StreamEvent::TokenReceived {
+                    agent_id: "System".to_string(),
+                    token: format!("[rollback] Agent {agent_id} exceeded consecutive rollbacks"),
+                })
+                .await?;
                 let mut skips = self.skip_until.lock().await;
                 skips.insert(agent_id.to_string(), sigma.iteration_index + 1);
             }
