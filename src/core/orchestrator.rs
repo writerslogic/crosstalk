@@ -386,7 +386,7 @@ impl Orchestrator {
                             self.emit(StreamEvent::TokenReceived { agent_id: "User".to_string(), token: text }).await?;
                         }
                         Some(ControlSignal::Rewind(index)) => {
-                            if let Ok(Some(restored)) = self.state_manager.restore(index) {
+                            if let Ok(Some(restored)) = self.state_manager.restore_async(index).await {
                                 let mut s = sigma_lock.lock().await;
                                 *s = restored;
                                 self.emit(StreamEvent::TokenReceived { agent_id: "System".to_string(), token: format!("\n[Rewound to iteration {}]\n", index) }).await?;
@@ -937,7 +937,7 @@ impl Orchestrator {
             let mut counters = self.rollback_counters.lock().await;
             counters.insert(agent_id.to_string(), 0);
         }
-        self.state_manager.checkpoint(sigma)?;
+        self.state_manager.checkpoint_async(sigma).await?;
         self.emit(StreamEvent::CheckpointWritten(current_i)).await?;
 
         for (name, _) in &turn.diffs {

@@ -31,6 +31,21 @@ impl StateManager {
         Ok(())
     }
 
+    /// Async-safe variant of [`Self::checkpoint`]: the blocking sled insert + fsync
+    /// are moved to the blocking-thread pool so the reactor is never stalled.
+    pub async fn checkpoint_async(&self, state: &ConversationState) -> Result<()> {
+        let key = format!("state:{}", state.iteration_index);
+        let encoded = serde_json::to_vec(state)?;
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            db.insert(key.as_bytes(), encoded)?;
+            db.flush()?;
+            Ok(())
+        })
+        .await
+        .context("checkpoint task panicked")?
+    }
+
     /// Rewind :: σ_t ← σ_{t-k}
     pub fn restore(&self, index: u32) -> Result<Option<ConversationState>> {
         let key = format!("state:{}", index);
@@ -38,6 +53,21 @@ impl StateManager {
             Some(data) => Ok(Some(serde_json::from_slice(&data)?)),
             None => Ok(None),
         }
+    }
+
+    /// Async-safe variant of [`Self::restore`]: the blocking sled read is moved
+    /// to the blocking-thread pool so the reactor is never stalled.
+    pub async fn restore_async(&self, index: u32) -> Result<Option<ConversationState>> {
+        let key = format!("state:{}", index);
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<ConversationState>> {
+            match db.get(key.as_bytes())? {
+                Some(data) => Ok(Some(serde_json::from_slice(&data)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+        .context("restore task panicked")?
     }
 
     /// Atomically execute `f` against `state`, checkpointing the result on
