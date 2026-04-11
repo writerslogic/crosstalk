@@ -56,8 +56,9 @@ impl PromptAgent for MockAgent {
 }
 
 async fn make_orchestrator(manager: StateManager, agents: Vec<Box<dyn PromptAgent>>) -> Orchestrator {
-    let (event_tx, _event_rx) = mpsc::channel::<StreamEvent>(1000);
+    let (event_tx, mut event_rx) = mpsc::channel::<StreamEvent>(1000);
     let (_control_tx, control_rx) = mpsc::channel::<ControlSignal>(100);
+    tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
     Orchestrator::new(manager, agents, event_tx, control_rx).await.expect("Failed to create orchestrator")
 }
 
