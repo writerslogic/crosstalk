@@ -21,6 +21,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use fastembed::{TextEmbedding, InitOptions, ExecutionProviderDispatch};
 use ort::{CoreMLExecutionProvider, CPUExecutionProvider};
+use std::panic;
 
 const EMBEDDING_DIM: usize = 384;
 const DEFAULT_TABLE: &str = "memory";
@@ -40,19 +41,19 @@ static EMBEDDER: OnceLock<Option<TextEmbedding>> = OnceLock::new();
 fn get_embedder() -> Option<&'static TextEmbedding> {
     EMBEDDER
         .get_or_init(|| {
-            let options = InitOptions {
-                execution_providers: vec![
-                    ExecutionProviderDispatch::from(CoreMLExecutionProvider::default()),
-                    ExecutionProviderDispatch::from(CPUExecutionProvider::default()),
-                ],
-                ..Default::default()
-            };
-            match TextEmbedding::try_new(options) {
-                Ok(model) => Some(model),
-                Err(e) => {
-                    eprintln!("[memory] fastembed model init failed, falling back to hash embeddings: {e}");
-                    None
-                }
+            let result = panic::catch_unwind(|| {
+                let options = InitOptions {
+                    execution_providers: vec![
+                        ExecutionProviderDispatch::from(CoreMLExecutionProvider::default()),
+                        ExecutionProviderDispatch::from(CPUExecutionProvider::default()),
+                    ],
+                    ..Default::default()
+                };
+                TextEmbedding::try_new(options)
+            });
+            match result {
+                Ok(Ok(model)) => Some(model),
+                _ => None,
             }
         })
         .as_ref()

@@ -45,7 +45,7 @@ which = "7.0.1"
 wgpu = "24.0.1"
 winit = "0.30.9"
 bytemuck = { version = "1.21.0", features = ["derive"] }
-fastembed = { version = "3", features = ["ort-download-binaries"] }
+fastembed = { version = "3", default-features = false, features = ["online", "ort-load-dynamic"] }
 ort = { version = "=2.0.0-rc.4", features = ["coreml"] }
 flate2 = "1.0"
 zeroize = { version = "1.8", features = ["derive"] }
