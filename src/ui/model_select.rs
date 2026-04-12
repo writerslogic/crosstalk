@@ -394,11 +394,11 @@ pub async fn run_model_selector() -> Result<Vec<String>> {
     let result = loop {
         // Drain any completed provider fetches
         while let Ok((provider, ids)) = rx.try_recv() {
-            state.lock().unwrap().add_models(&provider, ids);
+            state.lock().unwrap_or_else(|p| p.into_inner()).add_models(&provider, ids);
         }
 
         {
-            let s = state.lock().unwrap();
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
             terminal.draw(|f| draw_selector(f, &s))?;
             if s.done {
                 break if s.confirm { s.selected_ids() } else { vec![] };
@@ -410,7 +410,7 @@ pub async fn run_model_selector() -> Result<Vec<String>> {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                let mut s = state.lock().unwrap();
+                let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => s.move_up(),
                     KeyCode::Down | KeyCode::Char('j') => s.move_down(),

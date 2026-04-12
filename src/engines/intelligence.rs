@@ -56,15 +56,20 @@ impl CheckpointService {
         Self { flush_tx: Some(tx), handle: Some(handle) }
     }
 
-    fn trigger(&self) {
+    fn trigger(&self) -> Result<()> {
         if let Some(tx) = &self.flush_tx {
-            let _ = tx.try_send(());
+            match tx.try_send(()) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(anyhow!("checkpoint flush channel closed; flusher task is dead"));
+                }
+            }
         }
+        Ok(())
     }
 
     pub fn save_all(&self) -> Result<()> {
-        self.trigger();
-        Ok(())
+        self.trigger()
     }
 }
 
@@ -183,7 +188,7 @@ impl IntelligenceEngine {
     }
 
     fn trigger_save(&self) {
-        self.checkpoint.trigger();
+        let _ = self.checkpoint.trigger();
     }
 
     pub fn save_all(&self) -> Result<()> {
