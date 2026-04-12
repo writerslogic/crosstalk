@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use rand::{Rng, SeedableRng, rng};
 use rand::rngs::SmallRng;
 use rayon::prelude::*;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -117,27 +116,11 @@ fn trial_phase(i: usize, total: usize) -> TrialPhase {
 // SANDBOX STUB (wired separately in production)
 // =====================================================================
 
-pub struct SandboxManager;
-impl SandboxManager {
-    pub fn new() -> Result<Self> {
-        Ok(Self)
-    }
-}
-
-// =====================================================================
-// THE ENGINE
-// =====================================================================
-
-pub struct MonteCarloRunner {
-    #[allow(dead_code)]
-    sandbox: Arc<SandboxManager>,
-}
+pub struct MonteCarloRunner;
 
 impl MonteCarloRunner {
     pub fn new() -> Result<Self> {
-        Ok(Self {
-            sandbox: Arc::new(SandboxManager::new()?),
-        })
+        Ok(Self)
     }
 
     /// Variance-aware prediction over `crate::types::artifact` types.
