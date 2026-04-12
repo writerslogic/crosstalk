@@ -340,8 +340,7 @@ impl CliBridge {
         cmd.args(&args);
 
         if let Some(env) = env_override {
-            // Clear parent environment for isolation; inject only Nix-provided vars.
-            cmd.env_clear().envs(env);
+            cmd.envs(env);
         }
 
         let output = cmd.output()?;
@@ -378,7 +377,7 @@ impl CliBridge {
         let mut cmd = TokioCommand::new(&resolved);
         cmd.args(&args);
         if let Some(env) = env_override {
-            cmd.env_clear().envs(env);
+            cmd.envs(env);
         }
 
         let tool_name = binary_path.to_string();

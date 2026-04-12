@@ -1,4 +1,5 @@
 use crate::core::agent_trait::PromptAgent;
+use crate::core::environment::NixManager;
 use crate::core::state::StateManager;
 use crate::engines::analytics::AnalyticsEngine;
 use crate::engines::collective_intelligence::{CollectiveIntelligenceEngine, EnsembleEngine};
@@ -91,6 +92,7 @@ pub struct Orchestrator {
     rollback_counters: Mutex<BTreeMap<String, u32>>,
     skip_until: Mutex<BTreeMap<String, u32>>,
     rate_limiter: Arc<RequestRateLimiter>,
+    nix_env: Option<HashMap<String, String>>,
 }
 
 fn resolve_memory_store_path() -> Result<String> {
@@ -132,6 +134,24 @@ impl Orchestrator {
         for tool in tools {
             mcp_gateway.register_tool(tool);
         }
+
+        let nix_env = tokio::task::spawn_blocking(|| {
+            if which::which("nix").is_err() {
+                return None;
+            }
+            let deps: Vec<String> = ["rustc", "cargo", "git", "gcc", "pkg-config"]
+                .iter()
+                .filter(|d| which::which(d).is_ok())
+                .map(|d| d.to_string())
+                .collect();
+            NixManager::new(deps)
+                .ok()
+                .and_then(|mgr| mgr.synthesize().ok())
+        })
+        .await
+        .unwrap_or(None);
+
+        mcp_gateway.set_nix_env(nix_env.clone());
 
         let (alert_tx, alert_rx) = mpsc::unbounded_channel::<AuditAlert>();
         let auditor_tx = Some(ContinuousAuditor::spawn(alert_tx));
@@ -196,6 +216,7 @@ impl Orchestrator {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(60),
             )),
+            nix_env,
         })
     }
 
@@ -704,7 +725,7 @@ impl Orchestrator {
                     stderr: String::new(),
                 };
                 let tmp = std::env::temp_dir();
-                match LinterGuard::check(&sandbox_result, tmp.to_str().unwrap_or("/tmp")).await {
+                match LinterGuard::check(&sandbox_result, tmp.to_str().unwrap_or("/tmp"), self.nix_env.as_ref()).await {
                     Ok(report) if !report.passed => return Ok(None),
                     Err(_) => return Ok(None),
                     _ => {}

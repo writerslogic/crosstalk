@@ -1,6 +1,7 @@
 use crate::engines::sandbox::SandboxResult;
 use crate::types::artifact::Artifact;
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Command;
@@ -70,11 +71,11 @@ pub struct LinterGuard;
 
 impl LinterGuard {
     /// Full workspace lint. Returns a `LintReport`; errors block, warnings log.
-    pub async fn check(sandbox_result: &SandboxResult, workspace_dir: &str) -> Result<LintReport> {
+    pub async fn check(sandbox_result: &SandboxResult, workspace_dir: &str, env: Option<&HashMap<String, String>>) -> Result<LintReport> {
         if sandbox_result.exit_code != 0 {
             return Err(anyhow!("Sandbox failed: {}", sandbox_result.stderr));
         }
-        Self::run_clippy(workspace_dir).await
+        Self::run_clippy(workspace_dir, env).await
     }
 
     /// Lint a single artifact without a full workspace build.
@@ -157,7 +158,7 @@ impl LinterGuard {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    async fn run_clippy(workspace_dir: &str) -> Result<LintReport> {
+    async fn run_clippy(workspace_dir: &str, env: Option<&HashMap<String, String>>) -> Result<LintReport> {
         let ws = workspace_dir.to_string();
         let resolved = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf> {
             let p = Path::new(&ws)
@@ -179,8 +180,8 @@ impl LinterGuard {
             return Err(anyhow!("Refusing to lint workspace containing build.rs (arbitrary code execution risk)"));
         }
 
-        let child = Command::new("cargo")
-            .current_dir(&resolved)
+        let mut cmd = Command::new("cargo");
+        cmd.current_dir(&resolved)
             .args([
                 "clippy",
                 "--all-targets",
@@ -188,8 +189,11 @@ impl LinterGuard {
                 "--message-format=json",
             ])
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        if let Some(env) = env {
+            cmd.envs(env);
+        }
+        let child = cmd.spawn()?;
 
         let output = timeout(Duration::from_secs(30), child.wait_with_output())
             .await

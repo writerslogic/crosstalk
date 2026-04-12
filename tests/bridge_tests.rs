@@ -127,8 +127,8 @@ fn test_invoke_env_override_injects_vars() {
 }
 
 #[test]
-fn test_invoke_env_override_isolates_from_parent() {
-    // With env_override the child should NOT see the parent's env vars.
+fn test_invoke_env_override_additive() {
+    // env_override is additive: supplied vars are merged into the parent env.
     let printenv = match which::which("printenv") {
         Ok(p) => p,
         Err(_) => std::path::PathBuf::from("/usr/bin/printenv"),
@@ -137,21 +137,16 @@ fn test_invoke_env_override_isolates_from_parent() {
         return;
     }
 
-    // Set a canary var in the parent process env.
-    // SAFETY: test-only, single-threaded at this point.
-    unsafe { std::env::set_var("CROSSTALK_CANARY", "should_not_appear") };
-
     let mut env = HashMap::new();
-    env.insert("ISOLATED".into(), "yes".into());
+    env.insert("CROSSTALK_ADDED_VAR".into(), "present".into());
 
     let result = CliBridge::invoke(
         printenv.to_str().unwrap(),
-        vec!["CROSSTALK_CANARY".into()],
+        vec!["CROSSTALK_ADDED_VAR".into()],
         Some(&env),
     )
     .unwrap();
-    // printenv exits non-zero and prints nothing when the var is absent.
-    assert!(result.output.trim().is_empty());
+    assert_eq!(result.output.trim(), "present");
 }
 
 #[test]

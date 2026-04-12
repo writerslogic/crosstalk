@@ -33,7 +33,7 @@ fn failed_sandbox() -> SandboxResult {
 
 #[tokio::test]
 async fn test_check_rejects_failed_sandbox() {
-    let result = LinterGuard::check(&failed_sandbox(), "/tmp").await;
+    let result = LinterGuard::check(&failed_sandbox(), "/tmp", None).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("Sandbox failed"));
 }
@@ -41,14 +41,14 @@ async fn test_check_rejects_failed_sandbox() {
 #[tokio::test]
 async fn test_check_passes_when_no_cargo_toml() {
     // /tmp has no Cargo.toml, so clippy is skipped and we get a passing report
-    let report = LinterGuard::check(&ok_sandbox(), "/tmp").await.unwrap();
+    let report = LinterGuard::check(&ok_sandbox(), "/tmp", None).await.unwrap();
     assert!(report.passed);
     assert!(report.errors.is_empty());
 }
 
 #[tokio::test]
 async fn test_check_returns_lint_report_type() {
-    let report = LinterGuard::check(&ok_sandbox(), "/tmp").await.unwrap();
+    let report = LinterGuard::check(&ok_sandbox(), "/tmp", None).await.unwrap();
     let _: LintReport = report;
 }
 

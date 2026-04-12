@@ -338,6 +338,7 @@ pub struct McpGateway {
     pub resources: Vec<McpResource>,
     pub prompt_templates: Vec<serde_json::Value>,
     confirmation_override: Option<bool>,
+    pub nix_env: Option<HashMap<String, String>>,
 }
 
 impl McpGateway {
@@ -349,7 +350,12 @@ impl McpGateway {
             resources: vec![],
             prompt_templates: vec![],
             confirmation_override: None,
+            nix_env: None,
         }
+    }
+
+    pub fn set_nix_env(&mut self, env: Option<HashMap<String, String>>) {
+        self.nix_env = env;
     }
 
     pub fn set_confirmation_override(&mut self, v: Option<bool>) {
@@ -590,7 +596,10 @@ impl McpGateway {
 
         let bin = name.to_string();
         let tool_timeout = self.timeout_manager.duration_for(name);
-        let fut = tokio::task::spawn_blocking(move || CliBridge::invoke(&bin, cli_args, None));
+        let env_ref = self.nix_env.clone();
+        let fut = tokio::task::spawn_blocking(move || {
+            CliBridge::invoke(&bin, cli_args, env_ref.as_ref())
+        });
 
         match timeout(tool_timeout, fut).await {
             Ok(res) => {
