@@ -10,8 +10,7 @@ use tokio::time::{interval, Duration};
 
 pub struct CheckpointService {
     flush_tx: Option<mpsc::Sender<()>>,
-    #[allow(dead_code)]
-    handle: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl CheckpointService {

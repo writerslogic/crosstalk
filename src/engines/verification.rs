@@ -231,20 +231,6 @@ impl ProofExporter {
     }
 
     /// Produce a fully specified Lean 4 theorem block.
-    pub fn to_lean4_theorem(
-        theorem_name: &str,
-        statement: &str,
-        proof: &str,
-    ) -> Result<String> {
-        if theorem_name.trim().is_empty() {
-            return Err(anyhow!("theorem_name must not be empty"));
-        }
-        if statement.trim().is_empty() {
-            return Err(anyhow!("statement must not be empty"));
-        }
-        Ok(format!("theorem {theorem_name} {statement} :=\n  {proof}\n"))
-    }
-
     /// Write all core invariant theorems to `{output_dir}/Invariants.lean`.
     pub async fn export_all_proofs(output_dir: &str) -> Result<()> {
         let dir = Path::new(output_dir);

@@ -35,8 +35,6 @@ pub struct CrosstalkUI {
     input_buffer: String,
     active_pane: FocusedPane,
     playback_index: u32,
-    #[allow(dead_code)]
-    expanded_nodes: std::collections::HashSet<String>,
 }
 
 impl CrosstalkUI {
@@ -56,7 +54,6 @@ impl CrosstalkUI {
             input_buffer: String::new(),
             active_pane: FocusedPane::GhostStream,
             playback_index: 0,
-            expanded_nodes: std::collections::HashSet::new(),
         })
     }
 

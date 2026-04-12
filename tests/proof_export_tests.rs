@@ -17,38 +17,12 @@ fn to_lean4_includes_invariant_name() {
 }
 
 // ----------------------------------------------------------------
-// 2. to_lean4_theorem produces well-structured Lean 4 syntax.
-// ----------------------------------------------------------------
-#[test]
-fn to_lean4_theorem_valid_structure() {
-    let out = ProofExporter::to_lean4_theorem(
-        "trivial_lemma",
-        "(h : 1 = 1) : 1 = 1",
-        "h",
-    )
-    .unwrap();
-    assert!(out.starts_with("theorem trivial_lemma"), "must start with 'theorem <name>'");
-    assert!(out.contains(":="), "must include ':='");
-    assert!(out.contains("h"), "proof term must appear in output");
-}
-
-// ----------------------------------------------------------------
-// 3. Reject empty theorem/invariant names.
+// 2. Reject empty theorem/invariant names.
 // ----------------------------------------------------------------
 #[test]
 fn to_lean4_rejects_empty_name() {
     assert!(ProofExporter::to_lean4("", "some sketch").is_err());
     assert!(ProofExporter::to_lean4("   ", "some sketch").is_err());
-}
-
-#[test]
-fn to_lean4_theorem_rejects_empty_name() {
-    assert!(ProofExporter::to_lean4_theorem("", "True", "trivial").is_err());
-}
-
-#[test]
-fn to_lean4_theorem_rejects_empty_statement() {
-    assert!(ProofExporter::to_lean4_theorem("foo", "", "trivial").is_err());
 }
 
 // ----------------------------------------------------------------

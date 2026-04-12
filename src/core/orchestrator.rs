@@ -16,7 +16,7 @@ use crate::engines::quality::{ArtifactMetrics, QualityEngine, RegressionDetector
 use crate::engines::reasoning::{ReasoningEngine, SynthesisEngine};
 use crate::engines::release::ConvergenceReport;
 use crate::engines::simulation::MonteCarloRunner;
-use crate::engines::sandbox::{SandboxManager, SandboxResult};
+use crate::engines::sandbox::SandboxResult;
 use crate::engines::verification::{AuditAlert, ContinuousAuditor, HashChain, InvariantChecker, TautologyFilter};
 use crate::engines::security::SecretScanner;
 use crate::engines::FallacyDetector;
@@ -66,8 +66,6 @@ pub struct Orchestrator {
     state_manager: StateManager,
     event_tx: mpsc::Sender<StreamEvent>,
     control_rx: Mutex<mpsc::Receiver<ControlSignal>>,
-    #[allow(dead_code)]
-    sandbox: SandboxManager,
     mc_runner: MonteCarloRunner,
     pub mcp_gateway: McpGateway,
     pub memory_store: MemoryStore,
@@ -143,7 +141,6 @@ impl Orchestrator {
             state_manager,
             event_tx,
             control_rx: Mutex::new(control_rx),
-            sandbox: SandboxManager::new().context("Failed to init sandbox")?,
             mc_runner: MonteCarloRunner::new().context("Failed to init simulation")?,
             mcp_gateway,
             memory_store: MemoryStore::new(&resolve_memory_store_path()?),

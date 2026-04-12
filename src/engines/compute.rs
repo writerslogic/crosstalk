@@ -25,8 +25,13 @@ pub enum Urgency {
 }
 
 struct ResourceMonitorActor {
-    #[allow(dead_code)]
     handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ResourceMonitorActor {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 impl ResourceMonitorActor {
