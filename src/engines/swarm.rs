@@ -137,22 +137,20 @@ impl SwarmController {
                 nodes_ref.insert(id_clone.clone(), NodeStatus::Idle);
 
                 tokio::select! {
-                    // 1. Process incoming turns from the Swarm
-                    Ok(_turn) = turn_rx.recv() => {
-                        // Simulate heavy distributed workload
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        nodes_ref.insert(id_clone.clone(), NodeStatus::WaitingMerge);
+                    result = turn_rx.recv() => {
+                        match result {
+                            Ok(_turn) => {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                nodes_ref.insert(id_clone.clone(), NodeStatus::WaitingMerge);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
                     }
 
-                    // 2. React to out-of-band network notifications or work availability
-                    _ = notify_ref.notified() => {
-                        // Continue to next loop iteration to attempt task stealing
-                    }
+                    _ = notify_ref.notified() => {}
 
-                    // 3. Graceful shutdown condition (e.g., channel closed)
-                    else => {
-                        break; 
-                    }
+                    else => break,
                 }
             }
 

@@ -154,7 +154,7 @@ impl Orchestrator {
             analytics: AnalyticsEngine,
             collective: Mutex::new(CollectiveIntelligenceEngine::new()),
             viz: Mutex::new(GodView::new()),
-            file_writer: FileWriter::from_env(),
+            file_writer: FileWriter::from_env()?,
             auditor_tx,
             audit_rx: Mutex::new(alert_rx),
             surprise_engine: Mutex::new(SurpriseEngine::new()),

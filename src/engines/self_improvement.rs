@@ -5,7 +5,7 @@ use crate::types::self_improvement::{
     HandoffPackage, HypothesisStatus, ImprovementHypothesis, LearningOutcome, ParameterAdjustment,
     PostMortem, ProgressReport, PromptTemplate, SessionEvaluation, StrategyEntry,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -1092,13 +1092,28 @@ impl FileWriter {
         Self { root }
     }
 
-    pub fn from_env() -> Self {
-        let root = std::env::var("CROSSTALK_PROJECT_ROOT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-            });
-        Self { root }
+    pub fn from_env() -> Result<Self> {
+        let root = if let Ok(r) = std::env::var("CROSSTALK_PROJECT_ROOT") {
+            std::path::PathBuf::from(r)
+        } else {
+            Self::find_project_root()?
+        };
+        Ok(Self { root })
+    }
+
+    fn find_project_root() -> Result<std::path::PathBuf> {
+        let mut dir = std::env::current_dir()
+            .context("cannot determine current directory")?;
+        loop {
+            if dir.join("Cargo.toml").exists() {
+                return Ok(dir);
+            }
+            if !dir.pop() {
+                anyhow::bail!(
+                    "no Cargo.toml found in directory hierarchy; set CROSSTALK_PROJECT_ROOT"
+                );
+            }
+        }
     }
 
     pub async fn write_artifact(&self, name: &str, content: &str) -> Result<WriteOutcome> {
