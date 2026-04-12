@@ -987,16 +987,14 @@ impl Orchestrator {
         }
         self.swarm.broadcast_turn(turn.clone())?;
 
-        if let Some(ref auditor_tx) = self.auditor_tx {
-            if !auditor_tx.is_closed() {
-                if let Err(e) = auditor_tx.send(sigma.clone()).await {
+        if let Some(ref auditor_tx) = self.auditor_tx
+            && !auditor_tx.is_closed()
+                && let Err(e) = auditor_tx.send(sigma.clone()).await {
                     self.emit(StreamEvent::Error(format!(
                         "auditor send failed, auditor task dead: {e}"
                     )))
                     .await?;
                 }
-            }
-        }
 
         if let Some(ref mut root) = sigma.goal_tree.root {
             PlanningEngine::update_goal_status(root);
