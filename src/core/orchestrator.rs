@@ -95,6 +95,28 @@ pub struct Orchestrator {
     rate_limiter: Arc<RequestRateLimiter>,
 }
 
+fn resolve_memory_store_path() -> Result<String> {
+    use std::path::{Component, PathBuf};
+    let base: PathBuf = if let Ok(d) = std::env::var("XDG_DATA_HOME") {
+        PathBuf::from(d).join("crosstalk")
+    } else if let Ok(h) = std::env::var("HOME") {
+        PathBuf::from(h).join(".local/share/crosstalk")
+    } else {
+        anyhow::bail!(
+            "neither XDG_DATA_HOME nor HOME is set; cannot resolve memory store path"
+        );
+    };
+    if base.components().any(|c| matches!(c, Component::ParentDir)) {
+        anyhow::bail!(
+            "memory store path contains parent-dir traversal: {}",
+            base.display()
+        );
+    }
+    base.into_os_string()
+        .into_string()
+        .map_err(|p| anyhow::anyhow!("memory store path is not valid UTF-8: {:?}", p))
+}
+
 fn is_rate_limited(e: &anyhow::Error) -> bool {
     let s = format!("{e:?}");
     s.contains("429") || s.contains("Too Many Requests") || s.contains("rate_limit") || s.contains("RateLimit")
@@ -124,15 +146,7 @@ impl Orchestrator {
             sandbox: SandboxManager::new().context("Failed to init sandbox")?,
             mc_runner: MonteCarloRunner::new().context("Failed to init simulation")?,
             mcp_gateway,
-            memory_store: MemoryStore::new(
-                &std::env::var("XDG_DATA_HOME")
-                    .map(|d| format!("{d}/crosstalk"))
-                    .unwrap_or_else(|_| {
-                        std::env::var("HOME")
-                            .map(|h| format!("{h}/.local/share/crosstalk"))
-                            .unwrap_or_else(|_| "/tmp/crosstalk-memory".to_string())
-                    }),
-            ),
+            memory_store: MemoryStore::new(&resolve_memory_store_path()?),
             intelligence: Mutex::new(IntelligenceEngine::new()),
             compute: Mutex::new(ComputeManager::new()),
             reasoning: ReasoningEngine,
@@ -974,10 +988,17 @@ impl Orchestrator {
             let mut ctx = self.session_ctx.lock().await;
             ctx.record_turn(turn.outcome);
         }
-        let _ = self.swarm.broadcast_turn(turn.clone());
+        self.swarm.broadcast_turn(turn.clone())?;
 
         if let Some(ref auditor_tx) = self.auditor_tx {
-            let _ = auditor_tx.send(sigma.clone()).await;
+            if !auditor_tx.is_closed() {
+                if let Err(e) = auditor_tx.send(sigma.clone()).await {
+                    self.emit(StreamEvent::Error(format!(
+                        "auditor send failed, auditor task dead: {e}"
+                    )))
+                    .await?;
+                }
+            }
         }
 
         if let Some(ref mut root) = sigma.goal_tree.root {

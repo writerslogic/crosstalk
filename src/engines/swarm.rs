@@ -183,9 +183,10 @@ impl SwarmController {
     }
 
     pub fn broadcast_turn(&self, turn: Turn) -> Result<usize> {
-        self.state_tx
-            .send(turn)
-            .map_err(|e| anyhow!("Failed to broadcast: {}", e))
+        match self.state_tx.send(turn) {
+            Ok(n) => Ok(n),
+            Err(_) => Ok(0),
+        }
     }
 }
 
