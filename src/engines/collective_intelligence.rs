@@ -310,33 +310,66 @@ impl MetaStrategyOptimizer {
 
     #[must_use]
     pub fn select_best(&self, _task_category: TaskCategory) -> MetaStrategy {
-        let total_trials: u32 = self.outcomes.values().map(|o| o.trial_count).sum();
-        
-        // UCB1 for strategy selection
+        let mut rng = rand::rng();
+
         self.outcomes
             .values()
             .max_by(|a, b| {
-                let ucb_a = self.calculate_ucb(a, total_trials);
-                let ucb_b = self.calculate_ucb(b, total_trials);
-                ucb_a.total_cmp(&ucb_b)
+                let sample_a = Self::thompson_sample(a, &mut rng);
+                let sample_b = Self::thompson_sample(b, &mut rng);
+                sample_a.total_cmp(&sample_b)
             })
             .map(|o| o.strategy)
             .unwrap_or(MetaStrategy::DirectImplementation)
     }
 
-    fn calculate_ucb(&self, outcome: &StrategyOutcome, total_trials: u32) -> f64 {
+    fn thompson_sample(outcome: &StrategyOutcome, rng: &mut impl rand::Rng) -> f64 {
         if outcome.trial_count == 0 {
-            return f64::INFINITY;
+            return rng.random::<f64>();
         }
-        let avg = outcome.avg_quality();
-        let exploration = (2.0 * (total_trials as f64 + 1.0).ln() / outcome.trial_count as f64).sqrt();
-        avg + exploration
+        let avg = outcome.avg_quality().clamp(0.0, 1.0);
+        let successes = (avg * outcome.trial_count as f64) as u32;
+        let failures = outcome.trial_count.saturating_sub(successes);
+        let alpha = successes as f64 + 1.0;
+        let beta = failures as f64 + 1.0;
+        sample_beta(rng, alpha, beta)
     }
 }
 
 impl Default for MetaStrategyOptimizer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn sample_beta(rng: &mut impl rand::Rng, alpha: f64, beta: f64) -> f64 {
+    let x = sample_gamma(rng, alpha);
+    let y = sample_gamma(rng, beta);
+    if x + y == 0.0 { 0.5 } else { x / (x + y) }
+}
+
+fn sample_gamma(rng: &mut impl rand::Rng, shape: f64) -> f64 {
+    if shape < 1.0 {
+        let u: f64 = rng.random();
+        return sample_gamma(rng, shape + 1.0) * u.powf(1.0 / shape);
+    }
+    let d = shape - 1.0 / 3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+    loop {
+        let x: f64 = {
+            let u1: f64 = rng.random();
+            let u2: f64 = rng.random();
+            (u1.ln() * -2.0).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+        };
+        let v = (1.0 + c * x).powi(3);
+        if v <= 0.0 { continue; }
+        let u: f64 = rng.random();
+        if u < 1.0 - 0.0331 * x.powi(4) {
+            return d * v;
+        }
+        if u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) {
+            return d * v;
+        }
     }
 }
 

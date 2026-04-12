@@ -284,6 +284,22 @@ impl Orchestrator {
                 active.push((0, self.agents[0].name().to_string()));
             }
 
+            {
+                let intell = self.intelligence.lock().await;
+                let names: Vec<String> = active.iter().map(|(_, n)| n.clone()).collect();
+                if let Ok(best) = intell.route_task_constrained(
+                    TaskCategory::Research,
+                    &names,
+                    u32::MAX,
+                    u64::MAX,
+                    &[],
+                ) {
+                    if let Some(pos) = active.iter().position(|(_, n)| *n == best) {
+                        active.swap(0, pos);
+                    }
+                }
+            }
+
             let mut final_prompt = distilled_prompt;
             let structure = ReasoningEngine::select_structure(TaskCategory::Research, &active[0].1);
             match structure {
@@ -432,14 +448,17 @@ impl Orchestrator {
         }
 
         let weights = InfluenceWeightManager::calculate_weights_with_recency(&*sigma_lock.lock().await, 0.9);
-        
-        // 1. Collective Text Synthesis
+
+        // 1. Collective Text Synthesis (surprise-calibrated weights)
+        let se = self.surprise_engine.lock().await;
         let text_proposals: Vec<(String, String, f64)> = final_results.iter()
             .map(|(id, text)| {
-                let w = weights.get(id).copied().unwrap_or(1.0);
+                let base_w = weights.get(id).copied().unwrap_or(1.0);
+                let w = se.calibrate_weight(id, base_w);
                 (id.clone(), text.clone(), w)
             })
             .collect();
+        drop(se);
         let synthesized_text = EnsembleEngine::merge_proposals(text_proposals);
 
         // 2. Collective Artifact Synthesis
@@ -1099,6 +1118,18 @@ impl Orchestrator {
             let mut bridge = self.memory_bridge.lock().await;
             bridge.open_session(session_id.clone());
             bridge.push_record(&session_id, record);
+        }
+
+        if next_p > 0.70 && next_p <= 0.85 {
+            self.emit(StreamEvent::TokenReceived {
+                agent_id: "System".to_string(),
+                token: format!("[convergence] p={next_p:.2}, moderate confidence, continuing refinement"),
+            }).await?;
+        } else if next_p > 0.85 && next_p <= 0.95 {
+            self.emit(StreamEvent::TokenReceived {
+                agent_id: "System".to_string(),
+                token: format!("[convergence] p={next_p:.2}, high confidence, final polish"),
+            }).await?;
         }
 
         let is_converged = next_p > 0.95;
