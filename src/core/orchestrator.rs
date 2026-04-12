@@ -449,13 +449,39 @@ impl Orchestrator {
 
         let weights = InfluenceWeightManager::calculate_weights_with_recency(&*sigma_lock.lock().await, 0.9);
 
-        // 1. Collective Text Synthesis (surprise-calibrated weights)
+        // Outlier detection: compute pairwise word-overlap similarity
+        let mut outlier_penalty: HashMap<&str, f64> = HashMap::new();
+        if final_results.len() >= 2 {
+            let word_sets: Vec<(&str, std::collections::HashSet<&str>)> = final_results
+                .iter()
+                .map(|(id, text)| (id.as_str(), text.split_whitespace().collect()))
+                .collect();
+            for (i, (id, set_i)) in word_sets.iter().enumerate() {
+                let mut sim_sum = 0.0;
+                let mut count = 0;
+                for (j, (_, set_j)) in word_sets.iter().enumerate() {
+                    if i == j { continue; }
+                    let intersection = set_i.intersection(set_j).count() as f64;
+                    let union = set_i.union(set_j).count().max(1) as f64;
+                    sim_sum += intersection / union;
+                    count += 1;
+                }
+                let mean_sim = if count > 0 { sim_sum / count as f64 } else { 1.0 };
+                if mean_sim < 0.3 {
+                    outlier_penalty.insert(id, 0.1);
+                }
+            }
+        }
+
+        // 1. Collective Text Synthesis (surprise + certainty + outlier calibrated)
         let se = self.surprise_engine.lock().await;
         let text_proposals: Vec<(String, String, f64)> = final_results.iter()
             .map(|(id, text)| {
                 let base_w = weights.get(id).copied().unwrap_or(1.0);
-                let w = se.calibrate_weight(id, base_w);
-                (id.clone(), text.clone(), w)
+                let surprise_w = se.calibrate_weight(id, base_w);
+                let certainty = CertaintyAnalyzer::compute(text, 0.1);
+                let outlier_w = outlier_penalty.get(id.as_str()).copied().unwrap_or(1.0);
+                (id.clone(), text.clone(), surprise_w * certainty * outlier_w)
             })
             .collect();
         drop(se);
@@ -872,7 +898,13 @@ impl Orchestrator {
         let quality_score = {
             let base = QualityScorer::score(&turn);
             let surprise_penalty = (surprise - 0.5).max(0.0) * 0.6;
-            (base - surprise_penalty).max(0.0)
+            let artifact_health = if !sigma.artifacts.is_empty() {
+                sigma.artifacts.values().map(|a| a.metrics.health_score).sum::<f64>()
+                    / sigma.artifacts.len() as f64
+            } else {
+                1.0
+            };
+            ((base - surprise_penalty) * artifact_health).max(0.0)
         };
         {
             let alert_info = {
@@ -890,14 +922,26 @@ impl Orchestrator {
                 intell.detect_regression(agent_id, &recent_turns)
             };
             if let Some(alert) = alert_info {
+                let severity = if alert.baseline_mean > 0.0 {
+                    (alert.baseline_mean - alert.recent_mean) / alert.baseline_mean
+                } else {
+                    0.0
+                };
                 self.emit(StreamEvent::TokenReceived {
                     agent_id: "System".to_string(),
                     token: format!(
-                        "[intelligence] Regression detected for {}: {:.2} -> {:.2}",
-                        alert.agent_id, alert.baseline_mean, alert.recent_mean
+                        "[intelligence] Regression detected for {}: {:.2} -> {:.2} (severity {:.0}%)",
+                        alert.agent_id, alert.baseline_mean, alert.recent_mean, severity * 100.0
                     ),
                 })
                 .await?;
+                if severity > 0.3 {
+                    let mut skips = self.skip_until.lock().await;
+                    skips.insert(
+                        alert.agent_id.clone(),
+                        sigma.iteration_index + 2,
+                    );
+                }
             }
         }
 
@@ -1191,9 +1235,37 @@ impl Orchestrator {
             }
             p.push('\n');
         }
-        p.push_str("\nRecent History (Last 5 turns):\n");
+        p.push_str("\nRecent History (compressed):\n");
         for t in sigma.turns.iter().rev().take(5).rev() {
-            let _ = writeln!(p, "{}: {}", t.model_id, t.content);
+            let signals = ReasoningEngine::extract_signals(&t.content);
+            let outcome_tag = format!("{:?}", t.outcome);
+            let decisions = if signals.decisions.is_empty() {
+                String::new()
+            } else {
+                format!(" decisions=[{}]", signals.decisions.join("; "))
+            };
+            let problems = if signals.problems.is_empty() {
+                String::new()
+            } else {
+                format!(" problems=[{}]", signals.problems.join("; "))
+            };
+            let code_count = signals.code_blocks.len();
+            let code_tag = if code_count > 0 {
+                format!(" code_blocks={code_count}")
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                p,
+                "Turn {} by {} ({}){}{}{}: {}",
+                t.index,
+                t.model_id,
+                outcome_tag,
+                decisions,
+                problems,
+                code_tag,
+                &t.content[..t.content.len().min(150)],
+            );
         }
         p.push_str("\nRefine artifacts or debate the solution. Use ```lang:filename to propose changes. Tag completion with 'OPTIMAL'.");
         p
