@@ -91,16 +91,18 @@ impl ToolDiscovery {
 
                 let schema = CliBridge::validate_schema(bin)
                     .map(|s| s.to_json_schema())
-                    .unwrap_or_else(|_| serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "args": {
-                                "type": "array",
-                                "items": { "type": "string" },
-                                "description": "Command line arguments to pass to the tool"
+                    .unwrap_or_else(|_| {
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "args": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Command line arguments to pass to the tool"
+                                }
                             }
-                        }
-                    }));
+                        })
+                    });
 
                 let version_str = version.as_deref().unwrap_or("Unknown version");
                 let description = format!(
@@ -204,7 +206,11 @@ impl CargoBridge {
 
     pub fn clippy(args: &HashMap<String, String>) -> Vec<String> {
         let mut cli = vec!["clippy".to_string()];
-        if args.get("deny_warnings").map(|v| v == "true").unwrap_or(false) {
+        if args
+            .get("deny_warnings")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+        {
             cli.extend(["--".to_string(), "-D".to_string(), "warnings".to_string()]);
         }
         cli
@@ -477,9 +483,9 @@ impl CliBridge {
                 continue;
             }
 
-            let key = long.clone().unwrap_or_else(|| {
-                format!("short:{}", short.as_deref().unwrap_or(""))
-            });
+            let key = long
+                .clone()
+                .unwrap_or_else(|| format!("short:{}", short.as_deref().unwrap_or("")));
 
             if !seen.insert(key.clone()) {
                 continue;
@@ -515,4 +521,3 @@ impl CliBridge {
         flags
     }
 }
-

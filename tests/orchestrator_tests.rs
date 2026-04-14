@@ -55,11 +55,16 @@ impl PromptAgent for MockAgent {
     }
 }
 
-async fn make_orchestrator(manager: StateManager, agents: Vec<Box<dyn PromptAgent>>) -> Orchestrator {
+async fn make_orchestrator(
+    manager: StateManager,
+    agents: Vec<Box<dyn PromptAgent>>,
+) -> Orchestrator {
     let (event_tx, mut event_rx) = mpsc::channel::<StreamEvent>(1000);
     let (_control_tx, control_rx) = mpsc::channel::<ControlSignal>(100);
     tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
-    Orchestrator::new(manager, agents, event_tx, control_rx).await.expect("Failed to create orchestrator")
+    Orchestrator::new(manager, agents, event_tx, control_rx)
+        .await
+        .expect("Failed to create orchestrator")
 }
 
 fn make_sigma(session: &str) -> Arc<Mutex<ConversationState>> {
@@ -232,8 +237,8 @@ async fn test_auditor_tx_is_some() {
 #[tokio::test]
 async fn test_audit_alert_on_hash_mismatch() {
     use crosstalk::engines::verification::AuditAlert;
-    use tokio::sync::mpsc;
     use crosstalk::engines::verification::ContinuousAuditor;
+    use tokio::sync::mpsc;
 
     let (alert_tx, mut alert_rx) = mpsc::unbounded_channel::<AuditAlert>();
     let state_tx = ContinuousAuditor::spawn(alert_tx);
@@ -270,21 +275,24 @@ async fn test_audit_alert_on_hash_mismatch() {
 #[tokio::test]
 async fn test_audit_no_alert_when_idle() {
     use crosstalk::engines::verification::AuditAlert;
-    use tokio::sync::mpsc;
     use crosstalk::engines::verification::ContinuousAuditor;
+    use tokio::sync::mpsc;
 
     let (alert_tx, mut alert_rx) = mpsc::unbounded_channel::<AuditAlert>();
     let _state_tx = ContinuousAuditor::spawn(alert_tx);
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert!(alert_rx.try_recv().is_err(), "no alert when no states are sent");
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "no alert when no states are sent"
+    );
 }
 
 #[tokio::test]
 async fn test_audit_alert_has_correct_iteration_index() {
     use crosstalk::engines::verification::AuditAlert;
-    use tokio::sync::mpsc;
     use crosstalk::engines::verification::ContinuousAuditor;
+    use tokio::sync::mpsc;
 
     let (alert_tx, mut alert_rx) = mpsc::unbounded_channel::<AuditAlert>();
     let state_tx = ContinuousAuditor::spawn(alert_tx);
@@ -315,7 +323,10 @@ async fn test_audit_rx_nonblocking_after_turn() {
 
     // After a turn with a valid hash chain, audit_rx should still be empty
     let mut rx = omicron.audit_rx.lock().await;
-    assert!(rx.try_recv().is_err(), "no spurious audit alerts on valid turn");
+    assert!(
+        rx.try_recv().is_err(),
+        "no spurious audit alerts on valid turn"
+    );
 }
 
 // ── SurpriseEngine unit tests ──────────────────────────────────────────────
@@ -445,13 +456,22 @@ async fn test_orchestrator_records_surprise_after_turn() {
 // ── Track 10-B: PromptComposer, RegressionFeedbackHandler, template_cache ────
 
 use crosstalk::engines::intelligence::{PromptComposer, RegressionFeedbackHandler};
-use crosstalk::types::intelligence::{ModelProfile, PromptTemplate, RegressionAlert, RunningAverage};
 use crosstalk::types::conversation::TaskCategory;
+use crosstalk::types::intelligence::{
+    ModelProfile, PromptTemplate, RegressionAlert, RunningAverage,
+};
 use std::collections::BTreeMap;
 
 fn make_profile(model_id: &str, category: TaskCategory, mean: f64, turns: u32) -> ModelProfile {
     let mut task_scores = BTreeMap::new();
-    task_scores.insert(category, RunningAverage { mean, count: turns, variance: 0.0 });
+    task_scores.insert(
+        category,
+        RunningAverage {
+            mean,
+            count: turns,
+            variance: 0.0,
+        },
+    );
     ModelProfile {
         model_id: model_id.to_string(),
         task_scores,
@@ -461,7 +481,11 @@ fn make_profile(model_id: &str, category: TaskCategory, mean: f64, turns: u32) -
     }
 }
 
-fn make_turn_with_outcome(index: u32, outcome: TurnOutcome, category: Option<TaskCategory>) -> Turn {
+fn make_turn_with_outcome(
+    index: u32,
+    outcome: TurnOutcome,
+    category: Option<TaskCategory>,
+) -> Turn {
     Turn {
         index,
         model_id: "m".to_string(),
@@ -582,12 +606,17 @@ fn test_regression_feedback_includes_examples() {
 #[test]
 fn test_counter_examples_filters_by_category_and_outcome() {
     let turns = vec![
-        make_turn_with_outcome(1, TurnOutcome::TestsPassed, Some(TaskCategory::CodeGeneration)),
+        make_turn_with_outcome(
+            1,
+            TurnOutcome::TestsPassed,
+            Some(TaskCategory::CodeGeneration),
+        ),
         make_turn_with_outcome(2, TurnOutcome::Rejected, Some(TaskCategory::CodeGeneration)),
         make_turn_with_outcome(3, TurnOutcome::Compiled, Some(TaskCategory::Refactoring)),
         make_turn_with_outcome(4, TurnOutcome::Compiled, Some(TaskCategory::CodeGeneration)),
     ];
-    let examples = RegressionFeedbackHandler::counter_examples(&turns, TaskCategory::CodeGeneration);
+    let examples =
+        RegressionFeedbackHandler::counter_examples(&turns, TaskCategory::CodeGeneration);
     assert_eq!(examples.len(), 2);
     for ex in &examples {
         assert!(ex.contains("Turn 1") || ex.contains("Turn 4"));
@@ -605,7 +634,10 @@ async fn test_template_cache_initialized_with_defaults() {
     let omicron = make_orchestrator(manager, vec![agent]).await;
     let cache = omicron.template_cache.read().await;
     assert!(cache.contains_key("base"), "base template missing");
-    assert!(cache.contains_key("corrective"), "corrective template missing");
+    assert!(
+        cache.contains_key("corrective"),
+        "corrective template missing"
+    );
 }
 
 #[tokio::test]
@@ -624,7 +656,11 @@ async fn test_regression_corrective_prompt_reaches_agent() {
     {
         let intell = omicron.intelligence.lock().await;
         for _ in 0..5 {
-            let good = make_turn_with_outcome(0, TurnOutcome::TestsPassed, Some(TaskCategory::CodeGeneration));
+            let good = make_turn_with_outcome(
+                0,
+                TurnOutcome::TestsPassed,
+                Some(TaskCategory::CodeGeneration),
+            );
             intell.update_profile(&good, 0.9);
         }
     }
@@ -644,9 +680,12 @@ async fn test_regression_corrective_prompt_reaches_agent() {
     }
 
     let result = omicron.run_turn(sigma.clone()).await;
-    assert!(result.is_ok(), "run_turn should succeed even with regression: {result:?}");
+    assert!(
+        result.is_ok(),
+        "run_turn should succeed even with regression: {result:?}"
+    );
     let s = sigma.lock().await;
-    assert!(!s.turns.is_empty() || s.iteration_index >= 0);
+    assert!(!s.turns.is_empty() || s.iteration_index == 0);
 }
 
 // ── Track 09-B: Cross-Session Memory Linkage ──────────────────────────────
@@ -669,6 +708,7 @@ fn make_record(turn_id: u32, session_id: &str, content: &str, tests_passed: bool
             was_rolled_back: false,
             convergence_contribution: 0.0,
         }),
+        is_negative: false,
     }
 }
 
@@ -695,8 +735,14 @@ async fn test_memory_bridge_cross_session_recall_returns_records_from_all_sessio
     let mut bridge = MemoryBridge::new();
     bridge.open_session("alpha".to_string());
     bridge.open_session("beta".to_string());
-    bridge.push_record("alpha", make_record(1, "alpha", "implement sorting algorithm", false));
-    bridge.push_record("beta", make_record(2, "beta", "implement sorting algorithm", true));
+    bridge.push_record(
+        "alpha",
+        make_record(1, "alpha", "implement sorting algorithm", false),
+    );
+    bridge.push_record(
+        "beta",
+        make_record(2, "beta", "implement sorting algorithm", true),
+    );
 
     let results = bridge
         .recall_relevant("alpha", "sorting algorithm", 5, 0)
@@ -722,7 +768,10 @@ async fn test_memory_bridge_ranking_prefers_tests_passed() {
         .unwrap();
     assert_eq!(results.len(), 2);
     assert!(
-        results[0].outcome.as_ref().map_or(false, |o| o.tests_passed),
+        results[0]
+            .outcome
+            .as_ref()
+            .map_or(false, |o| o.tests_passed),
         "record with tests_passed should rank first"
     );
 }
@@ -733,10 +782,19 @@ async fn test_memory_bridge_max_one_recall_per_turn() {
     bridge.open_session("s".to_string());
     bridge.push_record("s", make_record(1, "s", "some content", false));
 
-    let first = bridge.recall_relevant("s", "some content", 5, 42).await.unwrap();
-    let second = bridge.recall_relevant("s", "some content", 5, 42).await.unwrap();
+    let first = bridge
+        .recall_relevant("s", "some content", 5, 42)
+        .await
+        .unwrap();
+    let second = bridge
+        .recall_relevant("s", "some content", 5, 42)
+        .await
+        .unwrap();
     assert!(!first.is_empty(), "first recall should return results");
-    assert!(second.is_empty(), "second recall for same turn should return empty");
+    assert!(
+        second.is_empty(),
+        "second recall for same turn should return empty"
+    );
 }
 
 #[tokio::test]
@@ -755,7 +813,10 @@ async fn test_memory_bridge_different_turns_both_recall() {
 fn test_memory_bridge_snapshot_and_index_round_trip() {
     let mut bridge = MemoryBridge::new();
     bridge.open_session("original".to_string());
-    bridge.push_record("original", make_record(10, "original", "snapshot content", true));
+    bridge.push_record(
+        "original",
+        make_record(10, "original", "snapshot content", true),
+    );
 
     let snapshot = bridge.take_snapshot("original");
     assert_eq!(snapshot.len(), 1);
@@ -820,7 +881,10 @@ async fn test_orchestrator_cross_session_recall_returns_examples() {
     omicron.run_turn(sigma.clone()).await.expect("turn failed");
 
     let bridge = omicron.memory_bridge.lock().await;
-    assert!(bridge.total_record_count() >= 2, "both sessions should contribute records");
+    assert!(
+        bridge.total_record_count() >= 2,
+        "both sessions should contribute records"
+    );
 }
 
 #[tokio::test]
@@ -835,7 +899,9 @@ async fn test_orchestrator_session_memory_map_registered_on_convergence() {
     let sigma = make_sigma("conv-session");
 
     // Force completion_probability above threshold so is_converged triggers.
-    omicron.completion_probability.store(0.96f64.to_bits(), std::sync::atomic::Ordering::Release);
+    omicron
+        .completion_probability
+        .store(0.96f64.to_bits(), std::sync::atomic::Ordering::Release);
 
     omicron.run_turn(sigma.clone()).await.expect("turn failed");
 

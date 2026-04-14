@@ -2,9 +2,9 @@ use crate::engines::verification::HashChain;
 use crate::types::conversation::ConversationState;
 use anyhow::{Result, anyhow};
 use clap_complete::{Shell, generate};
+use dashmap::DashMap;
 use std::io;
 use std::sync::Arc;
-use dashmap::DashMap;
 
 #[derive(Debug, Clone)]
 pub struct StabilityAuditResult {
@@ -24,11 +24,17 @@ pub struct ReleaseManager;
 
 impl ReleaseManager {
     pub fn run_stability_audit(sigma: &ConversationState) -> Result<StabilityAuditResult> {
-        let mut result = StabilityAuditResult { passed: 0, failed: 0, issues: vec![] };
+        let mut result = StabilityAuditResult {
+            passed: 0,
+            failed: 0,
+            issues: vec![],
+        };
 
         if !CpopVerifier::verify_history(std::slice::from_ref(sigma)) {
             result.failed += 1;
-            result.issues.push("Hash chain integrity compromised".to_string());
+            result
+                .issues
+                .push("Hash chain integrity compromised".to_string());
         } else {
             result.passed += 1;
         }
@@ -52,7 +58,9 @@ impl ReleaseManager {
                 result.failed += 1;
                 result.issues.push(format!(
                     "Artifact '{}': version {} != history length {}",
-                    name, artifact.version, artifact.history.len()
+                    name,
+                    artifact.version,
+                    artifact.history.len()
                 ));
             } else {
                 result.passed += 1;
@@ -60,13 +68,15 @@ impl ReleaseManager {
         }
 
         // Low-certainty turn count check
-        let risky_turns = sigma.turns.iter()
+        let risky_turns = sigma
+            .turns
+            .iter()
             .filter(|t| t.certainty.unwrap_or(1.0) < 0.3)
             .count();
         if risky_turns > 0 {
-            result.issues.push(format!(
-                "{risky_turns} turn(s) with certainty < 0.3"
-            ));
+            result
+                .issues
+                .push(format!("{risky_turns} turn(s) with certainty < 0.3"));
         }
         result.passed += 1;
 
@@ -96,7 +106,8 @@ impl ReleaseManager {
     #[must_use]
     pub fn generate_homebrew_formula(version: &str, sha256: &str) -> String {
         fn is_safe(s: &str) -> bool {
-            s.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-')
+            s.chars()
+                .all(|c| c.is_alphanumeric() || c == '.' || c == '-')
         }
         let version = if is_safe(version) { version } else { "invalid" };
         let sha256 = if is_safe(sha256) { sha256 } else { "invalid" };
@@ -152,7 +163,11 @@ impl ConvergenceReport {
             sigma.turns.len(),
             sigma.completion_probability,
             sigma.budget.spent,
-            if sigma.completion_probability > 0.95 { "CONVERGED" } else { "IN_PROGRESS" }
+            if sigma.completion_probability > 0.95 {
+                "CONVERGED"
+            } else {
+                "IN_PROGRESS"
+            }
         );
         report.push_str("\nArtifact Breakdown:\n");
         for (name, artifact) in &sigma.artifacts {
@@ -184,7 +199,9 @@ pub struct PluginManager {
 impl PluginManager {
     #[must_use]
     pub fn new() -> Self {
-        Self { plugins: DashMap::new() }
+        Self {
+            plugins: DashMap::new(),
+        }
     }
 
     pub fn register(&self, plugin: Arc<dyn CrosstalkPlugin>) {
@@ -207,7 +224,12 @@ impl PluginManager {
     pub fn run_quality_checks(&self, sigma: &ConversationState) -> Vec<(String, f64)> {
         self.plugins
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().on_quality_check(sigma).unwrap_or(0.0)))
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    entry.value().on_quality_check(sigma).unwrap_or(0.0),
+                )
+            })
             .collect()
     }
 }
@@ -217,4 +239,3 @@ impl Default for PluginManager {
         Self::new()
     }
 }
-

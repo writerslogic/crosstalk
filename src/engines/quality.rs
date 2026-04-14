@@ -6,8 +6,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use tree_sitter::Parser;
 use std::sync::Arc;
+use tree_sitter::Parser;
 
 thread_local! {
     static PARSER: RefCell<Parser> = RefCell::new({
@@ -38,7 +38,8 @@ impl QualityEngine {
             .filter(|l| l.trim().starts_with("//") || l.trim().starts_with("/*"))
             .count() as u32;
 
-        let (complexity, coupling) = Self::compute_ast_metrics(&artifact.content, workspace_modules);
+        let (complexity, coupling) =
+            Self::compute_ast_metrics(&artifact.content, workspace_modules);
 
         let comment_density = if total_lines > 0 {
             f64::from(comment_lines) / f64::from(total_lines)
@@ -46,10 +47,8 @@ impl QualityEngine {
             0.0
         };
 
-        let health_score = 1.0
-            - (f64::from(complexity) / 100.0)
-            - (f64::from(coupling) / 20.0)
-            + comment_density;
+        let health_score =
+            1.0 - (f64::from(complexity) / 100.0) - (f64::from(coupling) / 20.0) + comment_density;
 
         ArtifactMetrics {
             cyclomatic_complexity: complexity,
@@ -77,15 +76,19 @@ impl QualityEngine {
             if going_down {
                 let node = cursor.node();
                 let kind = node.kind();
-                
+
                 if matches!(
                     kind,
-                    "if_expression" | "for_expression" | "while_expression" | 
-                    "match_arm" | "if_let_expression" | "while_let_expression"
+                    "if_expression"
+                        | "for_expression"
+                        | "while_expression"
+                        | "match_arm"
+                        | "if_let_expression"
+                        | "while_let_expression"
                 ) {
                     complexity += 1;
                 }
-                
+
                 if (kind == "use_declaration" || kind == "scoped_identifier")
                     && let Some(slice) = content.as_bytes().get(node.byte_range())
                     && let Ok(text) = std::str::from_utf8(slice)
@@ -96,8 +99,10 @@ impl QualityEngine {
                         }
                     }
                 }
-                
-                if cursor.goto_first_child() { continue; }
+
+                if cursor.goto_first_child() {
+                    continue;
+                }
             }
             if cursor.goto_next_sibling() {
                 going_down = true;
@@ -107,9 +112,9 @@ impl QualityEngine {
                 going_down = false;
                 continue;
             }
-            break; 
+            break;
         }
-        
+
         (complexity, dependencies.len() as u32)
     }
 
@@ -127,7 +132,9 @@ impl QualityEngine {
         Ok((out.status.success(), stderr))
     }
 
-    pub fn build_dependency_graph(artifacts: &HashMap<String, Arc<Artifact>>) -> DiGraph<String, ()> {
+    pub fn build_dependency_graph(
+        artifacts: &HashMap<String, Arc<Artifact>>,
+    ) -> DiGraph<String, ()> {
         let mut graph = DiGraph::new();
         let mut node_indices = FxHashMap::default();
 
@@ -188,7 +195,9 @@ impl QualityEngine {
         existing
             .par_iter()
             .filter_map(|(name, artifact)| {
-                let match_count = artifact.content.lines()
+                let match_count = artifact
+                    .content
+                    .lines()
                     .map(|l| l.trim())
                     .filter(|l| new_lines.contains(l))
                     .count();
@@ -416,8 +425,16 @@ impl CoherenceChecker {
 
         let mut defined: HashSet<String> = HashSet::new();
         let def_prefixes = [
-            "pub fn ", "fn ", "pub struct ", "struct ", "pub enum ", "enum ",
-            "pub type ", "type ", "pub trait ", "trait ",
+            "pub fn ",
+            "fn ",
+            "pub struct ",
+            "struct ",
+            "pub enum ",
+            "enum ",
+            "pub type ",
+            "type ",
+            "pub trait ",
+            "trait ",
         ];
         for artifact in artifacts.values() {
             for line in artifact.content.lines() {
@@ -443,7 +460,9 @@ impl CoherenceChecker {
                 let t = line.trim();
 
                 if !t.contains('{')
-                    && let Some(mod_name) = t.strip_prefix("mod ").map(|r| r.trim_end_matches(';').trim())
+                    && let Some(mod_name) = t
+                        .strip_prefix("mod ")
+                        .map(|r| r.trim_end_matches(';').trim())
                     && !stems.contains(mod_name)
                 {
                     reports.push(IncoherenceReport {
@@ -544,7 +563,10 @@ impl CompletionScorer {
         }
         let last = recent.last().unwrap();
         let (blocker_type, suggested_action) = if last.tests_passing < 0.5 {
-            (BlockerType::FailingTest, "Fix the failing tests before continuing.".to_string())
+            (
+                BlockerType::FailingTest,
+                "Fix the failing tests before continuing.".to_string(),
+            )
         } else if !last.quality_floor_met {
             (
                 BlockerType::QualityBelowThreshold,
@@ -691,59 +713,59 @@ impl DocChecker {
                 if !doc_lines.is_empty()
                     && let Some(fn_line) = lines.get(i)
                 {
-                        let fn_t = fn_line.trim();
-                        if fn_t.contains("fn ") {
-                            let fn_name = fn_t
-                                .split("fn ")
-                                .nth(1)
-                                .and_then(|r| r.split('(').next())
-                                .unwrap_or("")
-                                .trim()
-                                .to_string();
+                    let fn_t = fn_line.trim();
+                    if fn_t.contains("fn ") {
+                        let fn_name = fn_t
+                            .split("fn ")
+                            .nth(1)
+                            .and_then(|r| r.split('(').next())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
 
-                            let doc_text = doc_lines.join(" ");
+                        let doc_text = doc_lines.join(" ");
 
-                            let doc_returns_option = doc_text.contains("Option");
-                            let doc_returns_result = doc_text.contains("Result");
-                            let sig_returns_option = fn_t.contains("-> Option");
-                            let sig_returns_result = fn_t.contains("-> Result");
+                        let doc_returns_option = doc_text.contains("Option");
+                        let doc_returns_result = doc_text.contains("Result");
+                        let sig_returns_option = fn_t.contains("-> Option");
+                        let sig_returns_result = fn_t.contains("-> Result");
 
-                            if doc_returns_option && sig_returns_result {
+                        if doc_returns_option && sig_returns_result {
+                            inconsistencies.push(DocInconsistency {
+                                function_name: fn_name.clone(),
+                                issue: "Doc says returns Option but signature returns Result."
+                                    .to_string(),
+                            });
+                        } else if doc_returns_result && sig_returns_option {
+                            inconsistencies.push(DocInconsistency {
+                                function_name: fn_name.clone(),
+                                issue: "Doc says returns Result but signature returns Option."
+                                    .to_string(),
+                            });
+                        }
+
+                        let sig_params = fn_t
+                            .split('(')
+                            .nth(1)
+                            .and_then(|s| s.split(')').next())
+                            .unwrap_or("");
+                        for word in doc_text.split_whitespace() {
+                            let candidate = word.trim_end_matches(':');
+                            if candidate.ends_with("_param")
+                                || (candidate.len() > 2
+                                    && candidate.starts_with(|c: char| c.is_lowercase())
+                                    && word.ends_with(':')
+                                    && !sig_params.contains(candidate))
+                            {
                                 inconsistencies.push(DocInconsistency {
-                                    function_name: fn_name.clone(),
-                                    issue: "Doc says returns Option but signature returns Result."
-                                        .to_string(),
-                                });
-                            } else if doc_returns_result && sig_returns_option {
-                                inconsistencies.push(DocInconsistency {
-                                    function_name: fn_name.clone(),
-                                    issue: "Doc says returns Result but signature returns Option."
-                                        .to_string(),
-                                });
-                            }
-
-                            let sig_params = fn_t
-                                .split('(')
-                                .nth(1)
-                                .and_then(|s| s.split(')').next())
-                                .unwrap_or("");
-                            for word in doc_text.split_whitespace() {
-                                let candidate = word.trim_end_matches(':');
-                                if candidate.ends_with("_param")
-                                    || (candidate.len() > 2
-                                        && candidate.starts_with(|c: char| c.is_lowercase())
-                                        && word.ends_with(':')
-                                        && !sig_params.contains(candidate))
-                                {
-                                    inconsistencies.push(DocInconsistency {
                                         function_name: fn_name.clone(),
                                         issue: format!(
                                             "Doc references parameter `{candidate}` not found in signature."
                                         ),
                                     });
-                                }
                             }
                         }
+                    }
                 }
                 doc_lines.clear();
             }
@@ -851,9 +873,10 @@ impl DeadCodeDetector {
                     if sym.is_empty() || sym == "*" {
                         continue;
                     }
-                    let used_elsewhere = lines.iter().enumerate().any(|(j, &l)| {
-                        j != i && l.contains(sym) && !l.trim().starts_with("use ")
-                    });
+                    let used_elsewhere = lines
+                        .iter()
+                        .enumerate()
+                        .any(|(j, &l)| j != i && l.contains(sym) && !l.trim().starts_with("use "));
                     if !used_elsewhere {
                         dead_items.push(DeadItem {
                             name: sym.to_string(),

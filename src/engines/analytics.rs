@@ -54,12 +54,17 @@ impl AnalyticsEngine {
         // Capability mismatch: one agent dominates failures
         let failure_agents = Self::dominant_failure_agent(sigma);
         if let Some(agent) = failure_agents {
-            blockers.push(format!("CapabilityMismatch: agent '{agent}' drives most failures"));
+            blockers.push(format!(
+                "CapabilityMismatch: agent '{agent}' drives most failures"
+            ));
         }
         // Conflicting proposals: many RolledBack turns
-        let rollback_rate = sigma.turns.iter()
+        let rollback_rate = sigma
+            .turns
+            .iter()
             .filter(|t| t.outcome == TurnOutcome::RolledBack)
-            .count() as f64 / n.max(1) as f64;
+            .count() as f64
+            / n.max(1) as f64;
         if rollback_rate > 0.3 {
             blockers.push(format!(
                 "ConflictingProposals: {:.0}% of turns rolled back",
@@ -67,10 +72,16 @@ impl AnalyticsEngine {
             ));
         }
         if n > 20 && sigma.completion_probability < 0.9 {
-            blockers.push("HighIterationCount: session has not converged after 20+ turns".to_string());
+            blockers
+                .push("HighIterationCount: session has not converged after 20+ turns".to_string());
         }
 
-        ConvergenceDiagnostic { velocity, delta_trend, quality_trend, blockers }
+        ConvergenceDiagnostic {
+            velocity,
+            delta_trend,
+            quality_trend,
+            blockers,
+        }
     }
 
     fn compute_delta_trend(sigma: &ConversationState) -> f64 {
@@ -92,7 +103,10 @@ impl AnalyticsEngine {
         let mut failures: HashMap<&str, u32> = HashMap::new();
         let mut total_failures = 0u32;
         for turn in &sigma.turns {
-            if matches!(turn.outcome, TurnOutcome::RolledBack | TurnOutcome::Rejected) {
+            if matches!(
+                turn.outcome,
+                TurnOutcome::RolledBack | TurnOutcome::Rejected
+            ) {
                 *failures.entry(&turn.model_id).or_insert(0) += 1;
                 total_failures += 1;
             }
@@ -217,12 +231,7 @@ impl StrategyRecommender {
         let success_rate = sigma
             .turns
             .iter()
-            .filter(|t| {
-                matches!(
-                    t.outcome,
-                    TurnOutcome::TestsPassed | TurnOutcome::Compiled
-                )
-            })
+            .filter(|t| matches!(t.outcome, TurnOutcome::TestsPassed | TurnOutcome::Compiled))
             .count() as f64
             / n as f64;
 
@@ -269,13 +278,10 @@ impl MetaLearningEngine {
             };
         }
 
-        let avg_turns = sessions.iter().map(|s| s.turns.len() as f64).sum::<f64>()
-            / session_count as f64;
+        let avg_turns =
+            sessions.iter().map(|s| s.turns.len() as f64).sum::<f64>() / session_count as f64;
 
-        let quality_scores: Vec<f64> = sessions
-            .iter()
-            .map(|s| s.completion_probability)
-            .collect();
+        let quality_scores: Vec<f64> = sessions.iter().map(|s| s.completion_probability).collect();
         let x: Vec<f64> = (0..quality_scores.len()).map(|i| i as f64).collect();
         let growth = AnalyticsEngine::linear_regression_slope(&x, &quality_scores);
 

@@ -73,11 +73,7 @@ impl StateManager {
     /// Atomically execute `f` against `state`, checkpointing the result on
     /// success or restoring both the in-memory state and the sled record on
     /// failure.  Uses a sled `Batch` so the write-then-cleanup is atomic.
-    pub fn execute_with_rollback<F>(
-        &self,
-        state: &mut ConversationState,
-        f: F,
-    ) -> Result<()>
+    pub fn execute_with_rollback<F>(&self, state: &mut ConversationState, f: F) -> Result<()>
     where
         F: FnOnce(&mut ConversationState) -> Result<()>,
     {

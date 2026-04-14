@@ -1,5 +1,7 @@
-use crosstalk::types::conversation::{ConversationState, TaskCategory, Turn, TurnOutcome, TurnStructure};
 use crosstalk::types::compute::{BudgetLedger, BudgetMode};
+use crosstalk::types::conversation::{
+    ConversationState, TaskCategory, Turn, TurnOutcome, TurnStructure,
+};
 
 #[test]
 fn test_conversation_state_initialization() {
@@ -17,10 +19,10 @@ fn test_budget_ledger_mode_transitions() {
         entries: vec![],
     };
     assert_eq!(ledger.mode(), BudgetMode::Normal);
-    
+
     ledger.spent = 8.5; // 15% left
     assert_eq!(ledger.mode(), BudgetMode::CostReduction);
-    
+
     ledger.spent = 9.8; // 2% left
     assert_eq!(ledger.mode(), BudgetMode::Emergency);
 }
@@ -40,10 +42,10 @@ fn test_turn_serialization_roundtrip() {
         signature: vec![1, 2, 3],
         surprise_signal: None,
     };
-    
+
     let serialized = serde_json::to_string(&turn).unwrap();
     let deserialized: Turn = serde_json::from_str(&serialized).unwrap();
-    
+
     assert_eq!(deserialized.index, 42);
     assert_eq!(deserialized.model_id, "gpt-4");
 }

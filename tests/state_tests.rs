@@ -34,7 +34,10 @@ fn rollback_success_commits_new_state() {
     .expect("should succeed");
 
     assert_eq!(sigma.iteration_index, 7);
-    let stored = mgr.restore(7).unwrap().expect("committed state must be readable");
+    let stored = mgr
+        .restore(7)
+        .unwrap()
+        .expect("committed state must be readable");
     assert_eq!(stored.iteration_index, 7);
 }
 
@@ -83,9 +86,7 @@ fn rollback_does_not_leave_rollback_marker_on_failure() {
     let mgr = StateManager::new(dir.path().to_str().unwrap()).unwrap();
     let mut sigma = ConversationState::new("marker-fail");
 
-    let _ = mgr.execute_with_rollback(&mut sigma, |_| {
-        Err(anyhow::anyhow!("fail"))
-    });
+    let _ = mgr.execute_with_rollback(&mut sigma, |_| Err(anyhow::anyhow!("fail")));
 
     assert_eq!(mgr.list_checkpoints().unwrap().len(), 0);
 }

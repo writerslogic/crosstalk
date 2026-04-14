@@ -47,8 +47,7 @@ fn test_invoke_exit_code_failure_sets_success_false() {
         Ok(p) => p,
         Err(_) => std::path::PathBuf::from("/bin/false"),
     };
-    let result =
-        CliBridge::invoke(false_bin.to_str().unwrap(), vec![], None).unwrap();
+    let result = CliBridge::invoke(false_bin.to_str().unwrap(), vec![], None).unwrap();
     assert!(!result.success);
 }
 
@@ -60,10 +59,7 @@ fn test_invoke_captures_stderr_on_failure() {
     let mut env: HashMap<String, String> = std::env::vars().collect();
     // Override HOME to prevent git from picking up a parent repo.
     env.insert("HOME".into(), tmp.path().to_str().unwrap().into());
-    env.insert(
-        "PATH".into(),
-        std::env::var("PATH").unwrap_or_default(),
-    );
+    env.insert("PATH".into(), std::env::var("PATH").unwrap_or_default());
     env.insert("GIT_DIR".into(), "/nonexistent_git_dir".into());
 
     let result = CliBridge::invoke("git", vec!["log".into()], Some(&env)).unwrap();
@@ -92,8 +88,7 @@ fn test_invoke_absolute_path_not_found_returns_err() {
 fn test_invoke_absolute_binary_path() {
     let git_path = require_bin!("git");
     let result =
-        CliBridge::invoke(git_path.to_str().unwrap(), vec!["--version".into()], None)
-            .unwrap();
+        CliBridge::invoke(git_path.to_str().unwrap(), vec!["--version".into()], None).unwrap();
     assert!(result.success);
     assert!(result.output.contains("git"));
 }
@@ -168,8 +163,7 @@ fn test_invoke_env_override_custom_path_resolution() {
     let mut env = HashMap::new();
     env.insert("PATH".into(), bin_dir.to_str().unwrap().into());
 
-    let result =
-        CliBridge::invoke("crosstalk_stub", vec![], Some(&env)).unwrap();
+    let result = CliBridge::invoke("crosstalk_stub", vec![], Some(&env)).unwrap();
     assert!(result.success, "stderr: {:?}", result.error);
     assert!(result.output.trim() == "stub_ok");
 }
@@ -179,10 +173,9 @@ fn test_invoke_env_override_custom_path_resolution() {
 #[tokio::test]
 async fn test_invoke_with_timeout_completes_successfully() {
     let _ = require_bin!("git");
-    let result =
-        CliBridge::invoke_with_timeout("git", vec!["--version".into()], None, 10)
-            .await
-            .unwrap();
+    let result = CliBridge::invoke_with_timeout("git", vec!["--version".into()], None, 10)
+        .await
+        .unwrap();
     assert!(result.success);
     assert!(result.output.contains("git"));
 }
@@ -219,10 +212,9 @@ async fn test_invoke_with_timeout_exceeded_returns_err() {
 
 #[tokio::test]
 async fn test_invoke_with_timeout_binary_not_found() {
-    let err =
-        CliBridge::invoke_with_timeout("__no_such_binary__", vec![], None, 5)
-            .await
-            .unwrap_err();
+    let err = CliBridge::invoke_with_timeout("__no_such_binary__", vec![], None, 5)
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("not found"));
 }
 
@@ -239,7 +231,10 @@ fn test_validate_schema_cargo() {
     // cargo universally exposes --version and --help
     let has_version = schema.flags.iter().any(|f| f.long == "version");
     let has_help = schema.flags.iter().any(|f| f.long == "help");
-    assert!(has_version || has_help, "expected --version or --help in cargo schema");
+    assert!(
+        has_version || has_help,
+        "expected --version or --help in cargo schema"
+    );
 }
 
 #[test]
@@ -249,7 +244,11 @@ fn test_validate_schema_git() {
     assert!(!schema.flags.is_empty());
     // git --help always lists --version
     let has_version = schema.flags.iter().any(|f| f.long == "version");
-    assert!(has_version, "expected --version flag in git schema; got: {:?}", schema.flags);
+    assert!(
+        has_version,
+        "expected --version flag in git schema; got: {:?}",
+        schema.flags
+    );
 }
 
 #[test]

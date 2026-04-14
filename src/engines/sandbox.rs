@@ -1,5 +1,5 @@
 use crate::types::conversation::ConversationState;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use wasmtime::*;
 use wasmtime_wasi::pipe::MemoryOutputPipe;
@@ -77,7 +77,11 @@ impl SandboxManager {
             Ok(result) if result.exit_code == 0 => Ok((result, None)),
             Ok(result) => Ok((result, Some(snapshot.clone()))),
             Err(e) => Ok((
-                SandboxResult { exit_code: -1, stdout: String::new(), stderr: e.to_string() },
+                SandboxResult {
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: e.to_string(),
+                },
                 Some(snapshot.clone()),
             )),
         }

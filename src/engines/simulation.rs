@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use rand::{Rng, SeedableRng, rng};
 use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng, rng};
 use rayon::prelude::*;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -249,11 +249,8 @@ impl MonteCarloRunner {
             let mut current_risk = 1.0;
             let mut standard_error = 1.0;
 
-            let num_batches = (config
-                .max_trials
-                .saturating_add(config.batch_size)
-                - 1)
-                / config.batch_size;
+            let num_batches =
+                (config.max_trials.saturating_add(config.batch_size) - 1) / config.batch_size;
 
             for batch_idx in 0..num_batches {
                 if cancel_token.is_cancelled() {

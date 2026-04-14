@@ -97,7 +97,10 @@ fn test_embedding_similarity_high() {
     // Verify embeddings are identical
     assert_eq!(embedding1.len(), embedding2.len());
     for (e1, e2) in embedding1.iter().zip(embedding2.iter()) {
-        assert!((e1 - e2).abs() < 1e-6, "Same text should produce identical embeddings");
+        assert!(
+            (e1 - e2).abs() < 1e-6,
+            "Same text should produce identical embeddings"
+        );
     }
 
     // Verify self-similarity is perfect
@@ -162,6 +165,7 @@ fn test_memory_store_insert_and_query() {
             timestamp: current_timestamp(),
             metadata_json: format!(r#"{{"text": "{}"}}"#, text),
             outcome: None,
+            is_negative: false,
         });
     }
 
@@ -170,7 +174,11 @@ fn test_memory_store_insert_and_query() {
     for (i, record) in records.iter().enumerate() {
         assert_eq!(record.turn_id, i as u32);
         assert_eq!(record.session_id, "test-session");
-        assert_eq!(record.embedding.len(), 384, "Embedding should have 384 dimensions");
+        assert_eq!(
+            record.embedding.len(),
+            384,
+            "Embedding should have 384 dimensions"
+        );
         assert!(!record.content_hash.is_empty());
     }
 
@@ -205,6 +213,7 @@ fn test_outcome_weighting() {
             was_rolled_back: true,
             convergence_contribution: 0.1,
         }),
+        is_negative: false,
     };
 
     let passed_record = MemoryRecord {
@@ -221,6 +230,7 @@ fn test_outcome_weighting() {
             was_rolled_back: false,
             convergence_contribution: 0.8,
         }),
+        is_negative: false,
     };
 
     // Verify outcome structure
@@ -263,6 +273,7 @@ fn test_vector_round_trip() {
             was_rolled_back: false,
             convergence_contribution: 0.9,
         }),
+        is_negative: false,
     };
 
     // Serialize to JSON (representing Arrow serialization)
@@ -300,14 +311,18 @@ fn test_failure_predictor_detection() {
     // Test context that should trigger the warning
     let current_context = "Implementing a function that uses CompilationError handling";
 
-    let warning = FailurePredictor::proactive_warning(current_context, &[failure_signature.clone()]);
+    let warning =
+        FailurePredictor::proactive_warning(current_context, &[failure_signature.clone()]);
 
     assert!(
         warning.is_some(),
         "Should detect matching error type in context"
     );
     let msg = warning.unwrap();
-    assert!(msg.contains("CompilationError"), "Warning should mention error type");
+    assert!(
+        msg.contains("CompilationError"),
+        "Warning should mention error type"
+    );
 }
 
 // ============================================================================
@@ -357,7 +372,10 @@ fn test_lesson_extraction() {
 
     let lessons = LessonExtractor::extract(&[turn]);
 
-    assert!(!lessons.is_empty(), "Should extract lesson from successful turn");
+    assert!(
+        !lessons.is_empty(),
+        "Should extract lesson from successful turn"
+    );
     let lesson = &lessons[0];
 
     // Verify lesson structure
@@ -366,7 +384,11 @@ fn test_lesson_extraction() {
     assert_eq!(lesson.outcome, "Success (Tests Passed)");
     assert!(lesson.confidence >= 0.85);
     assert!(!lesson.applicability_tags.is_empty());
-    assert!(lesson.applicability_tags.contains(&"passing_tests".to_string()));
+    assert!(
+        lesson
+            .applicability_tags
+            .contains(&"passing_tests".to_string())
+    );
 }
 
 // ============================================================================
@@ -490,6 +512,7 @@ fn test_memory_record_metadata_preservation() {
         timestamp: current_timestamp(),
         metadata_json: metadata.to_string(),
         outcome: None,
+        is_negative: false,
     };
 
     // Serialize and deserialize
@@ -524,6 +547,7 @@ fn test_outcome_record_round_trip() {
         timestamp: current_timestamp(),
         metadata_json: "{}".to_string(),
         outcome: Some(outcome.clone()),
+        is_negative: false,
     };
 
     let serialized = serde_json::to_string(&record).expect("Serialization failed");
@@ -651,7 +675,7 @@ fn test_query_weighted_outcome_ranking() {
 // New tests: Track 09-A — snapshot/restore, forget, clustering, stats
 // ============================================================================
 
-use crosstalk::engines::memory::{MemoryStore, SemanticClusterer};
+use crosstalk::engines::memory::{MemoryBridge, MemoryStore, SemanticClusterer};
 use crosstalk::types::memory::SessionContext;
 
 fn make_turn(index: u32, content: &str, outcome: TurnOutcome) -> Turn {
@@ -680,6 +704,7 @@ fn make_record(turn_id: u32, session_id: &str) -> MemoryRecord {
         timestamp: current_timestamp(),
         metadata_json: "{}".to_string(),
         outcome: None,
+        is_negative: false,
     }
 }
 
@@ -764,10 +789,7 @@ async fn test_forget_appends_deletion_log() {
     let mut store = MemoryStore::new(dir.path().to_str().unwrap());
     store.init().await.unwrap();
 
-    store
-        .forget(99, "sess-audit")
-        .await
-        .unwrap();
+    store.forget(99, "sess-audit").await.unwrap();
 
     assert_eq!(store.deletion_log.len(), 1);
     assert_eq!(store.deletion_log[0].turn_id, 99);
@@ -802,7 +824,11 @@ async fn test_forget_removes_cluster_assignment() {
     // recall_by_cluster for cluster 0 should now only have turn_id 20 in assignments
     let cluster0: Vec<u32> = {
         let clusters = vec![vec![10u32, 20], vec![30u32]];
-        clusters[0].iter().filter(|&&id| id != 10).copied().collect()
+        clusters[0]
+            .iter()
+            .filter(|&&id| id != 10)
+            .copied()
+            .collect()
     };
     assert_eq!(cluster0, vec![20]);
 }
@@ -943,8 +969,14 @@ fn session_context_record_turn_increments_total() {
     ctx.record_turn(TurnOutcome::TestsPassed);
     ctx.record_turn(TurnOutcome::RolledBack);
     assert_eq!(ctx.total_turns, 3);
-    assert_eq!(*ctx.outcome_summary.get(&TurnOutcome::TestsPassed).unwrap(), 2);
-    assert_eq!(*ctx.outcome_summary.get(&TurnOutcome::RolledBack).unwrap(), 1);
+    assert_eq!(
+        *ctx.outcome_summary.get(&TurnOutcome::TestsPassed).unwrap(),
+        2
+    );
+    assert_eq!(
+        *ctx.outcome_summary.get(&TurnOutcome::RolledBack).unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -1000,7 +1032,10 @@ fn decay_calibrator_no_calibration_below_min_samples() {
         cal.record_useful_turn(i as f64);
     }
     cal.calibrate();
-    assert!((cal.decay_rate() - 0.01).abs() < 1e-9, "should not change below 10 samples");
+    assert!(
+        (cal.decay_rate() - 0.01).abs() < 1e-9,
+        "should not change below 10 samples"
+    );
 }
 
 #[test]
@@ -1024,7 +1059,10 @@ fn decay_calibrator_young_turns_yield_higher_rate() {
         cal.record_useful_turn(5.0);
     }
     cal.calibrate();
-    assert!(cal.decay_rate() > 0.01, "recent-biased useful turns should raise decay rate");
+    assert!(
+        cal.decay_rate() > 0.01,
+        "recent-biased useful turns should raise decay rate"
+    );
 }
 
 #[test]
@@ -1081,7 +1119,9 @@ fn select_k_returns_value_in_valid_range() {
 fn distill_with_decay_zero_rate_weights_all_equally() {
     let mut sigma = ConversationState::new("test-decay");
     for i in 0u32..5 {
-        sigma.turns.push(make_turn(i, &format!("content {i}"), TurnOutcome::Unknown));
+        sigma
+            .turns
+            .push(make_turn(i, &format!("content {i}"), TurnOutcome::Unknown));
     }
     let out = ContextDistiller::distill_with_decay(&sigma, 4096, 0.0);
     assert!(out.contains("content 0"));
@@ -1091,8 +1131,215 @@ fn distill_with_decay_zero_rate_weights_all_equally() {
 #[test]
 fn distill_default_delegates_to_distill_with_decay() {
     let mut sigma = ConversationState::new("decay-delegate");
-    sigma.turns.push(make_turn(0, "hello", TurnOutcome::Unknown));
+    sigma
+        .turns
+        .push(make_turn(0, "hello", TurnOutcome::Unknown));
     let a = ContextDistiller::distill(&sigma, 4096);
     let b = ContextDistiller::distill_with_decay(&sigma, 4096, 0.01);
     assert_eq!(a, b);
+}
+
+// ============================================================================
+// FEAT-011: Negative memory (antipattern) tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_negative_records_excluded_from_recall() {
+    let mut bridge = MemoryBridge::new();
+    bridge.open_session("s1".to_string());
+
+    let mut pos = make_record(1, "s1");
+    pos.embedding = embed_text("rust async programming");
+    pos.is_negative = false;
+    bridge.push_record("s1", pos);
+
+    let mut neg = make_record(2, "s1");
+    neg.embedding = embed_text("rust async programming failure");
+    neg.is_negative = true;
+    bridge.push_record("s1", neg);
+
+    let results = bridge
+        .recall_relevant("s1", "rust async", 10, 0)
+        .await
+        .unwrap();
+    assert!(results.iter().all(|r| !r.is_negative));
+}
+
+#[tokio::test]
+async fn test_antipattern_recall_returns_only_negatives() {
+    let mut bridge = MemoryBridge::new();
+    bridge.open_session("s1".to_string());
+
+    let mut pos = make_record(1, "s1");
+    pos.embedding = embed_text("good pattern");
+    pos.is_negative = false;
+    bridge.push_record("s1", pos);
+
+    let mut neg = make_record(2, "s1");
+    neg.embedding = embed_text("bad antipattern");
+    neg.is_negative = true;
+    bridge.push_record("s1", neg);
+
+    let results = bridge.recall_antipatterns("antipattern", 10).await;
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_negative);
+}
+
+#[test]
+fn test_store_failure_lesson_creates_negative_record() {
+    use crosstalk::types::self_improvement::{FailureCause, PostMortem};
+
+    let mut bridge = MemoryBridge::new();
+    bridge.open_session("s1".to_string());
+
+    let mortem = PostMortem {
+        session_id: "s1".to_string(),
+        failure_turn_indices: vec![1, 3, 5],
+        root_cause: FailureCause::TypeMismatch,
+        missing_context: vec![],
+        alternative_approaches: vec![],
+    };
+    bridge.store_failure_lesson("s1", &mortem);
+
+    let records = bridge.take_snapshot("s1");
+    assert_eq!(records.len(), 1);
+    assert!(records[0].is_negative);
+    assert!(records[0].metadata_json.contains("\"is_negative\":true"));
+    assert!(records[0].metadata_json.contains("TypeMismatch"));
+}
+
+// ============================================================================
+// FEAT-012: Temporal decay tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_temporal_decay_favors_recent() {
+    let mut bridge = MemoryBridge::new();
+    bridge.open_session("s1".to_string());
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut old = make_record(1, "s1");
+    old.embedding = embed_text("database optimization query");
+    old.timestamp = now - 90 * 86400; // 90 days ago
+    bridge.push_record("s1", old);
+
+    let mut recent = make_record(2, "s1");
+    recent.embedding = embed_text("database optimization query");
+    recent.timestamp = now; // now
+    bridge.push_record("s1", recent);
+
+    let results = bridge
+        .recall_relevant("s1", "database optimization", 2, 0)
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    // Recent record should be first due to decay
+    assert_eq!(results[0].turn_id, 2);
+    assert_eq!(results[1].turn_id, 1);
+}
+
+// ============================================================================
+// FEAT-016: Per-category influence weight tests
+// ============================================================================
+
+use crosstalk::engines::consensus::InfluenceWeightManager;
+use crosstalk::types::conversation::TaskCategory;
+
+#[test]
+fn test_category_weights_favor_specialists() {
+    let mut sigma = ConversationState::new("cat-test");
+
+    // Agent A: only does CodeGeneration, always passes
+    for i in 0..5 {
+        let mut t = make_turn(i, "code", TurnOutcome::TestsPassed);
+        t.model_id = "agent-a".to_string();
+        t.task_category = Some(TaskCategory::CodeGeneration);
+        t.certainty = Some(0.9);
+        sigma.turns.push(t);
+    }
+
+    // Agent B: only does Research, mediocre
+    for i in 5..10 {
+        let mut t = make_turn(i, "research", TurnOutcome::Compiled);
+        t.model_id = "agent-b".to_string();
+        t.task_category = Some(TaskCategory::Research);
+        t.certainty = Some(0.5);
+        sigma.turns.push(t);
+    }
+
+    let code_weights = InfluenceWeightManager::calculate_weights_for_category(
+        &sigma,
+        TaskCategory::CodeGeneration,
+        0.9,
+    );
+    let a_code = code_weights.get("agent-a").copied().unwrap_or(0.0);
+    let b_code = code_weights.get("agent-b").copied().unwrap_or(0.0);
+
+    // Agent A should dominate in CodeGeneration
+    assert!(
+        a_code > b_code,
+        "specialist a={a_code} should beat generalist b={b_code} in CodeGeneration"
+    );
+}
+
+#[test]
+fn test_category_weights_fallback_when_no_category_turns() {
+    let mut sigma = ConversationState::new("cat-fallback");
+
+    for i in 0..3 {
+        let mut t = make_turn(i, "code", TurnOutcome::TestsPassed);
+        t.model_id = "agent-a".to_string();
+        t.task_category = Some(TaskCategory::CodeGeneration);
+        t.certainty = Some(0.8);
+        sigma.turns.push(t);
+    }
+
+    // No Architecture turns exist — should fall back to global weights
+    let arch_weights = InfluenceWeightManager::calculate_weights_for_category(
+        &sigma,
+        TaskCategory::Architecture,
+        0.9,
+    );
+    assert!(arch_weights.contains_key("agent-a"));
+}
+
+#[test]
+fn test_category_weights_generalist_dampened() {
+    let mut sigma = ConversationState::new("cat-dampen");
+
+    // Agent A: specialist in Debugging
+    for i in 0..5 {
+        let mut t = make_turn(i, "debug", TurnOutcome::TestsPassed);
+        t.model_id = "agent-a".to_string();
+        t.task_category = Some(TaskCategory::Debugging);
+        t.certainty = Some(0.9);
+        sigma.turns.push(t);
+    }
+
+    // Agent B: only does Research (no Debugging turns)
+    for i in 5..10 {
+        let mut t = make_turn(i, "research", TurnOutcome::TestsPassed);
+        t.model_id = "agent-b".to_string();
+        t.task_category = Some(TaskCategory::Research);
+        t.certainty = Some(0.9);
+        sigma.turns.push(t);
+    }
+
+    let debug_weights = InfluenceWeightManager::calculate_weights_for_category(
+        &sigma,
+        TaskCategory::Debugging,
+        0.9,
+    );
+    let a_w = debug_weights.get("agent-a").copied().unwrap_or(0.0);
+    let b_w = debug_weights.get("agent-b").copied().unwrap_or(0.0);
+
+    // Agent B should be dampened (global * 0.3) in Debugging
+    assert!(
+        a_w > b_w * 2.0,
+        "specialist a={a_w} should strongly outweigh dampened generalist b={b_w}"
+    );
 }

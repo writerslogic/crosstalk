@@ -5,13 +5,24 @@ use std::collections::BTreeMap;
 
 fn make_profile(model_id: &str, category: TaskCategory, mean: f64) -> ModelProfile {
     let mut task_scores = BTreeMap::new();
-    task_scores.insert(category, RunningAverage { mean, count: 1, variance: 0.0 });
+    task_scores.insert(
+        category,
+        RunningAverage {
+            mean,
+            count: 1,
+            variance: 0.0,
+        },
+    );
     ModelProfile {
         model_id: model_id.to_string(),
         task_scores,
         total_turns: 1,
         last_updated: 0,
-        latency_ms: RunningAverage { mean: 100.0, count: 1, variance: 0.0 },
+        latency_ms: RunningAverage {
+            mean: 100.0,
+            count: 1,
+            variance: 0.0,
+        },
     }
 }
 
@@ -58,8 +69,14 @@ async fn test_routing_respects_token_budget() {
 #[tokio::test]
 async fn test_routing_respects_blacklist() {
     let engine = IntelligenceEngine::new();
-    engine.profiles.insert("m1".to_string(), make_profile("m1", TaskCategory::CodeGeneration, 0.8));
-    engine.profiles.insert("m2".to_string(), make_profile("m2", TaskCategory::CodeGeneration, 0.9));
+    engine.profiles.insert(
+        "m1".to_string(),
+        make_profile("m1", TaskCategory::CodeGeneration, 0.8),
+    );
+    engine.profiles.insert(
+        "m2".to_string(),
+        make_profile("m2", TaskCategory::CodeGeneration, 0.9),
+    );
 
     let selected = engine
         .route_task_constrained(
@@ -76,10 +93,26 @@ async fn test_routing_respects_blacklist() {
 #[test]
 fn test_pareto_frontier_computation() {
     let points = vec![
-        ParetoPoint { model_id: "cheap_bad".to_string(), quality: 0.4, cost_tokens: 500 },
-        ParetoPoint { model_id: "expensive_good".to_string(), quality: 0.9, cost_tokens: 2000 },
-        ParetoPoint { model_id: "mid".to_string(), quality: 0.7, cost_tokens: 1000 },
-        ParetoPoint { model_id: "dominated".to_string(), quality: 0.6, cost_tokens: 1200 },
+        ParetoPoint {
+            model_id: "cheap_bad".to_string(),
+            quality: 0.4,
+            cost_tokens: 500,
+        },
+        ParetoPoint {
+            model_id: "expensive_good".to_string(),
+            quality: 0.9,
+            cost_tokens: 2000,
+        },
+        ParetoPoint {
+            model_id: "mid".to_string(),
+            quality: 0.7,
+            cost_tokens: 1000,
+        },
+        ParetoPoint {
+            model_id: "dominated".to_string(),
+            quality: 0.6,
+            cost_tokens: 1200,
+        },
     ];
 
     let frontier = ParetoOptimizer::compute_frontier(points);
@@ -92,9 +125,21 @@ fn test_pareto_frontier_computation() {
 #[test]
 fn test_pareto_selection_with_constraints() {
     let frontier = vec![
-        ParetoPoint { model_id: "p1".to_string(), quality: 0.9, cost_tokens: 2000 },
-        ParetoPoint { model_id: "p2".to_string(), quality: 0.7, cost_tokens: 1000 },
-        ParetoPoint { model_id: "p3".to_string(), quality: 0.5, cost_tokens: 500 },
+        ParetoPoint {
+            model_id: "p1".to_string(),
+            quality: 0.9,
+            cost_tokens: 2000,
+        },
+        ParetoPoint {
+            model_id: "p2".to_string(),
+            quality: 0.7,
+            cost_tokens: 1000,
+        },
+        ParetoPoint {
+            model_id: "p3".to_string(),
+            quality: 0.5,
+            cost_tokens: 500,
+        },
     ];
 
     // min_quality 0.6, max_tokens 1500 -> should pick p2

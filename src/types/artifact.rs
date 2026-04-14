@@ -1,5 +1,5 @@
 use crate::engines::quality::ArtifactMetrics;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -39,7 +39,11 @@ impl ArtifactDiff {
         if diff_text.contains('\0') {
             return Err(anyhow!("diff_text contains null bytes"));
         }
-        Ok(ArtifactDiff { original_version, new_version, diff_text })
+        Ok(ArtifactDiff {
+            original_version,
+            new_version,
+            diff_text,
+        })
     }
 
     pub fn validate(&self) -> Result<()> {

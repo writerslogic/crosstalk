@@ -253,7 +253,10 @@ async fn test_critical_tool_confirmed_passes_gate() {
     let res = gateway.handle_request("agent_full", req).await;
     assert!(res.is_err());
     let msg = res.unwrap_err().to_string();
-    assert!(!msg.contains("not confirmed"), "should have passed confirmation gate");
+    assert!(
+        !msg.contains("not confirmed"),
+        "should have passed confirmation gate"
+    );
     assert!(msg.contains("Tool not found"));
 }
 
@@ -307,7 +310,12 @@ async fn test_denied_tool_recovery_via_permission_upgrade() {
     );
     let denied = gateway.handle_request("agent_recover", req).await;
     assert!(denied.is_err());
-    assert!(denied.unwrap_err().to_string().contains("Permission denied"));
+    assert!(
+        denied
+            .unwrap_err()
+            .to_string()
+            .contains("Permission denied")
+    );
 
     // Upgrade to Full; permission check now passes.
     gateway
@@ -421,7 +429,10 @@ async fn disabled_tool_returns_error_immediately() {
         .tiers
         .insert("agent".to_string(), PermissionTier::Full);
 
-    let req = make_req("tools/call", serde_json::json!({ "name": "slow_tool", "arguments": {} }));
+    let req = make_req(
+        "tools/call",
+        serde_json::json!({ "name": "slow_tool", "arguments": {} }),
+    );
     let res = gateway.handle_request("agent", req).await;
     assert!(res.is_err());
     assert!(res.unwrap_err().to_string().contains("disabled"));

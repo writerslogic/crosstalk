@@ -1,7 +1,7 @@
 use crosstalk::engines::quality::{
-    ArtifactMetrics, BlockerType, CompletionScorer, DocChecker, IncoherenceKind, QualityTrend,
-    QualityTrendAnalyzer, RegressionDetector, TournamentProposal,
-    TournamentRunner, TrendClassification, CoherenceChecker, DeadItemKind, DeadCodeDetector,
+    ArtifactMetrics, BlockerType, CoherenceChecker, CompletionScorer, DeadCodeDetector,
+    DeadItemKind, DocChecker, IncoherenceKind, QualityTrend, QualityTrendAnalyzer,
+    RegressionDetector, TournamentProposal, TournamentRunner, TrendClassification,
 };
 use crosstalk::types::artifact::{Artifact, ArtifactDiff, ProofAttachment};
 use std::collections::{BTreeMap, HashMap};
@@ -40,22 +40,42 @@ fn artifact_with(name: &str, content: &str) -> Artifact {
 
 #[test]
 fn regression_detector_rejects_complexity_spike() {
-    let old = ArtifactMetrics { cyclomatic_complexity: 2, ..Default::default() };
-    let new = ArtifactMetrics { cyclomatic_complexity: 8, ..Default::default() };
+    let old = ArtifactMetrics {
+        cyclomatic_complexity: 2,
+        ..Default::default()
+    };
+    let new = ArtifactMetrics {
+        cyclomatic_complexity: 8,
+        ..Default::default()
+    };
     assert!(RegressionDetector::is_regressive(&old, &new));
 }
 
 #[test]
 fn regression_detector_rejects_comment_drop() {
-    let old = ArtifactMetrics { comment_density: 0.3, ..Default::default() };
-    let new = ArtifactMetrics { comment_density: 0.1, ..Default::default() };
+    let old = ArtifactMetrics {
+        comment_density: 0.3,
+        ..Default::default()
+    };
+    let new = ArtifactMetrics {
+        comment_density: 0.1,
+        ..Default::default()
+    };
     assert!(RegressionDetector::is_regressive(&old, &new));
 }
 
 #[test]
 fn regression_detector_accepts_stable_metrics() {
-    let old = ArtifactMetrics { cyclomatic_complexity: 5, comment_density: 0.2, ..Default::default() };
-    let new = ArtifactMetrics { cyclomatic_complexity: 6, comment_density: 0.2, ..Default::default() };
+    let old = ArtifactMetrics {
+        cyclomatic_complexity: 5,
+        comment_density: 0.2,
+        ..Default::default()
+    };
+    let new = ArtifactMetrics {
+        cyclomatic_complexity: 6,
+        comment_density: 0.2,
+        ..Default::default()
+    };
     assert!(!RegressionDetector::is_regressive(&old, &new));
 }
 
@@ -66,13 +86,28 @@ fn trend_analyzer_classifies_improving() {
     let trend = QualityTrend {
         artifact_id: "a1".to_string(),
         history: vec![
-            crosstalk::engines::quality::QualityTrendEntry { turn_id: 1, score: 0.5 },
-            crosstalk::engines::quality::QualityTrendEntry { turn_id: 2, score: 0.6 },
-            crosstalk::engines::quality::QualityTrendEntry { turn_id: 3, score: 0.7 },
-            crosstalk::engines::quality::QualityTrendEntry { turn_id: 4, score: 0.8 },
+            crosstalk::engines::quality::QualityTrendEntry {
+                turn_id: 1,
+                score: 0.5,
+            },
+            crosstalk::engines::quality::QualityTrendEntry {
+                turn_id: 2,
+                score: 0.6,
+            },
+            crosstalk::engines::quality::QualityTrendEntry {
+                turn_id: 3,
+                score: 0.7,
+            },
+            crosstalk::engines::quality::QualityTrendEntry {
+                turn_id: 4,
+                score: 0.8,
+            },
         ],
     };
-    assert_eq!(QualityTrendAnalyzer::classify(&trend), TrendClassification::Improving);
+    assert_eq!(
+        QualityTrendAnalyzer::classify(&trend),
+        TrendClassification::Improving
+    );
 }
 
 #[test]
@@ -80,12 +115,24 @@ fn trend_analyzer_classifies_degrading() {
     let trend = QualityTrend {
         artifact_id: "a1".to_string(),
         history: vec![
-            crosstalk::engines::quality::QualityTrendEntry { turn_id: 1, score: 0.8 },
-            crosstalk::engines::quality::QualityTrendEntry { turn_id: 2, score: 0.7 },
-            crosstalk::engines::quality::QualityTrendEntry { turn_id: 3, score: 0.6 },
+            crosstalk::engines::quality::QualityTrendEntry {
+                turn_id: 1,
+                score: 0.8,
+            },
+            crosstalk::engines::quality::QualityTrendEntry {
+                turn_id: 2,
+                score: 0.7,
+            },
+            crosstalk::engines::quality::QualityTrendEntry {
+                turn_id: 3,
+                score: 0.6,
+            },
         ],
     };
-    assert_eq!(QualityTrendAnalyzer::classify(&trend), TrendClassification::Degrading);
+    assert_eq!(
+        QualityTrendAnalyzer::classify(&trend),
+        TrendClassification::Degrading
+    );
 }
 
 // ── CoherenceChecker ──────────────────────────────────────────────────────────
@@ -104,8 +151,9 @@ fn coherence_stale_mod_declaration_flagged() {
     );
     let reports = CoherenceChecker::verify(&arts);
     assert!(
-        reports.iter().any(|r| r.symbol == "nonexistent_module"
-            && r.kind == IncoherenceKind::StaleImport),
+        reports
+            .iter()
+            .any(|r| r.symbol == "nonexistent_module" && r.kind == IncoherenceKind::StaleImport),
         "stale mod declaration must be flagged"
     );
 }
@@ -113,8 +161,14 @@ fn coherence_stale_mod_declaration_flagged() {
 #[test]
 fn coherence_known_mod_not_flagged() {
     let mut arts = HashMap::new();
-    arts.insert("lib.rs".to_string(), Arc::new(artifact_with("lib.rs", "mod helper;\n")));
-    arts.insert("helper.rs".to_string(), Arc::new(artifact_with("helper.rs", "pub fn foo() {}\n")));
+    arts.insert(
+        "lib.rs".to_string(),
+        Arc::new(artifact_with("lib.rs", "mod helper;\n")),
+    );
+    arts.insert(
+        "helper.rs".to_string(),
+        Arc::new(artifact_with("helper.rs", "pub fn foo() {}\n")),
+    );
     let reports = CoherenceChecker::verify(&arts);
     assert!(
         !reports.iter().any(|r| r.symbol == "helper"),
@@ -127,12 +181,16 @@ fn coherence_undefined_symbol_in_use_flagged() {
     let mut arts = HashMap::new();
     arts.insert(
         "consumer.rs".to_string(),
-        Arc::new(artifact_with("consumer.rs", "use some_crate::GhostStruct;\n")),
+        Arc::new(artifact_with(
+            "consumer.rs",
+            "use some_crate::GhostStruct;\n",
+        )),
     );
     let reports = CoherenceChecker::verify(&arts);
     assert!(
-        reports.iter().any(|r| r.symbol == "GhostStruct"
-            && r.kind == IncoherenceKind::UndefinedSymbol),
+        reports
+            .iter()
+            .any(|r| r.symbol == "GhostStruct" && r.kind == IncoherenceKind::UndefinedSymbol),
         "undefined PascalCase import must be flagged"
     );
 }
@@ -174,7 +232,10 @@ fn tournament_runner_picks_highest_score() {
         },
     ];
     let result = TournamentRunner::run(&proposals).unwrap();
-    assert_eq!(result.winner_agent_id, "B", "agent B wins due to passing tests");
+    assert_eq!(
+        result.winner_agent_id, "B",
+        "agent B wins due to passing tests"
+    );
 }
 
 // ── DocChecker ────────────────────────────────────────────────────────────────
@@ -183,7 +244,10 @@ fn tournament_runner_picks_highest_score() {
 fn doc_checker_detects_return_mismatch() {
     let content = "/// This function returns a Result.\npub fn foo() -> Option<u32> { None }";
     let issues = DocChecker::verify(content);
-    assert!(!issues.is_empty(), "mismatch between doc 'Result' and sig 'Option' should be flagged");
+    assert!(
+        !issues.is_empty(),
+        "mismatch between doc 'Result' and sig 'Option' should be flagged"
+    );
 }
 
 #[test]
@@ -199,7 +263,12 @@ fn doc_checker_detects_param_mismatch() {
 fn dead_code_detector_flags_unused_private_fn() {
     let content = "fn dead() {}\nfn main() {}";
     let report = DeadCodeDetector::scan("main.rs", content);
-    assert!(report.dead_items.iter().any(|i| i.name == "dead" && i.kind == DeadItemKind::UnusedFunction));
+    assert!(
+        report
+            .dead_items
+            .iter()
+            .any(|i| i.name == "dead" && i.kind == DeadItemKind::UnusedFunction)
+    );
 }
 
 #[test]
@@ -213,5 +282,10 @@ fn dead_code_detector_ignores_used_fn() {
 fn dead_code_detector_flags_unused_import() {
     let content = "use std::collections::HashMap;\nfn main() {}";
     let report = DeadCodeDetector::scan("main.rs", content);
-    assert!(report.dead_items.iter().any(|i| i.name == "HashMap" && i.kind == DeadItemKind::UnusedImport));
+    assert!(
+        report
+            .dead_items
+            .iter()
+            .any(|i| i.name == "HashMap" && i.kind == DeadItemKind::UnusedImport)
+    );
 }

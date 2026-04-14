@@ -6,13 +6,13 @@ use crosstalk::engines::collective_intelligence::{
     DynamicTeamComposer, EnsembleEngine, MetaStrategy, MetaStrategyOptimizer, PeerReview,
 };
 use crosstalk::engines::release::{ConvergenceReport, CpopVerifier, ReleaseManager};
+use crosstalk::types::analytics::QualityTrend;
+use crosstalk::types::conversation::{ConversationState, Turn, TurnOutcome};
+use crosstalk::types::intelligence::AgentProfile;
 use crosstalk::ui::visualization::{
     ForceDirectedGraph, HeatmapGenerator, LatentMapper, Node, ReplayEngine, SvgExporter,
     TimelineManager,
 };
-use crosstalk::types::analytics::QualityTrend;
-use crosstalk::types::conversation::{ConversationState, Turn, TurnOutcome};
-use crosstalk::types::intelligence::AgentProfile;
 use std::collections::BTreeMap;
 
 fn make_state(session_id: &str, turns: u32, prob: f64) -> ConversationState {
@@ -26,7 +26,11 @@ fn make_state(session_id: &str, turns: u32, prob: f64) -> ConversationState {
             timestamp: i as u64,
             diffs: vec![],
             certainty: Some(0.8),
-            outcome: if i % 3 == 0 { TurnOutcome::TestsPassed } else { TurnOutcome::Compiled },
+            outcome: if i % 3 == 0 {
+                TurnOutcome::TestsPassed
+            } else {
+                TurnOutcome::Compiled
+            },
             task_category: None,
             structure: None,
             signature: vec![],
@@ -49,13 +53,19 @@ fn analytics_report_has_correct_session_id() {
 #[test]
 fn quality_trend_detector_improving() {
     let scores = vec![0.4, 0.5, 0.6, 0.7, 0.8];
-    assert_eq!(QualityTrendDetector::detect(&scores), QualityTrend::Improving);
+    assert_eq!(
+        QualityTrendDetector::detect(&scores),
+        QualityTrend::Improving
+    );
 }
 
 #[test]
 fn quality_trend_detector_regressing() {
     let scores = vec![0.8, 0.7, 0.6, 0.5, 0.4];
-    assert_eq!(QualityTrendDetector::detect(&scores), QualityTrend::Regressing);
+    assert_eq!(
+        QualityTrendDetector::detect(&scores),
+        QualityTrend::Regressing
+    );
 }
 
 #[test]
@@ -93,7 +103,10 @@ fn strategy_recommender_flags_low_success_rate() {
         t.outcome = TurnOutcome::Rejected;
     }
     let recs = StrategyRecommender::recommend(&sigma);
-    assert!(recs.iter().any(|r| r.action == "switch_to_critique_protocol"));
+    assert!(
+        recs.iter()
+            .any(|r| r.action == "switch_to_critique_protocol")
+    );
 }
 
 #[test]
@@ -119,10 +132,19 @@ fn meta_learning_engine_identifies_best_model() {
 #[test]
 fn failure_taxonomy_categorizes_five_types() {
     assert_eq!(FailureTaxonomy::categorize("mismatched types"), "TypeError");
-    assert_eq!(FailureTaxonomy::categorize("timeout waiting for response"), "Timeout");
+    assert_eq!(
+        FailureTaxonomy::categorize("timeout waiting for response"),
+        "Timeout"
+    );
     assert_eq!(FailureTaxonomy::categorize("thread panicked"), "Panic");
-    assert_eq!(FailureTaxonomy::categorize("circular dependency"), "CircularReasoning");
-    assert_eq!(FailureTaxonomy::categorize("quality regression detected"), "QualityRegression");
+    assert_eq!(
+        FailureTaxonomy::categorize("circular dependency"),
+        "CircularReasoning"
+    );
+    assert_eq!(
+        FailureTaxonomy::categorize("quality regression detected"),
+        "QualityRegression"
+    );
 }
 
 // ── Track 18: missing AC coverage ────────────────────────────────────────────
@@ -132,8 +154,8 @@ fn analytics_report_to_json_is_parseable() {
     let sigma = make_state("json-test", 5, 0.7);
     let report = AnalyticsEngine::generate_report(&sigma);
     let json = report.to_json().expect("to_json must succeed");
-    let parsed: serde_json::Value = serde_json::from_str(&json)
-        .expect("to_json must produce parseable JSON");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&json).expect("to_json must produce parseable JSON");
     assert_eq!(parsed["session_id"], "json-test");
     assert!(parsed["agent_performances"].is_array());
     assert!(parsed["timestamp"].is_number());
@@ -167,7 +189,11 @@ fn agent_success_rate_matches_known_outcomes() {
         });
     }
     let report = AnalyticsEngine::generate_report(&sigma);
-    let agent = report.agent_performances.iter().find(|a| a.agent_id == "solo").unwrap();
+    let agent = report
+        .agent_performances
+        .iter()
+        .find(|a| a.agent_id == "solo")
+        .unwrap();
     assert!((agent.success_rate - 0.5).abs() < f64::EPSILON, "2/4 = 0.5");
 }
 
@@ -177,7 +203,11 @@ fn convergence_diagnostics_detects_stuck_goal() {
     sigma.completion_probability = 0.3;
     let report = AnalyticsEngine::generate_report(&sigma);
     assert!(
-        report.convergence.blockers.iter().any(|b| b.contains("StuckGoal")),
+        report
+            .convergence
+            .blockers
+            .iter()
+            .any(|b| b.contains("StuckGoal")),
         "should flag StuckGoal when 15 turns at P(C)=0.3"
     );
 }
@@ -202,7 +232,11 @@ fn convergence_diagnostics_detects_conflicting_proposals() {
     }
     let report = AnalyticsEngine::generate_report(&sigma);
     assert!(
-        report.convergence.blockers.iter().any(|b| b.contains("ConflictingProposals")),
+        report
+            .convergence
+            .blockers
+            .iter()
+            .any(|b| b.contains("ConflictingProposals")),
         "100% rollback rate should flag ConflictingProposals"
     );
 }
@@ -241,7 +275,11 @@ fn convergence_diagnostics_detects_capability_mismatch() {
     });
     let report = AnalyticsEngine::generate_report(&sigma);
     assert!(
-        report.convergence.blockers.iter().any(|b| b.contains("CapabilityMismatch")),
+        report
+            .convergence
+            .blockers
+            .iter()
+            .any(|b| b.contains("CapabilityMismatch")),
         "single agent driving >60% of failures should flag CapabilityMismatch"
     );
 }
@@ -254,7 +292,10 @@ fn meta_learning_across_five_sessions_shows_growth() {
     let refs: Vec<&ConversationState> = sessions.iter().collect();
     let insight = MetaLearningEngine::compute_insight(&refs);
     assert_eq!(insight.session_count, 5);
-    assert!(insight.quality_growth_rate > 0.0, "increasing P(C) across sessions = positive growth");
+    assert!(
+        insight.quality_growth_rate > 0.0,
+        "increasing P(C) across sessions = positive growth"
+    );
 }
 
 // ── Track 19: Release ─────────────────────────────────────────────────────────
@@ -278,7 +319,11 @@ fn stability_audit_detects_hash_mismatch() {
     // Default state_hash = [0u8;32] never matches a real computed hash
     let err = ReleaseManager::run_stability_audit(&sigma);
     assert!(err.is_err(), "mismatched hash should fail the audit");
-    assert!(err.unwrap_err().to_string().contains("Hash chain integrity"));
+    assert!(
+        err.unwrap_err()
+            .to_string()
+            .contains("Hash chain integrity")
+    );
 }
 
 #[test]
@@ -289,7 +334,8 @@ fn stability_audit_monotonic_turns_pass() {
     if let Err(e) = &result {
         assert!(
             e.to_string().contains("Hash chain"),
-            "only acceptable failure is hash: {}", e
+            "only acceptable failure is hash: {}",
+            e
         );
     }
 }
@@ -305,7 +351,11 @@ fn homebrew_formula_contains_version() {
 #[test]
 fn stability_audit_result_is_clean_when_no_failures() {
     use crosstalk::engines::release::StabilityAuditResult;
-    let clean = StabilityAuditResult { passed: 3, failed: 0, issues: vec![] };
+    let clean = StabilityAuditResult {
+        passed: 3,
+        failed: 0,
+        issues: vec![],
+    };
     assert!(clean.is_clean());
     let dirty = StabilityAuditResult {
         passed: 2,
@@ -318,7 +368,10 @@ fn stability_audit_result_is_clean_when_no_failures() {
 #[test]
 fn is_mandate_active_for_brand_new_session() {
     let sigma = ConversationState::new("fresh");
-    assert!(ReleaseManager::is_mandate_active(&sigma), "new session has no turns so mandate is active");
+    assert!(
+        ReleaseManager::is_mandate_active(&sigma),
+        "new session has no turns so mandate is active"
+    );
 }
 
 #[test]
@@ -338,7 +391,10 @@ fn is_mandate_active_false_for_old_session() {
         signature: vec![],
         surprise_signal: None,
     });
-    assert!(!ReleaseManager::is_mandate_active(&sigma), "15+ day old session is past mandate window");
+    assert!(
+        !ReleaseManager::is_mandate_active(&sigma),
+        "15+ day old session is past mandate window"
+    );
 }
 
 // ── Track 20: Collective Intelligence ────────────────────────────────────────
@@ -358,7 +414,10 @@ fn ensemble_merges_to_highest_quality() {
         ("c".to_string(), "proposal C content".to_string(), 0.6),
     ];
     let merged = EnsembleEngine::merge_proposals(proposals);
-    assert!(merged.contains("B"), "highest-quality proposal should dominate merge");
+    assert!(
+        merged.contains("B"),
+        "highest-quality proposal should dominate merge"
+    );
 }
 
 #[test]
@@ -376,14 +435,21 @@ fn dynamic_team_composer_assigns_roles() {
         );
     }
     let team = DynamicTeamComposer::compose(&profiles, "code");
-    assert!(team.architect.is_some() || team.coder.is_some(), "should assign at least one role");
+    assert!(
+        team.architect.is_some() || team.coder.is_some(),
+        "should assign at least one role"
+    );
 }
 
 #[test]
 fn meta_strategy_optimizer_best_after_three_trials() {
     let mut opt = MetaStrategyOptimizer::new();
-    for _ in 0..3 { opt.record(MetaStrategy::DebateAndCritique, 0.9); }
-    for _ in 0..3 { opt.record(MetaStrategy::EnsembleVoting, 0.6); }
+    for _ in 0..3 {
+        opt.record(MetaStrategy::DebateAndCritique, 0.9);
+    }
+    for _ in 0..3 {
+        opt.record(MetaStrategy::EnsembleVoting, 0.6);
+    }
     assert_eq!(opt.best_strategy(), Some(MetaStrategy::DebateAndCritique));
 }
 
@@ -445,12 +511,26 @@ fn replay_engine_records_and_advances() {
 fn svg_exporter_graph_produces_valid_svg() {
     let mut graph = ForceDirectedGraph::new();
     graph.nodes.push(Node {
-        id: "A".to_string(), x: 0.0, y: 0.0, dx: 0.0, dy: 0.0, weight: 1.0,
+        id: "A".to_string(),
+        x: 0.0,
+        y: 0.0,
+        dx: 0.0,
+        dy: 0.0,
+        weight: 1.0,
     });
     graph.nodes.push(Node {
-        id: "B".to_string(), x: 10.0, y: 10.0, dx: 0.0, dy: 0.0, weight: 2.0,
+        id: "B".to_string(),
+        x: 10.0,
+        y: 10.0,
+        dx: 0.0,
+        dy: 0.0,
+        weight: 2.0,
     });
-    graph.edges.push(crosstalk::ui::visualization::Edge { source: 0, target: 1, strength: 1.0 });
+    graph.edges.push(crosstalk::ui::visualization::Edge {
+        source: 0,
+        target: 1,
+        strength: 1.0,
+    });
     let svg = SvgExporter::export_graph(&graph, 400.0, 300.0);
     assert!(svg.starts_with("<svg"), "must start with <svg");
     assert!(svg.ends_with("</svg>"), "must end with </svg>");
@@ -489,8 +569,22 @@ fn heatmap_generator_maps_focus_points() {
 #[test]
 fn force_directed_graph_layout_step_moves_nodes() {
     let mut graph = ForceDirectedGraph::new();
-    graph.nodes.push(Node { id: "A".to_string(), x: 0.0, y: 0.0, dx: 0.0, dy: 0.0, weight: 1.0 });
-    graph.nodes.push(Node { id: "B".to_string(), x: 1.0, y: 0.0, dx: 0.0, dy: 0.0, weight: 1.0 });
+    graph.nodes.push(Node {
+        id: "A".to_string(),
+        x: 0.0,
+        y: 0.0,
+        dx: 0.0,
+        dy: 0.0,
+        weight: 1.0,
+    });
+    graph.nodes.push(Node {
+        id: "B".to_string(),
+        x: 1.0,
+        y: 0.0,
+        dx: 0.0,
+        dy: 0.0,
+        weight: 1.0,
+    });
     let x0 = graph.nodes[0].x;
     graph.compute_layout_step();
     let x1 = graph.nodes[0].x;

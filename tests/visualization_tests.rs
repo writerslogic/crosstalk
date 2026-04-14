@@ -14,9 +14,27 @@ fn sigma(session_id: &str, iter: u32) -> ConversationState {
 
 fn simple_graph() -> ForceDirectedGraph {
     let mut g = ForceDirectedGraph::new();
-    g.nodes.push(Node { id: "a".to_string(), x: -5.0, y: 0.0, dx: 0.0, dy: 0.0, weight: 1.0 });
-    g.nodes.push(Node { id: "b".to_string(), x: 5.0, y: 0.0, dx: 0.0, dy: 0.0, weight: 1.0 });
-    g.edges.push(Edge { source: 0, target: 1, strength: 1.0 });
+    g.nodes.push(Node {
+        id: "a".to_string(),
+        x: -5.0,
+        y: 0.0,
+        dx: 0.0,
+        dy: 0.0,
+        weight: 1.0,
+    });
+    g.nodes.push(Node {
+        id: "b".to_string(),
+        x: 5.0,
+        y: 0.0,
+        dx: 0.0,
+        dy: 0.0,
+        weight: 1.0,
+    });
+    g.edges.push(Edge {
+        source: 0,
+        target: 1,
+        strength: 1.0,
+    });
     g
 }
 
@@ -111,7 +129,9 @@ fn replay_engine_advance_returns_false_at_end() {
 #[test]
 fn replay_engine_2x_speed_skips_frames() {
     let mut re = ReplayEngine::new(2.0);
-    for i in 0..6u32 { re.record_frame(&sigma("s", i)); }
+    for i in 0..6u32 {
+        re.record_frame(&sigma("s", i));
+    }
     re.advance(); // cursor: 0 → 2
     assert_eq!(re.current_frame().unwrap().iteration, 2);
 }
@@ -119,7 +139,9 @@ fn replay_engine_2x_speed_skips_frames() {
 #[test]
 fn replay_engine_4x_speed_skips_four_frames() {
     let mut re = ReplayEngine::new(4.0);
-    for i in 0..10u32 { re.record_frame(&sigma("s", i)); }
+    for i in 0..10u32 {
+        re.record_frame(&sigma("s", i));
+    }
     re.advance(); // cursor: 0 → 4
     assert_eq!(re.current_frame().unwrap().iteration, 4);
 }
@@ -196,8 +218,11 @@ fn svg_export_graph_is_well_formed_xml() {
     assert_eq!(open_svg, 1);
     assert_eq!(close_svg, 1);
     // No unclosed angle brackets.
-    assert_eq!(svg.matches('<').count(), svg.matches('>').count(),
-        "every '<' must have a matching '>'");
+    assert_eq!(
+        svg.matches('<').count(),
+        svg.matches('>').count(),
+        "every '<' must have a matching '>'"
+    );
 }
 
 #[test]
@@ -250,7 +275,11 @@ fn force_graph_ten_nodes_stabilises_distinct_positions() {
         });
     }
     for i in 0..9 {
-        g.edges.push(Edge { source: i, target: i + 1, strength: 1.0 });
+        g.edges.push(Edge {
+            source: i,
+            target: i + 1,
+            strength: 1.0,
+        });
     }
     for _ in 0..150 {
         g.compute_layout_step();

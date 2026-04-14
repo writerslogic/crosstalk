@@ -28,7 +28,10 @@ async fn test_continuous_auditor_spawns_and_receives() {
     state1.state_hash = HashChain::compute(&state1, &prev_hash).expect("Hash computation failed");
 
     let send_result = tx.send(state1.clone()).await;
-    assert!(send_result.is_ok(), "Should successfully send state to auditor");
+    assert!(
+        send_result.is_ok(),
+        "Should successfully send state to auditor"
+    );
 
     let mut state2 = ConversationState::new("audit-session");
     state2.iteration_index = 1;
@@ -47,10 +50,14 @@ async fn test_continuous_auditor_spawns_and_receives() {
 
         surprise_signal: None,
     });
-    state2.state_hash = HashChain::compute(&state2, &state1.state_hash).expect("Hash computation failed");
+    state2.state_hash =
+        HashChain::compute(&state2, &state1.state_hash).expect("Hash computation failed");
 
     let send_result = tx.send(state2.clone()).await;
-    assert!(send_result.is_ok(), "Should successfully send second state to auditor");
+    assert!(
+        send_result.is_ok(),
+        "Should successfully send second state to auditor"
+    );
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 

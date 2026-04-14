@@ -1,8 +1,8 @@
 use crate::types::compute::{BudgetMode, CostEntry};
 use crate::types::conversation::ConversationState;
-use sha2::{Digest, Sha256};
 use anyhow::Result;
 use rand::Rng;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,8 +37,7 @@ impl Drop for ResourceMonitorActor {
 impl ResourceMonitorActor {
     fn spawn(tx: broadcast::Sender<ResourceEvent>, interval_secs: u64) -> Self {
         let handle = tokio::spawn(async move {
-            let mut ticker =
-                tokio::time::interval(Duration::from_secs(interval_secs));
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
             let mut sys = System::new_all();
             loop {
                 ticker.tick().await;
@@ -46,13 +45,8 @@ impl ResourceMonitorActor {
                 let rss_mb = sys.used_memory() / 1024 / 1024;
                 let cpu_load = sys.global_cpu_usage();
                 let disks = sysinfo::Disks::new_with_refreshed_list();
-                let disk_free_gb = disks
-                    .iter()
-                    .map(|d| d.available_space())
-                    .sum::<u64>()
-                    / 1024
-                    / 1024
-                    / 1024;
+                let disk_free_gb =
+                    disks.iter().map(|d| d.available_space()).sum::<u64>() / 1024 / 1024 / 1024;
                 let alert = if cpu_load > 90.0 {
                     Some("CPU Critical".to_string())
                 } else if rss_mb > 16_000 {
@@ -60,7 +54,12 @@ impl ResourceMonitorActor {
                 } else {
                     None
                 };
-                let _ = tx.send(ResourceEvent { rss_mb, cpu_load, disk_free_gb, alert });
+                let _ = tx.send(ResourceEvent {
+                    rss_mb,
+                    cpu_load,
+                    disk_free_gb,
+                    alert,
+                });
             }
         });
         Self { handle }
@@ -116,7 +115,12 @@ impl ComputeManager {
             None
         };
 
-        let event = ResourceEvent { rss_mb, cpu_load, disk_free_gb, alert };
+        let event = ResourceEvent {
+            rss_mb,
+            cpu_load,
+            disk_free_gb,
+            alert,
+        };
         let _ = self.resource_tx.send(event.clone());
         event
     }
@@ -146,8 +150,7 @@ impl ParallelInference {
         F: FnMut(String, String) -> Fut,
         Fut: std::future::Future<Output = Result<String>> + Send + 'static,
     {
-        let mut set: tokio::task::JoinSet<(String, Result<String>)> =
-            tokio::task::JoinSet::new();
+        let mut set: tokio::task::JoinSet<(String, Result<String>)> = tokio::task::JoinSet::new();
 
         for model in models {
             let fut = f(prompt.clone(), model.clone());
@@ -176,8 +179,7 @@ impl ParallelInference {
         F: FnMut(String, String) -> Fut,
         Fut: std::future::Future<Output = Result<String>> + Send + 'static,
     {
-        let mut set: tokio::task::JoinSet<(String, Result<String>)> =
-            tokio::task::JoinSet::new();
+        let mut set: tokio::task::JoinSet<(String, Result<String>)> = tokio::task::JoinSet::new();
 
         for model in models {
             let fut = f(prompt.clone(), model.clone());
@@ -257,7 +259,11 @@ impl InferenceCache {
     #[must_use]
     pub fn hit_rate(&self) -> f64 {
         let total = self.hits + self.misses;
-        if total == 0 { 0.0 } else { self.hits as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
     }
 }
 
@@ -297,7 +303,9 @@ pub struct LatencyRouter {
 
 impl LatencyRouter {
     pub fn new() -> Self {
-        Self { thresholds_ms: HashMap::new() }
+        Self {
+            thresholds_ms: HashMap::new(),
+        }
     }
 
     pub fn record(&mut self, model_id: &str, latency_ms: u64) {

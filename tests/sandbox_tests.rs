@@ -314,7 +314,10 @@ fn diff_nodes_contains_added_line() {
     history.record_snapshot(2, s2);
 
     let diff = history.diff_nodes("fn:bar", 1, 2).unwrap();
-    assert!(diff.contains('+'), "diff must contain '+' for inserted lines");
+    assert!(
+        diff.contains('+'),
+        "diff must contain '+' for inserted lines"
+    );
 }
 
 #[test]
@@ -326,7 +329,10 @@ fn diff_nodes_identical_versions_has_no_changes() {
     history.record_snapshot(2, s1);
 
     let diff = history.diff_nodes("fn:same", 1, 2).unwrap();
-    assert!(!diff.contains('+') && !diff.contains('-'), "identical versions should produce no change markers");
+    assert!(
+        !diff.contains('+') && !diff.contains('-'),
+        "identical versions should produce no change markers"
+    );
 }
 
 // ── execute_with_rollback ─────────────────────────────────────────────────────
@@ -335,7 +341,12 @@ fn diff_nodes_identical_versions_has_no_changes() {
 async fn execute_with_rollback_returns_snapshot_on_invalid_wasm() {
     let manager = SandboxManager::new().unwrap();
     let snapshot = ConversationState::new("snap-session");
-    let config = SandboxConfig { memory_limit_bytes: 1024 * 1024, fuel_limit: 10_000_000, output_buffer_bytes: 1024 * 1024, entry_point: None };
+    let config = SandboxConfig {
+        memory_limit_bytes: 1024 * 1024,
+        fuel_limit: 10_000_000,
+        output_buffer_bytes: 1024 * 1024,
+        entry_point: None,
+    };
     let (result, rollback) = manager
         .execute_with_rollback(&[0xFF, 0xFF], &config, &snapshot)
         .await
@@ -354,12 +365,18 @@ async fn execute_with_rollback_rollback_is_none_on_success() {
         0x01, 0x00, 0x00, 0x00, // version
         0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type section: () -> ()
         0x03, 0x02, 0x01, 0x00, // function section
-        0x07, 0x0A, 0x01, 0x06, 0x5F, 0x73, 0x74, 0x61, 0x72, 0x74, 0x00, 0x00, // export "_start"
+        0x07, 0x0A, 0x01, 0x06, 0x5F, 0x73, 0x74, 0x61, 0x72, 0x74, 0x00,
+        0x00, // export "_start"
         0x0A, 0x04, 0x01, 0x02, 0x00, 0x0B, // code section: empty body
     ];
     let manager = SandboxManager::new().unwrap();
     let snapshot = ConversationState::new("success-session");
-    let config = SandboxConfig { memory_limit_bytes: 1024 * 1024, fuel_limit: 10_000_000, output_buffer_bytes: 1024 * 1024, entry_point: None };
+    let config = SandboxConfig {
+        memory_limit_bytes: 1024 * 1024,
+        fuel_limit: 10_000_000,
+        output_buffer_bytes: 1024 * 1024,
+        entry_point: None,
+    };
     let (_result, rollback) = manager
         .execute_with_rollback(&wasm_bytes, &config, &snapshot)
         .await

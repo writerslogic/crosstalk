@@ -46,7 +46,9 @@ impl InvariantChecker {
         // 1. Monotonic indices: Ensures time flows strictly forward
         for window in sigma.turns.windows(2) {
             if window[1].index <= window[0].index {
-                return Err(anyhow!("Invariant violation: Non-monotonic turn indices detected"));
+                return Err(anyhow!(
+                    "Invariant violation: Non-monotonic turn indices detected"
+                ));
             }
         }
 
@@ -72,25 +74,31 @@ impl InvariantChecker {
     /// This executes 'verus' on the specification files in the verus/ directory.
     /// Returns Ok(()) if verification passes, or an error with Verus output if it fails.
     pub async fn verify_all_with_verus() -> Result<()> {
-        let proof_files = ["verus/state.rs", "verus/hash_chain.rs", "verus/invariant_checker.rs"];
-        
+        let proof_files = [
+            "verus/state.rs",
+            "verus/hash_chain.rs",
+            "verus/invariant_checker.rs",
+        ];
+
         for file in proof_files {
             if !Path::new(file).exists() {
                 return Err(anyhow!("Verus proof file not found: {}", file));
             }
-            
+
             let output = tokio::process::Command::new("verus")
                 .arg(file)
                 .output()
                 .await
                 .context("Failed to execute verus binary. Ensure verus is in PATH.")?;
-            
+
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 return Err(anyhow!(
                     "Verus verification failed for {}:\nSTDOUT: {}\nSTDERR: {}",
-                    file, stdout, stderr
+                    file,
+                    stdout,
+                    stderr
                 ));
             }
         }
@@ -274,7 +282,8 @@ impl ProofExporter {
                  turns[i.val]'(by omega) < turns[i.val + 1]'(by omega)) :\n\
              ∀ i j : Fin turns.length,\n\
                  i.val < j.val → turns[i.val]'i.isLt < turns[j.val]'j.isLt := by\n\
-           sorry -- inductive proof given in verus/state.rs\n".to_string()
+           sorry -- inductive proof given in verus/state.rs\n"
+            .to_string()
     }
 
     fn lean_hash_chain_integrity() -> String {
@@ -286,13 +295,15 @@ impl ProofExporter {
              (injective : ∀ s1 s2 prev, s1 ≠ s2 → hashFn s1 prev ≠ hashFn s2 prev)\n\
              (s1 s2 : State) (prev : Array UInt8) (hne : s1 ≠ s2) :\n\
              hashFn s1 prev ≠ hashFn s2 prev :=\n\
-           injective s1 s2 prev hne\n".to_string()
+           injective s1 s2 prev hne\n"
+            .to_string()
     }
 
     fn lean_artifact_version_consistency() -> String {
         "/-- Artifact version consistency: an artifact's version number equals\n\
          the length of its history. Verus proof: verus/state.rs#artifact_version_consistency --/\n\
          theorem artifact_version_consistency (version historyLen : Nat)\n\
-             (h : version = historyLen) : version = historyLen := h\n".to_string()
+             (h : version = historyLen) : version = historyLen := h\n"
+            .to_string()
     }
 }

@@ -34,7 +34,13 @@ impl ProofManager {
         let safe_name: String = attachment
             .artifact_name
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let safe_name = if safe_name.starts_with(|c: char| c.is_ascii_digit()) {
             format!("_{safe_name}")

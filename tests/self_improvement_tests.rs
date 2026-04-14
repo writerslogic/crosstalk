@@ -1,12 +1,10 @@
 use crosstalk::engines::self_improvement::{
-    AbTestManager, CalibrationAdjuster, PostMortemGenerator,
-    PromptEvolutionaryOptimizer, RuntimeParameterAdjuster, SelfEvaluationTrendAnalyzer,
-    SelfImprovementEngine, SafetyInterlock, SelfCodeModifier, ProgressReporter,
+    AbTestManager, CalibrationAdjuster, PostMortemGenerator, ProgressReporter,
+    PromptEvolutionaryOptimizer, RuntimeParameterAdjuster, SafetyInterlock, SelfCodeModifier,
+    SelfEvaluationTrendAnalyzer, SelfImprovementEngine,
 };
 use crosstalk::types::conversation::{ConversationState, Turn, TurnOutcome};
-use crosstalk::types::self_improvement::{
-    CalibrationRecord, PromptTemplate, SessionEvaluation,
-};
+use crosstalk::types::self_improvement::{CalibrationRecord, PromptTemplate, SessionEvaluation};
 use std::collections::BTreeMap;
 
 fn make_sigma(session_id: &str) -> ConversationState {
@@ -175,7 +173,9 @@ fn parameter_adjuster_applies_significant_changes() {
 
 #[test]
 fn safety_interlock_protects_core_files() {
-    assert!(!SafetyInterlock::is_modification_allowed("src/core/orchestrator.rs"));
+    assert!(!SafetyInterlock::is_modification_allowed(
+        "src/core/orchestrator.rs"
+    ));
     assert!(SafetyInterlock::is_modification_allowed("src/ui/app.rs"));
 }
 
@@ -190,9 +190,33 @@ fn code_modifier_proposes_improvements() {
 fn progress_reporter_estimates_remaining_turns() {
     let mut sigma = make_sigma("s1");
     sigma.completion_probability = 0.4; // 40% after 2 turns
-    sigma.turns.push(Turn { index: 0, model_id: "m".to_string(), content: "c".to_string(), timestamp: 0, diffs: vec![], certainty: Some(0.5), outcome: TurnOutcome::Compiled, task_category: None, structure: None, signature: vec![], surprise_signal: None });
-    sigma.turns.push(Turn { index: 1, model_id: "m".to_string(), content: "c".to_string(), timestamp: 0, diffs: vec![], certainty: Some(0.5), outcome: TurnOutcome::Compiled, task_category: None, structure: None, signature: vec![], surprise_signal: None });
-    
+    sigma.turns.push(Turn {
+        index: 0,
+        model_id: "m".to_string(),
+        content: "c".to_string(),
+        timestamp: 0,
+        diffs: vec![],
+        certainty: Some(0.5),
+        outcome: TurnOutcome::Compiled,
+        task_category: None,
+        structure: None,
+        signature: vec![],
+        surprise_signal: None,
+    });
+    sigma.turns.push(Turn {
+        index: 1,
+        model_id: "m".to_string(),
+        content: "c".to_string(),
+        timestamp: 0,
+        diffs: vec![],
+        certainty: Some(0.5),
+        outcome: TurnOutcome::Compiled,
+        task_category: None,
+        structure: None,
+        signature: vec![],
+        surprise_signal: None,
+    });
+
     let report = ProgressReporter::report(&sigma, 10);
     assert!(report.estimated_turns_remaining.is_some());
     // Exponential decay: -ln(1-0.4)/2 = 0.255. -ln(0.001)/0.255 = 27. 27-2 = 25.

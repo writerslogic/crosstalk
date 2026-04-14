@@ -73,13 +73,14 @@ impl GodView {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("viz_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("viz.wgsl").into()),
-            });
-
-        let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[],
-            push_constant_ranges: &[],
         });
+
+        let render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout"),
+                bind_group_layouts: &[],
+                push_constant_ranges: &[],
+            });
 
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
@@ -122,14 +123,24 @@ impl GodView {
 
     pub async fn render_frame(&mut self, sigma: &ConversationState) -> Result<()> {
         self.frame_count += 1;
-        
-        let Some(ref device) = self.device else { return Ok(()) };
-        let Some(ref queue) = self.queue else { return Ok(()) };
-        let Some(ref surface) = self.surface else { return Ok(()) };
-        let Some(ref render_pipeline) = self.render_pipeline else { return Ok(()) };
+
+        let Some(ref device) = self.device else {
+            return Ok(());
+        };
+        let Some(ref queue) = self.queue else {
+            return Ok(());
+        };
+        let Some(ref surface) = self.surface else {
+            return Ok(());
+        };
+        let Some(ref render_pipeline) = self.render_pipeline else {
+            return Ok(());
+        };
 
         let output = surface.get_current_texture()?;
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Render Encoder"),
         });
@@ -137,16 +148,16 @@ impl GodView {
         // 1. Project Swarm State to 3D Vertices
         let mut vertices = vec![];
         let total_turns = sigma.turns.len() as f32;
-        
+
         for (i, turn) in sigma.turns.iter().enumerate() {
             let certainty = turn.certainty.unwrap_or(0.5);
             let surprise = turn.surprise_signal.unwrap_or(0.5);
-            
+
             // Map [Certainty, Surprise] -> [-1, 1] Normalized Device Coordinates
             let x = (certainty as f32 * 2.0) - 1.0;
             let y = (surprise as f32 * 2.0) - 1.0;
             let z = (i as f32 / total_turns.max(1.0) * 2.0) - 1.0;
-            
+
             // Color gradient from Sovereign Green to Electric Purple based on turn index
             let color = [
                 0.0 + (i as f32 / total_turns.max(1.0) * 0.5),
@@ -161,7 +172,10 @@ impl GodView {
         }
 
         if vertices.is_empty() {
-            vertices.push(Vertex { position: [0.0, 0.0, 0.0], color: [1.0, 1.0, 1.0] });
+            vertices.push(Vertex {
+                position: [0.0, 0.0, 0.0],
+                color: [1.0, 1.0, 1.0],
+            });
         }
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -177,7 +191,12 @@ impl GodView {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.01, g: 0.01, b: 0.02, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.01,
+                            g: 0.01,
+                            b: 0.02,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -312,7 +331,11 @@ impl ForceDirectedGraph {
             let src_idx = id_to_idx.get(&window[0].model_id);
             let tgt_idx = id_to_idx.get(&window[1].model_id);
             if let (Some(&src), Some(&tgt)) = (src_idx, tgt_idx) {
-                self.edges.push(Edge { source: src, target: tgt, strength: 1.0 });
+                self.edges.push(Edge {
+                    source: src,
+                    target: tgt,
+                    strength: 1.0,
+                });
             }
         }
     }
@@ -377,7 +400,11 @@ pub struct TimelineManager {
 
 impl TimelineManager {
     pub fn new() -> Self {
-        Self { checkpoints: VecDeque::new(), cursor: 0, index: HashMap::new() }
+        Self {
+            checkpoints: VecDeque::new(),
+            cursor: 0,
+            index: HashMap::new(),
+        }
     }
 
     pub fn push(&mut self, state: ConversationState) {
@@ -440,7 +467,11 @@ pub struct ReplayEngine {
 
 impl ReplayEngine {
     pub fn new(speed: f32) -> Self {
-        Self { frames: Vec::new(), playback_speed: speed, cursor: 0 }
+        Self {
+            frames: Vec::new(),
+            playback_speed: speed,
+            cursor: 0,
+        }
     }
 
     pub fn record_frame(&mut self, state: &ConversationState) {
@@ -518,12 +549,7 @@ impl SvgExporter {
     }
 
     #[must_use]
-    pub fn export_heatmap(
-        artifact_name: &str,
-        heatmap: &[f32],
-        width: u32,
-        height: u32,
-    ) -> String {
+    pub fn export_heatmap(artifact_name: &str, heatmap: &[f32], width: u32, height: u32) -> String {
         let max_val = heatmap.iter().cloned().fold(0.0_f32, f32::max).max(1.0);
         let cell_w = (width as f32 / heatmap.len().max(1) as f32).max(1.0);
 
@@ -559,4 +585,3 @@ impl ThemeEngine {
         }
     }
 }
-

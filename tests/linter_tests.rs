@@ -18,7 +18,11 @@ fn make_artifact(name: &str, language: &str, content: &str) -> Artifact {
 }
 
 fn ok_sandbox() -> SandboxResult {
-    SandboxResult { exit_code: 0, stdout: String::new(), stderr: String::new() }
+    SandboxResult {
+        exit_code: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+    }
 }
 
 fn failed_sandbox() -> SandboxResult {
@@ -41,14 +45,18 @@ async fn test_check_rejects_failed_sandbox() {
 #[tokio::test]
 async fn test_check_passes_when_no_cargo_toml() {
     // /tmp has no Cargo.toml, so clippy is skipped and we get a passing report
-    let report = LinterGuard::check(&ok_sandbox(), "/tmp", None).await.unwrap();
+    let report = LinterGuard::check(&ok_sandbox(), "/tmp", None)
+        .await
+        .unwrap();
     assert!(report.passed);
     assert!(report.errors.is_empty());
 }
 
 #[tokio::test]
 async fn test_check_returns_lint_report_type() {
-    let report = LinterGuard::check(&ok_sandbox(), "/tmp", None).await.unwrap();
+    let report = LinterGuard::check(&ok_sandbox(), "/tmp", None)
+        .await
+        .unwrap();
     let _: LintReport = report;
 }
 
@@ -86,7 +94,12 @@ async fn test_check_artifact_non_rust_detects_todo() {
     );
     let report = LinterGuard::check_artifact(&art).await.unwrap();
     assert!(!report.skipped);
-    assert!(report.diagnostics.iter().any(|d| d.severity == Severity::Info));
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Severity::Info)
+    );
 }
 
 #[tokio::test]
@@ -104,7 +117,11 @@ async fn test_check_artifact_detects_unreachable() {
 
 #[tokio::test]
 async fn test_check_artifact_returns_struct() {
-    let art = make_artifact("lib.rs", "rust", "pub fn add(a: i32, b: i32) -> i32 { a + b }\n");
+    let art = make_artifact(
+        "lib.rs",
+        "rust",
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    );
     let report = LinterGuard::check_artifact(&art).await.unwrap();
     let _: ArtifactLintReport = report;
 }

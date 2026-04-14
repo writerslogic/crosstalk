@@ -12,8 +12,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::{
-    env,
-    io,
+    env, io,
     sync::{Arc, Mutex},
 };
 use tokio::sync::mpsc;
@@ -35,7 +34,7 @@ struct ProviderDef {
 enum AuthStyle {
     Bearer,
     XApiKey,
-    QueryKey,  // appended as ?key=...
+    QueryKey, // appended as ?key=...
 }
 
 const PROVIDERS: &[ProviderDef] = &[
@@ -132,15 +131,25 @@ impl SelectState {
             }
         }
         // Move cursor to first model entry (skip headers)
-        let cursor = items.iter().position(|i| matches!(i, Item::Model { .. })).unwrap_or(0);
-        Self { items, cursor, scroll: 0, done: false, confirm: false }
+        let cursor = items
+            .iter()
+            .position(|i| matches!(i, Item::Model { .. }))
+            .unwrap_or(0);
+        Self {
+            items,
+            cursor,
+            scroll: 0,
+            done: false,
+            confirm: false,
+        }
     }
 
     fn add_models(&mut self, provider: &str, ids: Vec<String>) {
         // Find the header index for this provider
-        let header_pos = self.items.iter().position(|i| {
-            matches!(i, Item::Header { provider: p, .. } if p == provider)
-        });
+        let header_pos = self
+            .items
+            .iter()
+            .position(|i| matches!(i, Item::Header { provider: p, .. } if p == provider));
         let Some(pos) = header_pos else { return };
 
         // Mark header as no longer loading
@@ -156,7 +165,10 @@ impl SelectState {
         let insert_at = pos + 1;
         let new_items: Vec<Item> = ids
             .into_iter()
-            .map(|id| Item::Model { id, selected: false })
+            .map(|id| Item::Model {
+                id,
+                selected: false,
+            })
             .collect();
 
         // Insert new items; bump cursor if it's past the insert point
@@ -176,13 +188,21 @@ impl SelectState {
 
     fn advance_to_model(&mut self, direction: isize) {
         let len = self.items.len();
-        if len == 0 { return; }
+        if len == 0 {
+            return;
+        }
         let mut i = self.cursor as isize;
         loop {
             i += direction;
-            if i < 0 { i = len as isize - 1; }
-            if i >= len as isize { i = 0; }
-            if i == self.cursor as isize { break; }
+            if i < 0 {
+                i = len as isize - 1;
+            }
+            if i >= len as isize {
+                i = 0;
+            }
+            if i == self.cursor as isize {
+                break;
+            }
             if matches!(self.items[i as usize], Item::Model { .. }) {
                 self.cursor = i as usize;
                 break;
@@ -191,18 +211,26 @@ impl SelectState {
     }
 
     fn move_up(&mut self) {
-        if self.cursor == 0 { return; }
+        if self.cursor == 0 {
+            return;
+        }
         self.cursor -= 1;
-        if matches!(self.items.get(self.cursor), Some(Item::Header { .. }))
-            && self.cursor > 0 { self.cursor -= 1; }
+        if matches!(self.items.get(self.cursor), Some(Item::Header { .. })) && self.cursor > 0 {
+            self.cursor -= 1;
+        }
         self.clamp_scroll();
     }
 
     fn move_down(&mut self) {
-        if self.cursor + 1 >= self.items.len() { return; }
+        if self.cursor + 1 >= self.items.len() {
+            return;
+        }
         self.cursor += 1;
         if matches!(self.items.get(self.cursor), Some(Item::Header { .. }))
-            && self.cursor + 1 < self.items.len() { self.cursor += 1; }
+            && self.cursor + 1 < self.items.len()
+        {
+            self.cursor += 1;
+        }
         self.clamp_scroll();
     }
 
@@ -216,7 +244,10 @@ impl SelectState {
         self.items
             .iter()
             .filter_map(|i| {
-                if let Item::Model { id, selected: true, .. } = i {
+                if let Item::Model {
+                    id, selected: true, ..
+                } = i
+                {
                     Some(id.clone())
                 } else {
                     None
@@ -236,7 +267,9 @@ impl SelectState {
     }
 
     fn any_loading(&self) -> bool {
-        self.items.iter().any(|i| matches!(i, Item::Header { loading: true, .. }))
+        self.items
+            .iter()
+            .any(|i| matches!(i, Item::Header { loading: true, .. }))
     }
 }
 
@@ -259,8 +292,11 @@ fn draw_selector(frame: &mut Frame, state: &SelectState) {
         " [↑↓] Navigate  [Space] Toggle  [Enter] Start  [q] Quit"
     };
 
-    let header = Paragraph::new(status)
-        .block(Block::default().borders(Borders::ALL).title(" Crosstalk — Select Models "));
+    let header = Paragraph::new(status).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Crosstalk — Select Models "),
+    );
     frame.render_widget(header, layout[0]);
 
     let visible_items: Vec<ListItem> = state
@@ -278,8 +314,11 @@ fn draw_selector(frame: &mut Frame, state: &SelectState) {
                     } else {
                         format!(" {provider}")
                     };
-                    ListItem::new(label)
-                        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    ListItem::new(label).style(
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
                 }
                 Item::Model { id, selected, .. } => {
                     let check = if *selected { "[✓]" } else { "[ ]" };
@@ -301,8 +340,8 @@ fn draw_selector(frame: &mut Frame, state: &SelectState) {
     let visible_cursor = state.cursor.saturating_sub(state.scroll);
     list_state.select(Some(visible_cursor));
 
-    let list = List::new(visible_items)
-        .block(Block::default().borders(Borders::ALL).title(" Models "));
+    let list =
+        List::new(visible_items).block(Block::default().borders(Borders::ALL).title(" Models "));
     frame.render_stateful_widget(list, layout[1], &mut list_state);
 
     let selected = state.selected_ids();
@@ -394,7 +433,10 @@ pub async fn run_model_selector() -> Result<Vec<String>> {
     let result = loop {
         // Drain any completed provider fetches
         while let Ok((provider, ids)) = rx.try_recv() {
-            state.lock().unwrap_or_else(|p| p.into_inner()).add_models(&provider, ids);
+            state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .add_models(&provider, ids);
         }
 
         {
@@ -406,25 +448,26 @@ pub async fn run_model_selector() -> Result<Vec<String>> {
         }
 
         if event::poll(std::time::Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => s.move_up(),
-                    KeyCode::Down | KeyCode::Char('j') => s.move_down(),
-                    KeyCode::Char(' ') => s.toggle(),
-                    KeyCode::Enter => {
-                        s.confirm = true;
-                        s.done = true;
-                    }
-                    KeyCode::Char('q') | KeyCode::Esc => {
-                        s.done = true;
-                    }
-                    _ => {}
-                }
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
             }
+            let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => s.move_up(),
+                KeyCode::Down | KeyCode::Char('j') => s.move_down(),
+                KeyCode::Char(' ') => s.toggle(),
+                KeyCode::Enter => {
+                    s.confirm = true;
+                    s.done = true;
+                }
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    s.done = true;
+                }
+                _ => {}
+            }
+        }
     };
 
     disable_raw_mode()?;

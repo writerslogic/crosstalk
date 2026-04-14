@@ -1,7 +1,7 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use crosstalk::core::state::StateManager;
 use crosstalk::engines::consensus::{CertaintyAnalyzer, NashSolver, ResolutionStrategy};
 use crosstalk::engines::diff::DiffEngine;
-use crosstalk::core::state::StateManager;
 use crosstalk::types::conversation::ConversationState;
 use tempfile::TempDir;
 
@@ -15,9 +15,13 @@ fn bench_diff(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("diff/generate_delta");
     for (label, (old, new)) in [("small_10l", &small), ("large_500l", &large)] {
-        group.bench_with_input(BenchmarkId::new("lines", label), &(old, new), |b, (o, n)| {
-            b.iter(|| DiffEngine::generate_delta(black_box(o), black_box(n), 0));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("lines", label),
+            &(old, new),
+            |b, (o, n)| {
+                b.iter(|| DiffEngine::generate_delta(black_box(o), black_box(n), 0));
+            },
+        );
     }
     group.finish();
 }
@@ -27,8 +31,7 @@ fn bench_diff(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_consensus(c: &mut Criterion) {
-    let proposals_2: Vec<(&str, f64, &str)> =
-        vec![("a", 0.6, "use async"), ("b", 0.4, "use sync")];
+    let proposals_2: Vec<(&str, f64, &str)> = vec![("a", 0.6, "use async"), ("b", 0.4, "use sync")];
     let proposals_8: Vec<(&str, f64, &str)> = (0..8)
         .map(|i| {
             let weight = 1.0 / 8.0;
@@ -106,5 +109,11 @@ fn bench_state(c: &mut Criterion) {
     drop(dir);
 }
 
-criterion_group!(benches, bench_diff, bench_consensus, bench_certainty, bench_state);
+criterion_group!(
+    benches,
+    bench_diff,
+    bench_consensus,
+    bench_certainty,
+    bench_state
+);
 criterion_main!(benches);

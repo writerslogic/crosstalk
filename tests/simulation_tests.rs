@@ -1,28 +1,46 @@
 use crosstalk::engines::simulation::{
-    Artifact, ArtifactDiff, MonteCarloRunner, DIVERGENCE_THRESHOLD,
+    Artifact, ArtifactDiff, DIVERGENCE_THRESHOLD, MonteCarloRunner,
 };
 
 // Helpers for common artifact profiles.
 
 fn known_good() -> (Artifact, ArtifactDiff) {
     (
-        Artifact { base_reliability: 0.99, complexity_score: 1.0 },
-        ArtifactDiff { mutation_volatility: 0.0, structural_impact: 0 },
+        Artifact {
+            base_reliability: 0.99,
+            complexity_score: 1.0,
+        },
+        ArtifactDiff {
+            mutation_volatility: 0.0,
+            structural_impact: 0,
+        },
     )
 }
 
 fn known_bad() -> (Artifact, ArtifactDiff) {
     (
-        Artifact { base_reliability: 0.01, complexity_score: 1.0 },
-        ArtifactDiff { mutation_volatility: 0.99, structural_impact: 100 },
+        Artifact {
+            base_reliability: 0.01,
+            complexity_score: 1.0,
+        },
+        ArtifactDiff {
+            mutation_volatility: 0.99,
+            structural_impact: 100,
+        },
     )
 }
 
 // base_rel=0.60, vol=0.20, impact=1 gives p_fail ~0.49 (derived analytically).
 fn flaky_50_50() -> (Artifact, ArtifactDiff) {
     (
-        Artifact { base_reliability: 0.60, complexity_score: 1.0 },
-        ArtifactDiff { mutation_volatility: 0.20, structural_impact: 1 },
+        Artifact {
+            base_reliability: 0.60,
+            complexity_score: 1.0,
+        },
+        ArtifactDiff {
+            mutation_volatility: 0.20,
+            structural_impact: 1,
+        },
     )
 }
 

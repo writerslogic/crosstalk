@@ -1,6 +1,6 @@
 use crosstalk::engines::intelligence::{IntelligenceEngine, QualityScorer};
 use crosstalk::engines::reasoning::{
-    ReasoningScorer, ReportGenerator, StructureSelector, ExtractedSignals,
+    ExtractedSignals, ReasoningScorer, ReportGenerator, StructureSelector,
 };
 use crosstalk::types::conversation::{TaskCategory, Turn, TurnOutcome, TurnStructure};
 use crosstalk::types::intelligence::{ModelProfile, RunningAverage};
@@ -8,7 +8,14 @@ use std::collections::BTreeMap;
 
 fn make_profile(model_id: &str, category: TaskCategory, mean: f64) -> ModelProfile {
     let mut task_scores = BTreeMap::new();
-    task_scores.insert(category, RunningAverage { mean, count: 1, variance: 0.0 });
+    task_scores.insert(
+        category,
+        RunningAverage {
+            mean,
+            count: 1,
+            variance: 0.0,
+        },
+    );
     ModelProfile {
         model_id: model_id.to_string(),
         task_scores,
@@ -27,7 +34,10 @@ async fn test_intelligence_routing_logic() {
     engine.profiles.insert("gpt-4".to_string(), p1);
     engine.profiles.insert("gpt-3.5".to_string(), p2);
 
-    let best = engine.route_task(TaskCategory::CodeGeneration, &["gpt-4".to_string(), "gpt-3.5".to_string()]);
+    let best = engine.route_task(
+        TaskCategory::CodeGeneration,
+        &["gpt-4".to_string(), "gpt-3.5".to_string()],
+    );
     assert_eq!(best, "gpt-4");
 }
 

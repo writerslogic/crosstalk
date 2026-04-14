@@ -35,7 +35,11 @@ impl SelfImprovementEngine {
         let total = sigma.turns.len() as f64;
         metrics.insert(
             "failure_rate".to_string(),
-            if total > 0.0 { failure_count / total } else { 0.0 },
+            if total > 0.0 {
+                failure_count / total
+            } else {
+                0.0
+            },
         );
         metrics.insert(
             "cost_efficiency".to_string(),
@@ -129,7 +133,12 @@ impl SelfEvaluationTrendAnalyzer {
         degrading.sort();
         stable.sort();
 
-        PerformanceTrendReport { ema, improving, degrading, stable }
+        PerformanceTrendReport {
+            ema,
+            improving,
+            degrading,
+            stable,
+        }
     }
 }
 
@@ -189,7 +198,9 @@ pub struct AbTestManager {
 impl AbTestManager {
     #[must_use]
     pub fn new() -> Self {
-        Self { active_tests: BTreeMap::new() }
+        Self {
+            active_tests: BTreeMap::new(),
+        }
     }
 
     pub fn register(&mut self, hypothesis: ImprovementHypothesis) {
@@ -214,7 +225,13 @@ impl AbTestManager {
         }
         let t_stat = (mean_t - mean_c) / se;
         let min_n = n_c.min(n_t);
-        let t_critical = if min_n < 15.0 { 2.145 } else if min_n < 25.0 { 2.064 } else { 2.00 };
+        let t_critical = if min_n < 15.0 {
+            2.145
+        } else if min_n < 25.0 {
+            2.064
+        } else {
+            2.00
+        };
         let effect = (mean_t - mean_c) / mean_c.abs().max(1e-6);
         t_stat > t_critical && effect > 0.05
     }
@@ -224,8 +241,16 @@ impl AbTestManager {
         let significant = Self::check_significance(control, test);
         let n_c = control.len() as f64;
         let n_t = test.len() as f64;
-        let mean_c = if n_c > 0.0 { control.iter().sum::<f64>() / n_c } else { 0.0 };
-        let mean_t = if n_t > 0.0 { test.iter().sum::<f64>() / n_t } else { 0.0 };
+        let mean_c = if n_c > 0.0 {
+            control.iter().sum::<f64>() / n_c
+        } else {
+            0.0
+        };
+        let mean_t = if n_t > 0.0 {
+            test.iter().sum::<f64>() / n_t
+        } else {
+            0.0
+        };
         let effect_size = (mean_t - mean_c) / mean_c.abs().max(1e-6);
 
         let se_t = if n_t > 1.0 {
@@ -259,7 +284,9 @@ pub struct PromptLibrary {
 impl PromptLibrary {
     #[must_use]
     pub fn new() -> Self {
-        Self { templates: BTreeMap::new() }
+        Self {
+            templates: BTreeMap::new(),
+        }
     }
 
     pub fn insert(&mut self, template: PromptTemplate) {
@@ -273,7 +300,8 @@ impl PromptLibrary {
 
     pub fn record_performance(&mut self, id: &str, session_id: &str, quality: f64) {
         if let Some(t) = self.templates.get_mut(id) {
-            t.performance_history.push((session_id.to_string(), quality));
+            t.performance_history
+                .push((session_id.to_string(), quality));
         }
     }
 
@@ -352,7 +380,9 @@ impl PostMortemGenerator {
             .map(|t| t.content.as_str())
             .unwrap_or("");
 
-        let root_cause = if first_failure.contains("mismatched types") || first_failure.contains("E0308") {
+        let root_cause = if first_failure.contains("mismatched types")
+            || first_failure.contains("E0308")
+        {
             FailureCause::TypeMismatch
         } else if first_failure.contains("budget") || first_failure.contains("cost limit") {
             FailureCause::InsufficientBudget
@@ -420,7 +450,9 @@ pub struct ErrorBudgetLedger {
 impl ErrorBudgetLedger {
     #[must_use]
     pub fn new() -> Self {
-        Self { budgets: BTreeMap::new() }
+        Self {
+            budgets: BTreeMap::new(),
+        }
     }
 
     pub fn set_budget(&mut self, task_type: &str, allowed_rate: f64) {
@@ -449,8 +481,7 @@ impl ErrorBudgetLedger {
         let obs = if failed { 1.0 } else { 0.0 };
         budget.actual_rate = alpha * obs + (1.0 - alpha) * budget.actual_rate;
         budget.budget_remaining =
-            ((budget.allowed_rate - budget.actual_rate) / budget.allowed_rate)
-                .clamp(0.0, 1.0);
+            ((budget.allowed_rate - budget.actual_rate) / budget.allowed_rate).clamp(0.0, 1.0);
         budget.enforcement_level = if budget.budget_remaining < f64::EPSILON {
             EnforcementLevel::Suspended
         } else if budget.budget_remaining < 0.2 {
@@ -483,33 +514,137 @@ impl BenchmarkSuite {
     pub fn with_standard_tasks() -> Self {
         let mut suite = Self::new();
         let specs: &[(&str, BenchmarkCategory, &str, f64)] = &[
-            ("bm-cg-01", BenchmarkCategory::CodeGeneration, "Implement a binary search function.", 0.2),
-            ("bm-cg-02", BenchmarkCategory::CodeGeneration, "Write a linked-list in safe Rust.", 0.5),
-            ("bm-cg-03", BenchmarkCategory::CodeGeneration, "Implement a thread-safe ring buffer.", 0.7),
-            ("bm-cg-04", BenchmarkCategory::CodeGeneration, "Build an async HTTP client wrapper.", 0.6),
-            ("bm-bf-01", BenchmarkCategory::BugFixing, "Fix off-by-one in slice indexing.", 0.3),
-            ("bm-bf-02", BenchmarkCategory::BugFixing, "Resolve borrow-checker lifetime conflict.", 0.6),
-            ("bm-bf-03", BenchmarkCategory::BugFixing, "Fix race condition in shared state.", 0.8),
-            ("bm-bf-04", BenchmarkCategory::BugFixing, "Debug integer overflow in release mode.", 0.5),
-            ("bm-rf-01", BenchmarkCategory::Refactoring, "Extract duplicated logic into a trait.", 0.4),
-            ("bm-rf-02", BenchmarkCategory::Refactoring, "Replace nested match with combinator chain.", 0.3),
-            ("bm-rf-03", BenchmarkCategory::Refactoring, "Decompose god struct into smaller types.", 0.6),
-            ("bm-rf-04", BenchmarkCategory::Refactoring, "Migrate sync I/O to async.", 0.7),
-            ("bm-ad-01", BenchmarkCategory::ArchitectureDesign, "Design plugin system with trait objects.", 0.8),
-            ("bm-ad-02", BenchmarkCategory::ArchitectureDesign, "Model state machine for connection lifecycle.", 0.6),
-            ("bm-ad-03", BenchmarkCategory::ArchitectureDesign, "Design zero-copy message passing.", 0.9),
-            ("bm-ad-04", BenchmarkCategory::ArchitectureDesign, "Define layered error type hierarchy.", 0.5),
-            ("bm-rs-01", BenchmarkCategory::ResearchSynthesis, "Summarise trade-offs of lock-free queues.", 0.5),
-            ("bm-rs-02", BenchmarkCategory::ResearchSynthesis, "Compare consensus algorithms for embedded.", 0.7),
-            ("bm-rs-03", BenchmarkCategory::ResearchSynthesis, "Survey WASM runtimes for safety-critical use.", 0.6),
-            ("bm-rs-04", BenchmarkCategory::ResearchSynthesis, "Evaluate formal verification tools for Rust.", 0.8),
+            (
+                "bm-cg-01",
+                BenchmarkCategory::CodeGeneration,
+                "Implement a binary search function.",
+                0.2,
+            ),
+            (
+                "bm-cg-02",
+                BenchmarkCategory::CodeGeneration,
+                "Write a linked-list in safe Rust.",
+                0.5,
+            ),
+            (
+                "bm-cg-03",
+                BenchmarkCategory::CodeGeneration,
+                "Implement a thread-safe ring buffer.",
+                0.7,
+            ),
+            (
+                "bm-cg-04",
+                BenchmarkCategory::CodeGeneration,
+                "Build an async HTTP client wrapper.",
+                0.6,
+            ),
+            (
+                "bm-bf-01",
+                BenchmarkCategory::BugFixing,
+                "Fix off-by-one in slice indexing.",
+                0.3,
+            ),
+            (
+                "bm-bf-02",
+                BenchmarkCategory::BugFixing,
+                "Resolve borrow-checker lifetime conflict.",
+                0.6,
+            ),
+            (
+                "bm-bf-03",
+                BenchmarkCategory::BugFixing,
+                "Fix race condition in shared state.",
+                0.8,
+            ),
+            (
+                "bm-bf-04",
+                BenchmarkCategory::BugFixing,
+                "Debug integer overflow in release mode.",
+                0.5,
+            ),
+            (
+                "bm-rf-01",
+                BenchmarkCategory::Refactoring,
+                "Extract duplicated logic into a trait.",
+                0.4,
+            ),
+            (
+                "bm-rf-02",
+                BenchmarkCategory::Refactoring,
+                "Replace nested match with combinator chain.",
+                0.3,
+            ),
+            (
+                "bm-rf-03",
+                BenchmarkCategory::Refactoring,
+                "Decompose god struct into smaller types.",
+                0.6,
+            ),
+            (
+                "bm-rf-04",
+                BenchmarkCategory::Refactoring,
+                "Migrate sync I/O to async.",
+                0.7,
+            ),
+            (
+                "bm-ad-01",
+                BenchmarkCategory::ArchitectureDesign,
+                "Design plugin system with trait objects.",
+                0.8,
+            ),
+            (
+                "bm-ad-02",
+                BenchmarkCategory::ArchitectureDesign,
+                "Model state machine for connection lifecycle.",
+                0.6,
+            ),
+            (
+                "bm-ad-03",
+                BenchmarkCategory::ArchitectureDesign,
+                "Design zero-copy message passing.",
+                0.9,
+            ),
+            (
+                "bm-ad-04",
+                BenchmarkCategory::ArchitectureDesign,
+                "Define layered error type hierarchy.",
+                0.5,
+            ),
+            (
+                "bm-rs-01",
+                BenchmarkCategory::ResearchSynthesis,
+                "Summarise trade-offs of lock-free queues.",
+                0.5,
+            ),
+            (
+                "bm-rs-02",
+                BenchmarkCategory::ResearchSynthesis,
+                "Compare consensus algorithms for embedded.",
+                0.7,
+            ),
+            (
+                "bm-rs-03",
+                BenchmarkCategory::ResearchSynthesis,
+                "Survey WASM runtimes for safety-critical use.",
+                0.6,
+            ),
+            (
+                "bm-rs-04",
+                BenchmarkCategory::ResearchSynthesis,
+                "Evaluate formal verification tools for Rust.",
+                0.8,
+            ),
         ];
         for (id, cat, spec, diff) in specs {
             suite.tasks.push(BenchmarkTask {
                 id: id.to_string(),
                 category: *cat,
                 input_spec: spec.to_string(),
-                quality_rubric: vec!["Correct".to_string(), "Idiomatic".to_string(), "Tested".to_string()],
+                quality_rubric: vec![
+                    "Correct".to_string(),
+                    "Idiomatic".to_string(),
+                    "Tested".to_string(),
+                ],
                 reference_solution: String::new(),
                 difficulty: *diff,
             });
@@ -604,11 +739,8 @@ impl<'a> ContinuousLearner<'a> {
             .record_outcome("general", failure_rate > 0.1);
 
         if let Some(tid) = template_id {
-            self.prompt_library.record_performance(
-                tid,
-                &sigma.session_id,
-                actual_outcome,
-            );
+            self.prompt_library
+                .record_performance(tid, &sigma.session_id, actual_outcome);
         }
     }
 }
@@ -640,13 +772,15 @@ impl SafetyInterlock {
 pub struct SelfCodeModifier;
 
 impl SelfCodeModifier {
-    const PATTERNS: &'static [(&'static str, &'static str)] = &[
-        (".unwrap_or_else(|_| panic!())", ".unwrap()"),
-    ];
+    const PATTERNS: &'static [(&'static str, &'static str)] =
+        &[(".unwrap_or_else(|_| panic!())", ".unwrap()")];
 
     pub fn propose_improvement(file_path: &str, current_content: &str) -> Result<String> {
         if !SafetyInterlock::is_modification_allowed(file_path) {
-            return Err(anyhow!("Modification rejected: {} is a protected file", file_path));
+            return Err(anyhow!(
+                "Modification rejected: {} is a protected file",
+                file_path
+            ));
         }
         let mut result = current_content.to_string();
         let mut changed = false;
@@ -659,7 +793,10 @@ impl SelfCodeModifier {
         if changed {
             Ok(result)
         } else {
-            Err(anyhow!("No sub-optimal code patterns identified in {}", file_path))
+            Err(anyhow!(
+                "No sub-optimal code patterns identified in {}",
+                file_path
+            ))
         }
     }
 
@@ -708,7 +845,11 @@ impl PromptEvolutionaryOptimizer {
                 m.content = format!("You are an expert Rust engineer.\n\n{}", m.content);
             }
             PromptMutation::TrimVerbose => {
-                m.content = m.content.chars().take(m.content.len().saturating_sub(m.content.len() / 4)).collect();
+                m.content = m
+                    .content
+                    .chars()
+                    .take(m.content.len().saturating_sub(m.content.len() / 4))
+                    .collect();
             }
             PromptMutation::InjectExamples => {
                 if !m.content.contains("{{examples}}") {
@@ -721,12 +862,17 @@ impl PromptEvolutionaryOptimizer {
 
     #[must_use]
     pub fn generate_variants(parent: &PromptTemplate) -> Vec<PromptTemplate> {
-        Self::MUTATIONS.iter().map(|&m| Self::mutate(parent, m)).collect()
+        Self::MUTATIONS
+            .iter()
+            .map(|&m| Self::mutate(parent, m))
+            .collect()
     }
 
     #[must_use]
     pub fn select_winner(candidates: &[PromptTemplate]) -> Option<&PromptTemplate> {
-        candidates.iter().max_by(|a, b| a.mean_quality().total_cmp(&b.mean_quality()))
+        candidates
+            .iter()
+            .max_by(|a, b| a.mean_quality().total_cmp(&b.mean_quality()))
     }
 }
 
@@ -743,8 +889,14 @@ impl CalibrationAdjuster {
         }
         let sum_x: f64 = records.iter().map(|r| r.predicted_outcome).sum();
         let sum_y: f64 = records.iter().map(|r| r.actual_outcome).sum();
-        let sum_xx: f64 = records.iter().map(|r| r.predicted_outcome * r.predicted_outcome).sum();
-        let sum_xy: f64 = records.iter().map(|r| r.predicted_outcome * r.actual_outcome).sum();
+        let sum_xx: f64 = records
+            .iter()
+            .map(|r| r.predicted_outcome * r.predicted_outcome)
+            .sum();
+        let sum_xy: f64 = records
+            .iter()
+            .map(|r| r.predicted_outcome * r.actual_outcome)
+            .sum();
         let denom = n * sum_xx - sum_x * sum_x;
         if denom.abs() < f64::EPSILON {
             return (1.0, 0.0);
@@ -794,7 +946,10 @@ impl BenchmarkRegressionGuard {
         if regressions.is_empty() {
             Ok(())
         } else {
-            Err(anyhow!("Benchmark regression detected: {}", regressions.join("; ")))
+            Err(anyhow!(
+                "Benchmark regression detected: {}",
+                regressions.join("; ")
+            ))
         }
     }
 
@@ -868,7 +1023,10 @@ impl RuntimeParameterAdjuster {
         params.insert("convergence_threshold".to_string(), 0.98);
         params.insert("regression_alert_ratio".to_string(), 0.9);
         params.insert("tautology_similarity_threshold".to_string(), 0.95);
-        Self { parameters: params, history: vec![] }
+        Self {
+            parameters: params,
+            history: vec![],
+        }
     }
 
     pub fn apply_if_significant(
@@ -1065,14 +1223,19 @@ impl EscalationContextBuilder {
 // ── FileWriter ────────────────────────────────────────────────────────────────
 
 const BLOCKED_FILENAMES: &[&str] = &[
-    ".env", ".env.local", ".env.production", "Cargo.lock",
-    ".gitignore", ".git-credentials", "id_rsa", "id_ed25519",
-    "build.rs", "Cargo.toml",
+    ".env",
+    ".env.local",
+    ".env.production",
+    "Cargo.lock",
+    ".gitignore",
+    ".git-credentials",
+    "id_rsa",
+    "id_ed25519",
+    "build.rs",
+    "Cargo.toml",
 ];
 const BLOCKED_DIRS: &[&str] = &[".git", ".github", ".gitlab", "target", ".cargo", ".ssh"];
-const ALLOWED_EXTENSIONS: &[&str] = &[
-    "rs", "toml", "md", "json", "yaml", "yml", "txt",
-];
+const ALLOWED_EXTENSIONS: &[&str] = &["rs", "toml", "md", "json", "yaml", "yml", "txt"];
 
 pub enum WriteOutcome {
     /// File was written (and passed `cargo check`).
@@ -1102,8 +1265,7 @@ impl FileWriter {
     }
 
     fn find_project_root() -> Result<std::path::PathBuf> {
-        let mut dir = std::env::current_dir()
-            .context("cannot determine current directory")?;
+        let mut dir = std::env::current_dir().context("cannot determine current directory")?;
         loop {
             if dir.join("Cargo.toml").exists() {
                 return Ok(dir);
@@ -1138,10 +1300,12 @@ impl FileWriter {
 
         if let Some(fname) = rel.file_name().and_then(|n| n.to_str())
             && (BLOCKED_FILENAMES.contains(&fname)
-                || BLOCKED_FILENAMES.iter().any(|&blocked| fname.starts_with(blocked)))
-            {
-                return Ok(WriteOutcome::Skipped("blocked filename"));
-            }
+                || BLOCKED_FILENAMES
+                    .iter()
+                    .any(|&blocked| fname.starts_with(blocked)))
+        {
+            return Ok(WriteOutcome::Skipped("blocked filename"));
+        }
 
         for component in rel.components() {
             if let std::path::Component::Normal(c) = component

@@ -1,6 +1,6 @@
 use crate::types::conversation::{ConversationState, Turn};
 use crate::types::planning::{GoalNode, GoalStatus, GoalTree, Milestone, SessionManifest};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use petgraph::algo::toposort;
 use petgraph::graph::DiGraph;
 use sha2::{Digest, Sha256};
@@ -106,7 +106,7 @@ impl ContextPruner {
         goals.sort_unstable_by(|a, b| b.criticality.cmp(&a.criticality));
 
         // 3. Extract the critical turn indices (Maximum of 5)
-        // Because n=5, a simple Vec `.contains()` fits entirely in the L1 CPU Cache 
+        // Because n=5, a simple Vec `.contains()` fits entirely in the L1 CPU Cache
         // and is mathematically faster than hashing elements into a HashSet.
         let critical_turn_indices: Vec<u32> = goals
             .into_iter()
@@ -224,8 +224,12 @@ impl GoalScheduler {
             }
         }
 
-        let sorted = toposort(&graph, None)
-            .map_err(|e| anyhow!("Goal dependency cycle detected involving node: {}", graph[e.node_id()]))?;
+        let sorted = toposort(&graph, None).map_err(|e| {
+            anyhow!(
+                "Goal dependency cycle detected involving node: {}",
+                graph[e.node_id()]
+            )
+        })?;
 
         // Group into parallel batches using longest-path levels
         let mut level: HashMap<petgraph::graph::NodeIndex, usize> = HashMap::new();
@@ -490,4 +494,3 @@ impl BranchRegistry {
         }
     }
 }
-

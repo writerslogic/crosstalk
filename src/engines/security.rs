@@ -4,10 +4,10 @@ use rand::Rng;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use zeroize::Zeroizing;
-use std::sync::{Arc, OnceLock};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
 static AWS_REGEX: OnceLock<Regex> = OnceLock::new();
 static GH_REGEX: OnceLock<Regex> = OnceLock::new();
@@ -85,9 +85,8 @@ impl ShellSanity {
         "tree-sitter",
     ];
 
-    const DANGEROUS_BINS: &'static [&'static str] = &[
-        "rm", "curl", "wget", "nc", "netcat", "dd", "mkfs"
-    ];
+    const DANGEROUS_BINS: &'static [&'static str] =
+        &["rm", "curl", "wget", "nc", "netcat", "dd", "mkfs"];
 
     #[must_use]
     pub fn is_dangerous(cmd: &str) -> bool {
@@ -213,7 +212,9 @@ impl TurnSigner {
     pub fn verify_turn(&self, turn: &Turn) -> bool {
         let mut clean = turn.clone();
         clean.signature = vec![];
-        let Ok(data) = serde_json::to_vec(&clean) else { return false };
+        let Ok(data) = serde_json::to_vec(&clean) else {
+            return false;
+        };
         self.verify(&data, &turn.signature)
     }
 
@@ -264,8 +265,12 @@ impl SecretScanner {
 }
 
 const PROXY_VARS: &[&str] = &[
-    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-    "http_proxy", "https_proxy", "all_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
 ];
 
 pub struct ExfilBlock;
@@ -309,8 +314,16 @@ impl ZeroTrustPolicy {
             ("curl".to_string(), None, RiskLevel::Critical),
             ("wget".to_string(), None, RiskLevel::Critical),
             ("git".to_string(), Some("push".to_string()), RiskLevel::High),
-            ("git".to_string(), Some("force".to_string()), RiskLevel::Critical),
-            ("cargo".to_string(), Some("clean".to_string()), RiskLevel::Medium),
+            (
+                "git".to_string(),
+                Some("force".to_string()),
+                RiskLevel::Critical,
+            ),
+            (
+                "cargo".to_string(),
+                Some("clean".to_string()),
+                RiskLevel::Medium,
+            ),
             ("cargo".to_string(), None, RiskLevel::Low),
             ("rustc".to_string(), None, RiskLevel::Low),
             ("git".to_string(), None, RiskLevel::Low),
@@ -359,7 +372,10 @@ impl ZeroTrustPolicy {
 
     #[must_use]
     pub fn requires_confirmation(&self, level: &RiskLevel) -> bool {
-        matches!(level, RiskLevel::Medium | RiskLevel::High | RiskLevel::Critical)
+        matches!(
+            level,
+            RiskLevel::Medium | RiskLevel::High | RiskLevel::Critical
+        )
     }
 }
 
@@ -389,12 +405,18 @@ impl FuzzRunner {
         let crashes: Vec<String> = stdout
             .lines()
             .filter(|l| {
-                l.contains("ERROR:") || l.contains("CRASH") ||
-                l.contains("assertion failed") || l.contains("panicked at")
+                l.contains("ERROR:")
+                    || l.contains("CRASH")
+                    || l.contains("assertion failed")
+                    || l.contains("panicked at")
             })
             .map(|l| l.trim().to_string())
             .collect();
-        FuzzResult { target: target.to_string(), iterations, crashes }
+        FuzzResult {
+            target: target.to_string(),
+            iterations,
+            crashes,
+        }
     }
 
     pub async fn run(target: &str, max_iterations: u64) -> anyhow::Result<FuzzResult> {
@@ -402,7 +424,13 @@ impl FuzzRunner {
         let target_for_cmd = target.clone();
         let out = tokio::task::spawn_blocking(move || {
             std::process::Command::new("cargo")
-                .args(["fuzz", "run", &target_for_cmd, "--", &format!("-runs={max_iterations}")])
+                .args([
+                    "fuzz",
+                    "run",
+                    &target_for_cmd,
+                    "--",
+                    &format!("-runs={max_iterations}"),
+                ])
                 .output()
         })
         .await??;
@@ -431,9 +459,11 @@ impl AuditRunner {
             .filter(|l| l.contains("RUSTSEC-") || l.contains("Vulnerable crate"))
             .map(|l| l.trim().to_string())
             .collect();
-        let clean = vulnerabilities.is_empty()
-            || stdout.contains("No vulnerabilities found");
-        AuditResult { vulnerabilities, clean }
+        let clean = vulnerabilities.is_empty() || stdout.contains("No vulnerabilities found");
+        AuditResult {
+            vulnerabilities,
+            clean,
+        }
     }
 
     pub async fn run() -> anyhow::Result<AuditResult> {
@@ -463,7 +493,10 @@ pub struct DriftMonitor {
 
 impl DriftMonitor {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), snapshots: HashMap::new() }
+        Self {
+            root: root.into(),
+            snapshots: HashMap::new(),
+        }
     }
 
     pub fn snapshot_all(&mut self) -> anyhow::Result<()> {
@@ -479,8 +512,9 @@ impl DriftMonitor {
                 let entry = entry?;
                 let path = entry.path();
                 if path.is_dir() {
-                    if path.file_name().and_then(|s| s.to_str()) == Some(".git") || 
-                       path.file_name().and_then(|s| s.to_str()) == Some("target") {
+                    if path.file_name().and_then(|s| s.to_str()) == Some(".git")
+                        || path.file_name().and_then(|s| s.to_str()) == Some("target")
+                    {
                         continue;
                     }
                     self.scan_dir(&path, acc)?;
@@ -491,7 +525,15 @@ impl DriftMonitor {
                     // Basic hash for drift detection
                     let content = std::fs::read(&path).unwrap_or_default();
                     let hash = format!("{:x}", sha2::Sha256::digest(&content));
-                    acc.insert(path.clone(), FileSnapshot { path, mtime, size, hash });
+                    acc.insert(
+                        path.clone(),
+                        FileSnapshot {
+                            path,
+                            mtime,
+                            size,
+                            hash,
+                        },
+                    );
                 }
             }
         }
@@ -577,4 +619,3 @@ impl AuditLogger {
         Ok(entries)
     }
 }
-

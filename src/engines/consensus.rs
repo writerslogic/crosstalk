@@ -1,5 +1,5 @@
 use crate::types::artifact::Artifact;
-use crate::types::conversation::{ConversationState, TurnOutcome};
+use crate::types::conversation::{ConversationState, TaskCategory, TurnOutcome};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -34,12 +34,21 @@ impl CertaintyAnalyzer {
             "maybe", "perhaps", "i think", "possibly", "could be", "unsure", "not sure", "might",
         ];
         let strong_terms = [
-            "certainly", "definitely", "correct", "fix", "optimal", "verified", "must",
+            "certainly",
+            "definitely",
+            "correct",
+            "fix",
+            "optimal",
+            "verified",
+            "must",
         ];
 
         let content_lower = content.to_lowercase();
 
-        let hedging_count = hedging_terms.iter().filter(|&&t| content_lower.contains(t)).count();
+        let hedging_count = hedging_terms
+            .iter()
+            .filter(|&&t| content_lower.contains(t))
+            .count();
         let hedging_penalty = (hedging_count.min(4) as f64) * 0.1;
 
         let strong_bonus: f64 = strong_terms
@@ -87,7 +96,10 @@ impl NashSolver {
         for round in 1..max_rounds {
             let all_same = prev_resolutions.windows(2).all(|w| w[0] == w[1]);
             if all_same {
-                for r in rounds.iter_mut().filter(|r| r.round_index == round as u32 - 1) {
+                for r in rounds
+                    .iter_mut()
+                    .filter(|r| r.round_index == round as u32 - 1)
+                {
                     r.accepted = true;
                 }
                 break;
@@ -179,8 +191,7 @@ impl NashSolver {
                 proposals
                     .iter()
                     .max_by_key(|(_, _, t)| {
-                        let words: std::collections::HashSet<&str> =
-                            t.split_whitespace().collect();
+                        let words: std::collections::HashSet<&str> = t.split_whitespace().collect();
                         all_words
                             .iter()
                             .map(|other| words.intersection(other).count())
@@ -268,7 +279,21 @@ impl KalmanConvergence {
     #[must_use]
     pub fn confidence_interval(&self) -> (f64, f64) {
         let half_width = 1.96 * self.variance.sqrt();
-        ((self.p_c - half_width).max(0.0), (self.p_c + half_width).min(1.0))
+        (
+            (self.p_c - half_width).max(0.0),
+            (self.p_c + half_width).min(1.0),
+        )
+    }
+}
+
+fn outcome_factor(outcome: &TurnOutcome) -> f64 {
+    match outcome {
+        TurnOutcome::TestsPassed => 1.2,
+        TurnOutcome::Compiled => 1.0,
+        TurnOutcome::AdvancedConvergence => 1.1,
+        TurnOutcome::Rejected | TurnOutcome::RolledBack => 0.4,
+        TurnOutcome::Stalled => 0.6,
+        TurnOutcome::Unknown => 0.8,
     }
 }
 
@@ -294,20 +319,14 @@ impl InfluenceWeightManager {
         decay: f64,
     ) -> std::collections::BTreeMap<String, f64> {
         let n = sigma.turns.len();
-        let mut agent_stats: std::collections::BTreeMap<String, (f64, f64)> = std::collections::BTreeMap::new();
+        let mut agent_stats: std::collections::BTreeMap<String, (f64, f64)> =
+            std::collections::BTreeMap::new();
 
         for (i, turn) in sigma.turns.iter().enumerate() {
             let steps_ago = (n - 1).saturating_sub(i);
             let recency = decay.powi(steps_ago as i32);
 
-            let outcome_factor = match turn.outcome {
-                TurnOutcome::TestsPassed => 1.2,
-                TurnOutcome::Compiled => 1.0,
-                TurnOutcome::AdvancedConvergence => 1.1,
-                TurnOutcome::Rejected | TurnOutcome::RolledBack => 0.4,
-                TurnOutcome::Stalled => 0.6,
-                TurnOutcome::Unknown => 0.8,
-            };
+            let of = outcome_factor(&turn.outcome);
 
             let certainty = turn.certainty.unwrap_or(0.5);
             // Surprise > 0.5 means the agent behaved unexpectedly — reduce trust.
@@ -316,7 +335,7 @@ impl InfluenceWeightManager {
                 .map(|s| 1.0 - (s - 0.5).max(0.0) * 0.4)
                 .unwrap_or(1.0);
 
-            let contribution = certainty * outcome_factor * surprise_factor * recency;
+            let contribution = certainty * of * surprise_factor * recency;
             let (score, weight) = agent_stats
                 .entry(turn.model_id.clone())
                 .or_insert((0.0, 0.0));
@@ -337,13 +356,76 @@ impl InfluenceWeightManager {
             .collect()
     }
 
+    /// Compute weights filtered to turns matching `category`.
+    ///
+    /// Agents with no turns in the category fall back to a dampened global
+    /// weight (`global * 0.3`), so specialists dominate in their domain while
+    /// generalists still contribute a baseline.
+    #[must_use]
+    pub fn calculate_weights_for_category(
+        sigma: &ConversationState,
+        category: TaskCategory,
+        decay: f64,
+    ) -> std::collections::BTreeMap<String, f64> {
+        let category_turns: Vec<_> = sigma
+            .turns
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.task_category == Some(category))
+            .collect();
+
+        if category_turns.is_empty() {
+            return Self::calculate_weights_with_recency(sigma, decay);
+        }
+
+        let n = category_turns.len();
+        let mut agent_stats: std::collections::BTreeMap<String, (f64, f64)> =
+            std::collections::BTreeMap::new();
+
+        for (rank, (_, turn)) in category_turns.iter().enumerate() {
+            let steps_ago = (n - 1).saturating_sub(rank);
+            let recency = decay.powi(steps_ago as i32);
+
+            let of = outcome_factor(&turn.outcome);
+
+            let certainty = turn.certainty.unwrap_or(0.5);
+            let surprise_factor = turn
+                .surprise_signal
+                .map(|s| 1.0 - (s - 0.5).max(0.0) * 0.4)
+                .unwrap_or(1.0);
+
+            let contribution = certainty * of * surprise_factor * recency;
+            let (score, weight) = agent_stats
+                .entry(turn.model_id.clone())
+                .or_insert((0.0, 0.0));
+            *score += contribution;
+            *weight += recency;
+        }
+
+        let category_weights: std::collections::BTreeMap<String, f64> = agent_stats
+            .into_iter()
+            .map(|(id, (score, weight))| {
+                let w = if weight > 0.0 {
+                    (score / weight).clamp(0.1, 2.0)
+                } else {
+                    1.0
+                };
+                (id, w)
+            })
+            .collect();
+
+        let global_weights = Self::calculate_weights_with_recency(sigma, decay);
+        let mut merged = category_weights.clone();
+        for (id, gw) in &global_weights {
+            merged.entry(id.clone()).or_insert(gw * 0.3);
+        }
+        merged
+    }
+
     /// Return agents sorted by weight descending, highest-influence first.
     #[must_use]
     pub fn rank(weights: &std::collections::BTreeMap<String, f64>) -> Vec<(String, f64)> {
-        let mut sorted: Vec<(String, f64)> = weights
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
+        let mut sorted: Vec<(String, f64)> = weights.iter().map(|(k, v)| (k.clone(), *v)).collect();
         sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
         sorted
     }
@@ -414,8 +496,7 @@ impl PayoffCalculator {
                         // Relative advantage: normalised to [0, 1].
                         let relative = ((my_score - their_score) * 0.5 + 0.5).clamp(0.0, 1.0);
                         // Coordination bonus: reward improvement over current baseline.
-                        let coordination =
-                            (1.0 - (my_score - current_score).abs()).clamp(0.0, 1.0);
+                        let coordination = (1.0 - (my_score - current_score).abs()).clamp(0.0, 1.0);
                         relative * 0.7 + coordination * 0.3
                     })
                     .collect()

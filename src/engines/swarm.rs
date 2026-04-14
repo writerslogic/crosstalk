@@ -1,6 +1,6 @@
 use crate::types::consensus::MergeVote;
 use crate::types::conversation::Turn;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use crossbeam::deque::{Injector, Steal, Worker};
 use dashmap::DashMap;
 use rand::Rng;
@@ -12,7 +12,7 @@ use std::sync::{
     atomic::{AtomicU32, Ordering as AtomicOrdering},
 };
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::task::JoinSet;
 
 /// Zero-copy identifier to prevent heap allocations on map lookups.
@@ -107,7 +107,7 @@ impl SwarmController {
         let nodes_ref = Arc::clone(&self.nodes);
         let id_clone = Arc::clone(&id);
         let injector = Arc::clone(&self.task_queue);
-        
+
         // Subscribe to the global turn broadcaster before spawning
         let mut turn_rx = self.state_tx.subscribe();
         let notify_ref = Arc::clone(&self.work_notify);
@@ -129,7 +129,10 @@ impl SwarmController {
                 if let Some(sub_task) = task {
                     nodes_ref.insert(id_clone.clone(), NodeStatus::Running);
                     // Process the sub-task
-                    tokio::time::sleep(Duration::from_millis(100 * sub_task.estimated_turns as u64)).await;
+                    tokio::time::sleep(Duration::from_millis(
+                        100 * sub_task.estimated_turns as u64,
+                    ))
+                    .await;
                     nodes_ref.insert(id_clone.clone(), NodeStatus::WaitingMerge);
                     continue;
                 }
@@ -255,7 +258,7 @@ impl LeaderElection {
                         rpc_tasks.spawn(async move {
                             // Strict timeout on external RPCs to prevent network stalling
                             match tokio::time::timeout(
-                                Duration::from_millis(50), 
+                                Duration::from_millis(50),
                                 peer.request_vote(term, candidate_id)
                             ).await {
                                 Ok(Ok(vote_granted)) => vote_granted,
@@ -268,8 +271,8 @@ impl LeaderElection {
                     while let Some(res) = rpc_tasks.join_next().await {
                         if let Ok(true) = res {
                             self.votes += 1;
-                            
-                            // QUORUM SHORT-CIRCUIT: 
+
+                            // QUORUM SHORT-CIRCUIT:
                             // If we hit quorum early, abort pending RPCs to save bandwidth.
                             if self.votes >= quorum {
                                 rpc_tasks.abort_all();
@@ -279,7 +282,7 @@ impl LeaderElection {
                         }
                     }
                 }
-                
+
                 // Election failed
                 self.state = RaftState::Follower;
                 false
@@ -335,7 +338,11 @@ impl TaskDecomposer {
             .map(|(i, chunk)| SubTask {
                 id: format!("task-{i}"),
                 description: chunk.join(". "),
-                dependencies: if i == 0 { vec![] } else { vec![format!("task-{}", i - 1)] },
+                dependencies: if i == 0 {
+                    vec![]
+                } else {
+                    vec![format!("task-{}", i - 1)]
+                },
                 estimated_turns: chunk.len() as u32,
             })
             .collect()
@@ -348,7 +355,10 @@ impl AgentAssigner {
     /// Greedy assignment: each sub-task goes to the agent with the highest
     /// capability score. Returns a map of `task_id → agent_id`.
     #[must_use]
-    pub fn assign(tasks: &[SubTask], capabilities: &HashMap<String, f64>) -> HashMap<String, String> {
+    pub fn assign(
+        tasks: &[SubTask],
+        capabilities: &HashMap<String, f64>,
+    ) -> HashMap<String, String> {
         if capabilities.is_empty() {
             return HashMap::new();
         }
@@ -453,7 +463,7 @@ impl ProgressMonitor {
 
         for entry in nodes.iter() {
             match entry.value() {
-                NodeStatus::Idle => {},
+                NodeStatus::Idle => {}
                 NodeStatus::Running | NodeStatus::Spawning => running += 1,
                 NodeStatus::WaitingMerge => waiting_merge += 1,
                 NodeStatus::Complete => complete += 1,
@@ -462,9 +472,19 @@ impl ProgressMonitor {
         }
 
         let total = running + waiting_merge + complete + failed;
-        let completion_ratio = if total == 0 { 0.0 } else { complete as f64 / total as f64 };
+        let completion_ratio = if total == 0 {
+            0.0
+        } else {
+            complete as f64 / total as f64
+        };
 
-        ProgressReport { running, waiting_merge, complete, failed, completion_ratio }
+        ProgressReport {
+            running,
+            waiting_merge,
+            complete,
+            failed,
+            completion_ratio,
+        }
     }
 }
 

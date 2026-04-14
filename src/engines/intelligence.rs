@@ -5,8 +5,8 @@ use dashmap::DashMap;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use tokio::fs;
-use tokio::sync::{mpsc, RwLock};
-use tokio::time::{interval, Duration};
+use tokio::sync::{RwLock, mpsc};
+use tokio::time::{Duration, interval};
 
 pub struct CheckpointService {
     flush_tx: Option<mpsc::Sender<()>>,
@@ -15,7 +15,10 @@ pub struct CheckpointService {
 
 impl CheckpointService {
     fn new() -> Self {
-        Self { flush_tx: None, handle: None }
+        Self {
+            flush_tx: None,
+            handle: None,
+        }
     }
 
     fn spawn(
@@ -52,7 +55,10 @@ impl CheckpointService {
                 }
             }
         });
-        Self { flush_tx: Some(tx), handle: Some(handle) }
+        Self {
+            flush_tx: Some(tx),
+            handle: Some(handle),
+        }
     }
 
     fn trigger(&self) -> Result<()> {
@@ -60,7 +66,9 @@ impl CheckpointService {
             match tx.try_send(()) {
                 Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    return Err(anyhow!("checkpoint flush channel closed; flusher task is dead"));
+                    return Err(anyhow!(
+                        "checkpoint flush channel closed; flusher task is dead"
+                    ));
                 }
             }
         }
@@ -131,10 +139,13 @@ impl IntelligenceEngine {
                 Err(e) => return Err(anyhow::anyhow!(e)),
             }
         {
-            let content = fs::read_to_string(path).await.context("Failed to read intelligence data")?;
+            let content = fs::read_to_string(path)
+                .await
+                .context("Failed to read intelligence data")?;
             let data: serde_json::Value = serde_json::from_str(&content)?;
             if let Some(profiles) = data.get("profiles") {
-                let parsed: BTreeMap<String, ModelProfile> = serde_json::from_value(profiles.clone())?;
+                let parsed: BTreeMap<String, ModelProfile> =
+                    serde_json::from_value(profiles.clone())?;
                 for (k, v) in parsed {
                     self.profiles.insert(k, v);
                 }
@@ -157,18 +168,25 @@ impl IntelligenceEngine {
     }
 
     pub fn update_profile(&self, turn: &Turn, quality_score: f64) {
-        let mut profile = self.profiles.entry(turn.model_id.clone()).or_insert_with(|| ModelProfile {
-            model_id: turn.model_id.clone(),
-            task_scores: BTreeMap::new(),
-            total_turns: 0,
-            last_updated: ConversationState::now(),
-            latency_ms: Default::default(),
-        });
+        let mut profile = self
+            .profiles
+            .entry(turn.model_id.clone())
+            .or_insert_with(|| ModelProfile {
+                model_id: turn.model_id.clone(),
+                task_scores: BTreeMap::new(),
+                total_turns: 0,
+                last_updated: ConversationState::now(),
+                latency_ms: Default::default(),
+            });
 
         if let Some(cat) = turn.task_category {
-            profile.task_scores.entry(cat).or_default().update(quality_score);
+            profile
+                .task_scores
+                .entry(cat)
+                .or_default()
+                .update(quality_score);
         }
-        
+
         profile.total_turns += 1;
         profile.last_updated = ConversationState::now();
 
@@ -182,7 +200,9 @@ impl IntelligenceEngine {
         self.update_profile(turn, quality_score);
         self.latency_predictor.record(&turn.model_id, latency_ms);
         if let Some(mut profile) = self.profiles.get_mut(&turn.model_id) {
-            profile.latency_ms.update(self.latency_predictor.predict_latency(&turn.model_id) as f64);
+            profile
+                .latency_ms
+                .update(self.latency_predictor.predict_latency(&turn.model_id) as f64);
         }
     }
 
@@ -194,8 +214,14 @@ impl IntelligenceEngine {
         self.checkpoint.save_all()
     }
 
-    pub fn detect_regression(&self, model_id: &str, recent_turns: &[Turn]) -> Option<RegressionAlert> {
-        if recent_turns.is_empty() { return None; }
+    pub fn detect_regression(
+        &self,
+        model_id: &str,
+        recent_turns: &[Turn],
+    ) -> Option<RegressionAlert> {
+        if recent_turns.is_empty() {
+            return None;
+        }
 
         let profile = self.profiles.get(model_id)?;
         let mut recent_quality_sum = 0.0;
@@ -213,7 +239,9 @@ impl IntelligenceEngine {
             }
         }
 
-        if valid_turns == 0 { return None; }
+        if valid_turns == 0 {
+            return None;
+        }
         let recent_avg = recent_quality_sum / valid_turns as f64;
 
         let baseline = profile
@@ -246,19 +274,30 @@ impl IntelligenceEngine {
     ) -> Result<String, String> {
         let estimated_tokens = Self::estimate_tokens(category);
         if estimated_tokens > budget {
-            return Err(format!("Estimated tokens {} exceeds budget {}", estimated_tokens, budget));
+            return Err(format!(
+                "Estimated tokens {} exceeds budget {}",
+                estimated_tokens, budget
+            ));
         }
 
         let mut best_candidate: Option<&String> = None;
         let mut highest_score = -1.0;
 
         for model_id in available_models {
-            if blacklist.contains(model_id) { continue; }
+            if blacklist.contains(model_id) {
+                continue;
+            }
 
             if let Some(profile) = self.profiles.get(model_id) {
                 let predicted = self.latency_predictor.predict_latency(model_id);
-                let effective_latency = if predicted > 0 { predicted as f64 } else { profile.latency_ms.mean };
-                if effective_latency > latency_ms as f64 { continue; }
+                let effective_latency = if predicted > 0 {
+                    predicted as f64
+                } else {
+                    profile.latency_ms.mean
+                };
+                if effective_latency > latency_ms as f64 {
+                    continue;
+                }
 
                 let score = profile.task_scores.get(&category).map_or(0.5, |ra| ra.mean);
 
@@ -272,7 +311,13 @@ impl IntelligenceEngine {
         match best_candidate {
             Some(model) => Ok(model.clone()),
             None => {
-                let diag = self.generate_routing_diagnostics(category, available_models, budget, latency_ms, blacklist);
+                let diag = self.generate_routing_diagnostics(
+                    category,
+                    available_models,
+                    budget,
+                    latency_ms,
+                    blacklist,
+                );
                 Err(format!("No models satisfy constraints. {}", diag))
             }
         }
@@ -289,7 +334,12 @@ impl IntelligenceEngine {
         let mut issues = Vec::new();
 
         if Self::estimate_tokens(category) > budget {
-            issues.push(format!("Category {:?} needs {} tokens but budget is {}", category, Self::estimate_tokens(category), budget));
+            issues.push(format!(
+                "Category {:?} needs {} tokens but budget is {}",
+                category,
+                Self::estimate_tokens(category),
+                budget
+            ));
         }
 
         for model in available_models {
@@ -299,7 +349,10 @@ impl IntelligenceEngine {
             if let Some(profile) = self.profiles.get(model)
                 && profile.latency_ms.mean > latency_ms as f64
             {
-                issues.push(format!("{} latency {}ms exceeds {}ms limit", model, profile.latency_ms.mean as u64, latency_ms));
+                issues.push(format!(
+                    "{} latency {}ms exceeds {}ms limit",
+                    model, profile.latency_ms.mean as u64, latency_ms
+                ));
             }
         }
 
@@ -361,7 +414,8 @@ impl QualityScorer {
         }
 
         let lower = turn.content.to_lowercase();
-        let has_evidence = lower.split(|c: char| !c.is_alphabetic())
+        let has_evidence = lower
+            .split(|c: char| !c.is_alphabetic())
             .any(|w| w == "evidence" || w == "proof");
         if has_evidence {
             score += 0.05;
@@ -475,14 +529,14 @@ impl ModelEnsemble {
             .collect();
 
         if candidates.is_empty() {
-            return Err(anyhow!("No ensemble candidates available for {:?}", category));
+            return Err(anyhow!(
+                "No ensemble candidates available for {:?}",
+                category
+            ));
         }
 
         if Self::is_safety_critical(category) {
-            let high_confidence = candidates
-                .iter()
-                .filter(|(_, s)| *s > 0.8)
-                .count();
+            let high_confidence = candidates.iter().filter(|(_, s)| *s > 0.8).count();
             if high_confidence < 3 {
                 return Err(anyhow!(
                     "Safety-critical task requires 3 models with confidence > 0.8, got {}",
@@ -493,16 +547,16 @@ impl ModelEnsemble {
 
         let mut ranked: Vec<(String, f64)> = match self.voting_strategy {
             VotingStrategy::MaxConfidence => candidates,
-            VotingStrategy::Majority => candidates
-                .into_iter()
-                .filter(|(_, s)| *s >= 0.5)
-                .collect(),
+            VotingStrategy::Majority => candidates.into_iter().filter(|(_, s)| *s >= 0.5).collect(),
             VotingStrategy::WeightedConsensus => {
                 let total: f64 = candidates.iter().map(|(_, s)| s).sum();
                 if total == 0.0 {
                     candidates
                 } else {
-                    candidates.into_iter().map(|(m, s)| (m, s / total)).collect()
+                    candidates
+                        .into_iter()
+                        .map(|(m, s)| (m, s / total))
+                        .collect()
                 }
             }
         };
@@ -548,8 +602,15 @@ impl PromptComposer {
         let profile_summary = if profile.task_scores.is_empty() {
             format!("{} (no history)", profile.model_id)
         } else {
-            let avg = profile.task_scores.get(&cat).map(|ra| ra.mean).unwrap_or(0.5);
-            format!("{} | {:?} mean: {:.2} | {} turns", profile.model_id, cat, avg, profile.total_turns)
+            let avg = profile
+                .task_scores
+                .get(&cat)
+                .map(|ra| ra.mean)
+                .unwrap_or(0.5);
+            format!(
+                "{} | {:?} mean: {:.2} | {} turns",
+                profile.model_id, cat, avg, profile.total_turns
+            )
         };
 
         let mut vars = BTreeMap::new();
@@ -571,10 +632,16 @@ impl PromptComposer {
             .collect();
 
         if is_in_regression {
-            matching.iter().find(|t| t.is_corrective()).copied()
+            matching
+                .iter()
+                .find(|t| t.is_corrective())
+                .copied()
                 .or_else(|| matching.first().copied())
         } else {
-            matching.iter().find(|t| !t.is_corrective()).copied()
+            matching
+                .iter()
+                .find(|t| !t.is_corrective())
+                .copied()
                 .or_else(|| matching.first().copied())
         }
     }
@@ -659,7 +726,10 @@ impl LatencyPredictor {
     }
 
     pub fn predict_latency(&self, model_id: &str) -> u64 {
-        self.ema.get(model_id).map(|v| if v.is_finite() { *v as u64 } else { 0u64 }).unwrap_or(0)
+        self.ema
+            .get(model_id)
+            .map(|v| if v.is_finite() { *v as u64 } else { 0u64 })
+            .unwrap_or(0)
     }
 
     pub fn is_high_variance(&self, model_id: &str) -> bool {
@@ -674,10 +744,14 @@ impl LatencyPredictor {
         if mean == 0.0 {
             return false;
         }
-        let variance = hist.iter().map(|&x| {
-            let d = x as f64 - mean;
-            d * d
-        }).sum::<f64>() / hist.len() as f64;
+        let variance = hist
+            .iter()
+            .map(|&x| {
+                let d = x as f64 - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / hist.len() as f64;
         variance.sqrt() > mean * 0.5
     }
 }
@@ -745,7 +819,12 @@ impl ConvergenceVelocityTracker {
     #[must_use]
     pub fn is_stalled(&self) -> bool {
         self.velocity_history.len() >= 3
-            && self.velocity_history.iter().rev().take(3).all(|&v| v.abs() < 0.005)
+            && self
+                .velocity_history
+                .iter()
+                .rev()
+                .take(3)
+                .all(|&v| v.abs() < 0.005)
     }
 
     /// Estimated turns remaining until completion_probability reaches 1.0.
@@ -794,13 +873,21 @@ impl ParetoOptimizer {
             })
             .cloned()
             .collect();
-        frontier.sort_by(|a, b| b.quality.partial_cmp(&a.quality).unwrap_or(std::cmp::Ordering::Equal));
+        frontier.sort_by(|a, b| {
+            b.quality
+                .partial_cmp(&a.quality)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         frontier
     }
 
     /// From the frontier, select the cheapest point meeting both constraints.
     #[must_use]
-    pub fn select(frontier: &[ParetoPoint], min_quality: f64, max_tokens: u32) -> Option<&ParetoPoint> {
+    pub fn select(
+        frontier: &[ParetoPoint],
+        min_quality: f64,
+        max_tokens: u32,
+    ) -> Option<&ParetoPoint> {
         frontier
             .iter()
             .filter(|p| p.quality >= min_quality && p.cost_tokens <= max_tokens)

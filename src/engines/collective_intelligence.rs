@@ -1,4 +1,4 @@
-use crate::types::conversation::{Turn, TurnOutcome, TaskCategory};
+use crate::types::conversation::{TaskCategory, Turn, TurnOutcome};
 use crate::types::intelligence::AgentProfile;
 use crate::types::memory::TransferableLesson;
 use serde::{Deserialize, Serialize};
@@ -93,7 +93,9 @@ impl KnowledgeTransfer {
             .iter()
             .filter(|l| {
                 l.category == task_category
-                    || l.applicability_tags.iter().any(|t| task_tags.contains(&t.as_str()))
+                    || l.applicability_tags
+                        .iter()
+                        .any(|t| task_tags.contains(&t.as_str()))
             })
             .collect();
 
@@ -144,7 +146,8 @@ impl PeerReview {
         }
         if proposal.contains("unsafe") {
             correctness -= 0.15;
-            comments.push("Unsafe block present: requires manual safety justification.".to_string());
+            comments
+                .push("Unsafe block present: requires manual safety justification.".to_string());
         }
         if !proposal.contains("///") && proposal.contains("pub fn") {
             maintainability -= 0.1;
@@ -244,7 +247,9 @@ impl DynamicTeamComposer {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, Default,
+)]
 pub enum MetaStrategy {
     #[default]
     DirectImplementation,
@@ -284,7 +289,14 @@ impl MetaStrategyOptimizer {
             MetaStrategy::StepByStepReasoning,
             MetaStrategy::EnsembleVoting,
         ] {
-            outcomes.insert(strategy, StrategyOutcome { strategy, quality_sum: 0.0, trial_count: 0 });
+            outcomes.insert(
+                strategy,
+                StrategyOutcome {
+                    strategy,
+                    quality_sum: 0.0,
+                    trial_count: 0,
+                },
+            );
         }
         Self { outcomes }
     }
@@ -362,7 +374,9 @@ fn sample_gamma(rng: &mut impl rand::Rng, shape: f64) -> f64 {
             (u1.ln() * -2.0).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
         };
         let v = (1.0 + c * x).powi(3);
-        if v <= 0.0 { continue; }
+        if v <= 0.0 {
+            continue;
+        }
         let u: f64 = rng.random();
         if u < 1.0 - 0.0331 * x.powi(4) {
             return d * v;
@@ -394,10 +408,7 @@ impl SwarmPremiumCalculator {
         multi_agent_score: f64,
         agent_scores: &BTreeMap<String, f64>,
     ) -> SwarmPremium {
-        let best_single = agent_scores
-            .values()
-            .cloned()
-            .fold(0.0_f64, f64::max);
+        let best_single = agent_scores.values().cloned().fold(0.0_f64, f64::max);
         let premium_pct = if best_single > 0.0 {
             ((multi_agent_score - best_single) / best_single) * 100.0
         } else {
@@ -432,10 +443,19 @@ impl SkillRecord {
         let n_f = n as f64;
         let sum_x: f64 = (0..n).map(|i| i as f64).sum();
         let sum_y: f64 = self.score_history.iter().sum();
-        let sum_xy: f64 = self.score_history.iter().enumerate().map(|(i, y)| i as f64 * y).sum();
+        let sum_xy: f64 = self
+            .score_history
+            .iter()
+            .enumerate()
+            .map(|(i, y)| i as f64 * y)
+            .sum();
         let sum_xx: f64 = (0..n).map(|i| (i * i) as f64).sum();
         let denom = n_f * sum_xx - sum_x * sum_x;
-        if denom == 0.0 { 0.0 } else { (n_f * sum_xy - sum_x * sum_y) / denom }
+        if denom == 0.0 {
+            0.0
+        } else {
+            (n_f * sum_xy - sum_x * sum_y) / denom
+        }
     }
 
     #[must_use]
@@ -467,7 +487,8 @@ impl SkillProgressionTracker {
 
     #[must_use]
     pub fn get(&self, agent_id: &str, task_type: &str) -> Option<&SkillRecord> {
-        self.records.get(&(agent_id.to_string(), task_type.to_string()))
+        self.records
+            .get(&(agent_id.to_string(), task_type.to_string()))
     }
 }
 
@@ -487,10 +508,7 @@ impl CapabilityGapScanner {
 
     /// Find task types where the best agent's score falls below `threshold`.
     #[must_use]
-    pub fn scan(
-        profiles: &BTreeMap<String, AgentProfile>,
-        threshold: f64,
-    ) -> Vec<CapabilityGap> {
+    pub fn scan(profiles: &BTreeMap<String, AgentProfile>, threshold: f64) -> Vec<CapabilityGap> {
         let mut best_per_task: BTreeMap<String, f64> = BTreeMap::new();
         for profile in profiles.values() {
             for (cat, &score) in &profile.capabilities {
@@ -535,7 +553,10 @@ impl ReviewerCalibrator {
     /// Record a review outcome.
     /// `flagged` = reviewer flagged an issue; `real_issue` = issue was genuine.
     pub fn record(&mut self, reviewer_id: &str, flagged: bool, real_issue: bool) {
-        let (tp, fp, fn_) = self.stats.entry(reviewer_id.to_string()).or_insert((0, 0, 0));
+        let (tp, fp, fn_) = self
+            .stats
+            .entry(reviewer_id.to_string())
+            .or_insert((0, 0, 0));
         match (flagged, real_issue) {
             (true, true) => *tp += 1,
             (true, false) => *fp += 1,
@@ -546,16 +567,28 @@ impl ReviewerCalibrator {
 
     #[must_use]
     pub fn precision(&self, reviewer_id: &str) -> f64 {
-        let Some(&(tp, fp, _)) = self.stats.get(reviewer_id) else { return 0.0 };
+        let Some(&(tp, fp, _)) = self.stats.get(reviewer_id) else {
+            return 0.0;
+        };
         let denom = tp + fp;
-        if denom == 0 { 0.0 } else { tp as f64 / denom as f64 }
+        if denom == 0 {
+            0.0
+        } else {
+            tp as f64 / denom as f64
+        }
     }
 
     #[must_use]
     pub fn recall(&self, reviewer_id: &str) -> f64 {
-        let Some(&(tp, _, fn_)) = self.stats.get(reviewer_id) else { return 0.0 };
+        let Some(&(tp, _, fn_)) = self.stats.get(reviewer_id) else {
+            return 0.0;
+        };
         let denom = tp + fn_;
-        if denom == 0 { 0.0 } else { tp as f64 / denom as f64 }
+        if denom == 0 {
+            0.0
+        } else {
+            tp as f64 / denom as f64
+        }
     }
 }
 
@@ -591,7 +624,11 @@ impl UCB1ProtocolSelector {
         Self {
             arms: protocol_names
                 .iter()
-                .map(|n| ProtocolArm { name: n.to_string(), total_reward: 0.0, trials: 0 })
+                .map(|n| ProtocolArm {
+                    name: n.to_string(),
+                    total_reward: 0.0,
+                    trials: 0,
+                })
                 .collect(),
             total_trials: 0,
         }
@@ -602,7 +639,10 @@ impl UCB1ProtocolSelector {
     pub fn select(&self) -> Option<&str> {
         self.arms
             .iter()
-            .max_by(|a, b| a.ucb1(self.total_trials).total_cmp(&b.ucb1(self.total_trials)))
+            .max_by(|a, b| {
+                a.ucb1(self.total_trials)
+                    .total_cmp(&b.ucb1(self.total_trials))
+            })
             .map(|a| a.name.as_str())
     }
 

@@ -12,6 +12,9 @@ pub struct MemoryRecord {
     pub timestamp: u64,
     pub metadata_json: String,
     pub outcome: Option<OutcomeRecord>,
+    /// Negative examples represent antipatterns extracted from failed sessions.
+    #[serde(default)]
+    pub is_negative: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

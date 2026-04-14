@@ -1,10 +1,10 @@
 use crate::types::artifact::ArtifactDiff;
 use crate::types::conversation::{ConversationState, TaskCategory, Turn, TurnStructure};
 use crate::types::security::FallacyReport;
+use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use rustc_hash::FxHasher;
 use tree_sitter::{Node, Parser};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -59,18 +59,33 @@ impl ReasoningEngine {
             }
 
             // Handle Logic Signals (Zero-allocation prefix matching)
-            if trimmed.is_empty() { continue; }
+            if trimmed.is_empty() {
+                continue;
+            }
 
-            if trimmed.eq_ignore_ascii_case("decision:") || trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]") || trimmed.starts_with("⊢") || trimmed.starts_with("Δα:") {
+            if trimmed.eq_ignore_ascii_case("decision:")
+                || trimmed.starts_with("- [x]")
+                || trimmed.starts_with("- [X]")
+                || trimmed.starts_with("⊢")
+                || trimmed.starts_with("Δα:")
+            {
                 decisions.push(trimmed.to_string());
-            } else if trimmed.eq_ignore_ascii_case("problem:") || trimmed.eq_ignore_ascii_case("err:") || trimmed.starts_with("⊥") {
+            } else if trimmed.eq_ignore_ascii_case("problem:")
+                || trimmed.eq_ignore_ascii_case("err:")
+                || trimmed.starts_with("⊥")
+            {
                 problems.push(trimmed.to_string());
             } else if trimmed.ends_with('?') {
                 questions.push(trimmed.to_string());
             }
         }
 
-        ExtractedSignals { decisions, problems, questions, code_blocks }
+        ExtractedSignals {
+            decisions,
+            problems,
+            questions,
+            code_blocks,
+        }
     }
 }
 
@@ -92,18 +107,28 @@ impl ReasoningScorer {
 
         // Dimension 1: signal richness (0.0..=0.30)
         let signal_score = {
-            let d = if signals.decisions.is_empty() { 0.0 } else { 0.15 };
-            let q = if signals.questions.len() <= 3 { 0.05 } else { 0.0 };
-            let c = if signals.code_blocks.is_empty() { 0.0 } else { 0.10 };
+            let d = if signals.decisions.is_empty() {
+                0.0
+            } else {
+                0.15
+            };
+            let q = if signals.questions.len() <= 3 {
+                0.05
+            } else {
+                0.0
+            };
+            let c = if signals.code_blocks.is_empty() {
+                0.0
+            } else {
+                0.10
+            };
             d + q + c
         };
 
         // Dimension 2: evidence anchoring proxy (0.0..=0.25)
         let evidence_score = {
-            let has_code_ref =
-                turn.content.contains("```") || turn.content.contains("line ");
-            let has_citation =
-                turn.content.contains("http") || turn.content.contains("doi:");
+            let has_code_ref = turn.content.contains("```") || turn.content.contains("line ");
+            let has_citation = turn.content.contains("http") || turn.content.contains("doi:");
             let density = (has_code_ref as u8 + has_citation as u8) as f64 * 0.125;
             let word_count = turn.content.split_whitespace().count();
             let length_bonus = (word_count as f64 / 200.0).min(1.0) * 0.05;
@@ -120,8 +145,7 @@ impl ReasoningScorer {
         // Dimension 4: fallacy penalty (max 0.20)
         let fallacy_penalty = (fallacies.len() as f64 * 0.05).min(0.20);
 
-        let assumption_bonus =
-            (assumptions.len() as f64 * 0.025).min(0.05);
+        let assumption_bonus = (assumptions.len() as f64 * 0.025).min(0.05);
 
         let base = 0.30;
         (base + signal_score + evidence_score + structure_score + assumption_bonus
@@ -190,7 +214,12 @@ impl FallacyDetector {
 
     fn detect_straw_man(content: &str) -> Option<FallacyReport> {
         let lower = content.to_lowercase();
-        let setups = ["they claim", "their argument is", "they believe", "their position is"];
+        let setups = [
+            "they claim",
+            "their argument is",
+            "they believe",
+            "their position is",
+        ];
         let dismissals = [
             "is absurd",
             "is ridiculous",
@@ -213,7 +242,8 @@ impl FallacyDetector {
     /// Upgraded from $O(N^2)$ to $O(N)$ using a semantic hash-binning approach.
     /// Sentences are hashed into semantic buckets. Collisions indicate circular reasoning.
     fn detect_circular_reasoning(content: &str) -> Option<FallacyReport> {
-        let mut semantic_buckets: HashMap<u64, &str, FxBuildHasher> = HashMap::with_capacity_and_hasher(128, Default::default());
+        let mut semantic_buckets: HashMap<u64, &str, FxBuildHasher> =
+            HashMap::with_capacity_and_hasher(128, Default::default());
 
         let sentences = content
             .split(['.', '?', '!', '\n'])
@@ -227,12 +257,18 @@ impl FallacyDetector {
             // If a highly similar semantic structure already exists in the text...
             if let Some(previous_sentence) = semantic_buckets.get(&signature) {
                 let s_lower = sentence.to_lowercase();
-                
+
                 // ...and the new sentence acts as a conclusion, it is circular.
-                if s_lower.contains("therefore") || s_lower.contains("thus") || s_lower.contains("consequently") {
+                if s_lower.contains("therefore")
+                    || s_lower.contains("thus")
+                    || s_lower.contains("consequently")
+                {
                     return Some(FallacyReport {
                         fallacy_type: "CircularReasoning".to_string(),
-                        evidence_span: format!("Premise: \"{}\" vs Conclusion: \"{}\"", previous_sentence, sentence),
+                        evidence_span: format!(
+                            "Premise: \"{}\" vs Conclusion: \"{}\"",
+                            previous_sentence, sentence
+                        ),
                         confidence: 0.85,
                     });
                 }
@@ -251,7 +287,7 @@ impl FallacyDetector {
             .split_whitespace()
             .filter(|w| w.len() > 3) // Ignore "the", "and", "is"
             .collect();
-        
+
         words.sort_unstable(); // Order-independent signature
         for word in words {
             hasher.write(word.to_ascii_lowercase().as_bytes());
@@ -279,7 +315,9 @@ pub struct StrategyMixer {
 
 impl StrategyMixer {
     pub fn new() -> Self {
-        Self { history: Vec::new() }
+        Self {
+            history: Vec::new(),
+        }
     }
 
     pub fn record(&mut self, rec: StrategyRecord) {
@@ -289,9 +327,11 @@ impl StrategyMixer {
     #[must_use]
     pub fn blend(&self, task: TaskCategory, agent_id: Option<&str>) -> Vec<(TurnStructure, f64)> {
         let mut acc: HashMap<TurnStructure, (f64, u32)> = HashMap::new();
-        for r in self.history.iter().filter(|r| {
-            r.task == task && agent_id.is_none_or(|id| r.agent_id == id)
-        }) {
+        for r in self
+            .history
+            .iter()
+            .filter(|r| r.task == task && agent_id.is_none_or(|id| r.agent_id == id))
+        {
             let e = acc.entry(r.structure).or_default();
             e.0 += r.quality_score;
             e.1 += 1;
@@ -321,7 +361,9 @@ pub struct StructureSelector {
 
 impl StructureSelector {
     pub fn new() -> Self {
-        Self { mixer: StrategyMixer::new() }
+        Self {
+            mixer: StrategyMixer::new(),
+        }
     }
 
     pub fn record_outcome(
@@ -417,20 +459,13 @@ impl CrossExaminer {
         for word in argument.split_whitespace() {
             let stripped = word.trim_matches(|c: char| !c.is_alphabetic());
             if stripped.len() > 4 && stripped == stripped.to_uppercase() {
-                questions.push(format!(
-                    "How is \"{}\" defined in this context?",
-                    stripped
-                ));
+                questions.push(format!("How is \"{}\" defined in this context?", stripped));
             }
         }
 
         let lower = argument.to_lowercase();
-        if lower.contains("causes")
-            || lower.contains("leads to")
-            || lower.contains("results in")
-        {
-            questions
-                .push("What evidence supports this causal relationship?".to_string());
+        if lower.contains("causes") || lower.contains("leads to") || lower.contains("results in") {
+            questions.push("What evidence supports this causal relationship?".to_string());
         }
 
         if lower.contains("always") || lower.contains("never") || lower.contains("all ") {
@@ -575,10 +610,19 @@ pub struct SynthesisEngine;
 
 impl SynthesisEngine {
     #[must_use]
-    pub fn merge(base_content: &str, proposals: Vec<ArtifactDiff>, language: &str) -> Option<String> {
-        if proposals.is_empty() { return None; }
+    pub fn merge(
+        base_content: &str,
+        proposals: Vec<ArtifactDiff>,
+        language: &str,
+    ) -> Option<String> {
+        if proposals.is_empty() {
+            return None;
+        }
         if proposals.len() == 1 {
-            return Some(crate::engines::diff::DiffEngine::apply_patch(base_content, &proposals[0]));
+            return Some(crate::engines::diff::DiffEngine::apply_patch(
+                base_content,
+                &proposals[0],
+            ));
         }
 
         let versions: Vec<String> = proposals
@@ -595,7 +639,7 @@ impl SynthesisEngine {
         let mut parser = Parser::new();
         let lang = match language.to_lowercase().as_str() {
             "rust" | "rs" => tree_sitter_rust::LANGUAGE.into(),
-            _ => return Some(versions[0].clone()), 
+            _ => return Some(versions[0].clone()),
         };
         parser.set_language(&lang).ok()?;
 
@@ -609,7 +653,10 @@ impl SynthesisEngine {
             if let Some(tree) = parser.parse(v, None) {
                 let blocks = Self::extract_blocks(v, tree.root_node());
                 for b in blocks {
-                    block_proposals.entry(b.signature).or_default().push(b.content);
+                    block_proposals
+                        .entry(b.signature)
+                        .or_default()
+                        .push(b.content);
                 }
             }
         }
@@ -630,8 +677,7 @@ impl SynthesisEngine {
                 for change in &changes {
                     *frequency.entry(*change).or_insert(0) += 1;
                 }
-                let (winning_change, _) =
-                    frequency.into_iter().max_by_key(|&(_, count)| count)?;
+                let (winning_change, _) = frequency.into_iter().max_by_key(|&(_, count)| count)?;
                 Some((base_block.byte_range.clone(), winning_change.clone()))
             })
             .collect();
@@ -657,11 +703,13 @@ impl SynthesisEngine {
     fn extract_blocks(source: &str, root: Node) -> Vec<AstBlock> {
         let mut blocks = Vec::new();
         let mut cursor = root.walk();
-        
+
         for node in root.children(&mut cursor) {
             let kind = node.kind();
-            if matches!(kind, "function_item" | "struct_item" | "enum_item" | "impl_item" | "trait_item") {
-                
+            if matches!(
+                kind,
+                "function_item" | "struct_item" | "enum_item" | "impl_item" | "trait_item"
+            ) {
                 // Crucial AST Fix: Expand byte_range upward to include #[attributes] preceding the block
                 let mut start_byte = node.start_byte();
                 if let Some(prev) = node.prev_sibling()
@@ -672,7 +720,7 @@ impl SynthesisEngine {
 
                 let signature = Self::get_node_signature(source, node);
                 let byte_range = start_byte..node.end_byte();
-                
+
                 blocks.push(AstBlock {
                     signature,
                     byte_range: byte_range.clone(),

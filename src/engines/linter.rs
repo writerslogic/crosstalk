@@ -1,11 +1,11 @@
 use crate::engines::sandbox::SandboxResult;
 use crate::types::artifact::Artifact;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 // ─── Severity ────────────────────────────────────────────────────────────────
 
@@ -71,7 +71,11 @@ pub struct LinterGuard;
 
 impl LinterGuard {
     /// Full workspace lint. Returns a `LintReport`; errors block, warnings log.
-    pub async fn check(sandbox_result: &SandboxResult, workspace_dir: &str, env: Option<&HashMap<String, String>>) -> Result<LintReport> {
+    pub async fn check(
+        sandbox_result: &SandboxResult,
+        workspace_dir: &str,
+        env: Option<&HashMap<String, String>>,
+    ) -> Result<LintReport> {
         if sandbox_result.exit_code != 0 {
             return Err(anyhow!("Sandbox failed: {}", sandbox_result.stderr));
         }
@@ -94,12 +98,19 @@ impl LinterGuard {
             // Non-Rust artifacts: run a syntax-only heuristic scan
             let diags = Self::heuristic_scan(&artifact.content);
             let passed = !diags.iter().any(|d| d.severity == Severity::Error);
-            return Ok(ArtifactLintReport { diagnostics: diags, passed, skipped: false });
+            return Ok(ArtifactLintReport {
+                diagnostics: diags,
+                passed,
+                skipped: false,
+            });
         }
 
         const MAX_ARTIFACT_BYTES: usize = 512 * 1024;
         if artifact.content.len() > MAX_ARTIFACT_BYTES {
-            return Err(anyhow!("Artifact too large to lint ({} bytes)", artifact.content.len()));
+            return Err(anyhow!(
+                "Artifact too large to lint ({} bytes)",
+                artifact.content.len()
+            ));
         }
 
         let uid = std::time::SystemTime::now()
@@ -112,7 +123,8 @@ impl LinterGuard {
         let src = dir.join(format!("artifact_{pid}_{uid}.rs"));
         tokio::fs::write(&src, &artifact.content).await?;
 
-        let src_str = src.to_str()
+        let src_str = src
+            .to_str()
             .ok_or_else(|| anyhow!("Artifact temp path is not valid UTF-8: {:?}", src))?;
 
         let rustc = Command::new("rustc")
@@ -137,7 +149,11 @@ impl LinterGuard {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let diags = Self::parse_json_diagnostics(&stderr);
             let passed = !diags.iter().any(|d| d.severity == Severity::Error);
-            Ok(ArtifactLintReport { diagnostics: diags, passed, skipped: false })
+            Ok(ArtifactLintReport {
+                diagnostics: diags,
+                passed,
+                skipped: false,
+            })
         }
         .await;
         // Always clean up temp file regardless of lint outcome
@@ -158,7 +174,10 @@ impl LinterGuard {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    async fn run_clippy(workspace_dir: &str, env: Option<&HashMap<String, String>>) -> Result<LintReport> {
+    async fn run_clippy(
+        workspace_dir: &str,
+        env: Option<&HashMap<String, String>>,
+    ) -> Result<LintReport> {
         let ws = workspace_dir.to_string();
         let resolved = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf> {
             let p = Path::new(&ws)
@@ -172,12 +191,21 @@ impl LinterGuard {
         .await
         .map_err(|e| anyhow!("spawn_blocking join error: {}", e))??;
 
-        if tokio::fs::metadata(resolved.join("Cargo.toml")).await.is_err() {
-            return Ok(LintReport { warnings: vec![], errors: vec![], passed: true });
+        if tokio::fs::metadata(resolved.join("Cargo.toml"))
+            .await
+            .is_err()
+        {
+            return Ok(LintReport {
+                warnings: vec![],
+                errors: vec![],
+                passed: true,
+            });
         }
 
         if tokio::fs::metadata(resolved.join("build.rs")).await.is_ok() {
-            return Err(anyhow!("Refusing to lint workspace containing build.rs (arbitrary code execution risk)"));
+            return Err(anyhow!(
+                "Refusing to lint workspace containing build.rs (arbitrary code execution risk)"
+            ));
         }
 
         let mut cmd = Command::new("cargo");
@@ -209,8 +237,12 @@ impl LinterGuard {
                     continue;
                 }
                 let msg = &v["message"];
-                let Some(level_str) = msg["level"].as_str() else { continue; };
-                let Some(text) = msg["message"].as_str() else { continue; };
+                let Some(level_str) = msg["level"].as_str() else {
+                    continue;
+                };
+                let Some(text) = msg["message"].as_str() else {
+                    continue;
+                };
                 let code = msg["code"]["code"].as_str().map(|s| s.to_string());
 
                 let (line_n, col_n) = msg["spans"]
@@ -244,15 +276,23 @@ impl LinterGuard {
         }
 
         let passed = errors.is_empty();
-        Ok(LintReport { warnings, errors, passed })
+        Ok(LintReport {
+            warnings,
+            errors,
+            passed,
+        })
     }
 
     fn parse_json_diagnostics(stderr: &str) -> Vec<Diagnostic> {
         let mut diags = Vec::new();
         for line in stderr.lines() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                let Some(level_str) = v["level"].as_str() else { continue; };
-                let Some(text) = v["message"].as_str() else { continue; };
+                let Some(level_str) = v["level"].as_str() else {
+                    continue;
+                };
+                let Some(text) = v["message"].as_str() else {
+                    continue;
+                };
                 let code = v["code"]["code"].as_str().map(|s| s.to_string());
                 let (line_n, col_n) = v["spans"]
                     .as_array()
@@ -325,7 +365,11 @@ impl LinterGuard {
     fn only_comments_changed(content: &str) -> bool {
         content.lines().all(|l| {
             let t = l.trim();
-            t.is_empty() || t.starts_with("//") || t.starts_with('#') || t.starts_with("/*") || t.starts_with('*')
+            t.is_empty()
+                || t.starts_with("//")
+                || t.starts_with('#')
+                || t.starts_with("/*")
+                || t.starts_with('*')
         })
     }
 
@@ -347,7 +391,11 @@ impl LinterGuard {
             "clippy::needless_return" => Some(SuggestedFix {
                 description: "Remove explicit return from last expression".to_string(),
                 original: diag.message.clone(),
-                replacement: diag.message.trim_start_matches("return ").trim_end_matches(';').to_string(),
+                replacement: diag
+                    .message
+                    .trim_start_matches("return ")
+                    .trim_end_matches(';')
+                    .to_string(),
                 safe: true,
             }),
             _ => None,

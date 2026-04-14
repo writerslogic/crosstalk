@@ -170,7 +170,10 @@ impl PermissionManager {
         tool_name: &str,
         args: &serde_json::Value,
     ) -> Result<(), PermissionError> {
-        let tier = self.tiers.get(agent_id).unwrap_or(&PermissionTier::ReadOnly);
+        let tier = self
+            .tiers
+            .get(agent_id)
+            .unwrap_or(&PermissionTier::ReadOnly);
         match tier {
             PermissionTier::Full => Ok(()),
             PermissionTier::ReadOnly => {
@@ -207,12 +210,10 @@ impl PermissionManager {
         let path_str = path.to_string_lossy().to_string();
 
         // Resolve symlinks; fall back to lexical normalization when path doesn't exist yet.
-        let canonical = std::fs::canonicalize(path)
-            .unwrap_or_else(|_| Self::normalize_path(path));
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| Self::normalize_path(path));
 
         let in_allowed = allowed_dirs.iter().any(|a| {
-            let canon_a = std::fs::canonicalize(a)
-                .unwrap_or_else(|_| Self::normalize_path(a));
+            let canon_a = std::fs::canonicalize(a).unwrap_or_else(|_| Self::normalize_path(a));
             canonical.starts_with(&canon_a)
         });
 
@@ -242,12 +243,10 @@ impl PermissionManager {
             }
             let p = Path::new(&s);
             Self::validate_path_strict(p, allowed).map_err(|e| match e {
-                PermissionError::PathTraversal(_) => {
-                    PermissionError::PathTraversal(format!(
-                        "Attempted path traversal: {} blocked",
-                        s
-                    ))
-                }
+                PermissionError::PathTraversal(_) => PermissionError::PathTraversal(format!(
+                    "Attempted path traversal: {} blocked",
+                    s
+                )),
                 PermissionError::PathOutOfScope(_) => PermissionError::PathOutOfScope(format!(
                     "Path '{}' is outside allowed directories",
                     s
@@ -263,8 +262,10 @@ impl PermissionManager {
         Self::collect_strings(args, &mut strings);
         strings.iter().any(|s| {
             let t = s.trim();
-            t == "rm" || t.starts_with("rm ")
-                || t == "mv" || t.starts_with("mv ")
+            t == "rm"
+                || t.starts_with("rm ")
+                || t == "mv"
+                || t.starts_with("mv ")
                 || t.contains('>')
         })
     }
@@ -387,10 +388,7 @@ impl McpGateway {
                 while let Ok(Some(msg)) = transport.next_message().await {
                     if let Ok(req) = serde_json::from_str::<JsonRpcRequest>(&msg) {
                         let result = if req.method == "tools/call" {
-                            let name = req.params["name"]
-                                .as_str()
-                                .unwrap_or("")
-                                .to_string();
+                            let name = req.params["name"].as_str().unwrap_or("").to_string();
                             let args = req.params["arguments"].clone();
 
                             let prepared = {
@@ -411,8 +409,8 @@ impl McpGateway {
 
                                     match timeout(tool_timeout, fut).await {
                                         Ok(join_result) => {
-                                            let invoke_result = join_result
-                                                .map_err(|e| anyhow!("{}", e));
+                                            let invoke_result =
+                                                join_result.map_err(|e| anyhow!("{}", e));
                                             match invoke_result {
                                                 Ok(tool_res) => {
                                                     let mut g = gateway.lock().await;
@@ -561,7 +559,10 @@ impl McpGateway {
         args: serde_json::Value,
     ) -> Result<ToolResult> {
         if self.timeout_manager.is_disabled(name) {
-            return Err(anyhow!("Tool {} is disabled due to repeated timeouts", name));
+            return Err(anyhow!(
+                "Tool {} is disabled due to repeated timeouts",
+                name
+            ));
         }
 
         if let Err(e) = self.permissions.check_with_reason(agent_id, name, &args) {
@@ -617,7 +618,11 @@ impl McpGateway {
                         "Timeout after {}s (occurrence {}){}",
                         tool_timeout.as_secs(),
                         count,
-                        if now_disabled { " — tool disabled" } else { "" }
+                        if now_disabled {
+                            " — tool disabled"
+                        } else {
+                            ""
+                        }
                     )),
                     elapsed_ms: tool_timeout.as_millis() as u64,
                 })
@@ -634,7 +639,10 @@ impl McpGateway {
         args: serde_json::Value,
     ) -> Result<PreparedToolCall> {
         if self.timeout_manager.is_disabled(name) {
-            return Err(anyhow!("Tool {} is disabled due to repeated timeouts", name));
+            return Err(anyhow!(
+                "Tool {} is disabled due to repeated timeouts",
+                name
+            ));
         }
 
         if let Err(e) = self.permissions.check_with_reason(agent_id, name, &args) {
@@ -687,7 +695,11 @@ impl McpGateway {
                 "Timeout after {}s (occurrence {}){}",
                 tool_timeout.as_secs(),
                 count,
-                if now_disabled { " -- tool disabled" } else { "" }
+                if now_disabled {
+                    " -- tool disabled"
+                } else {
+                    ""
+                }
             )),
             elapsed_ms: tool_timeout.as_millis() as u64,
         }

@@ -1,6 +1,6 @@
 use crosstalk::engines::swarm::{
-    AgentAssigner, ConflictDetector, ConflictSeverity, GlobalMergeGate, LeaderElection,
-    NodeStatus, ProgressMonitor, SwarmController, SwarmTelemetry, TaskDecomposer,
+    AgentAssigner, ConflictDetector, ConflictSeverity, GlobalMergeGate, LeaderElection, NodeStatus,
+    ProgressMonitor, SwarmController, SwarmTelemetry, TaskDecomposer,
 };
 use crosstalk::types::consensus::MergeVote;
 use dashmap::DashMap;
@@ -60,8 +60,9 @@ fn assign_empty_capabilities_returns_empty() {
 #[test]
 fn assign_picks_highest_capability_agent() {
     let tasks = TaskDecomposer::decompose("A.", 1);
-    let caps: HashMap<String, f64> =
-        [("weak".into(), 0.3), ("strong".into(), 0.9)].into_iter().collect();
+    let caps: HashMap<String, f64> = [("weak".into(), 0.3), ("strong".into(), 0.9)]
+        .into_iter()
+        .collect();
     let result = AgentAssigner::assign(&tasks, &caps);
     assert_eq!(result["task-0"], "strong");
 }
@@ -164,9 +165,21 @@ fn merge_gate_empty_votes_no_quorum() {
 #[test]
 fn merge_gate_majority_approves_quorum() {
     let votes = vec![
-        MergeVote { node_id: "a".into(), approve: true, reason: String::new() },
-        MergeVote { node_id: "b".into(), approve: true, reason: String::new() },
-        MergeVote { node_id: "c".into(), approve: false, reason: String::new() },
+        MergeVote {
+            node_id: "a".into(),
+            approve: true,
+            reason: String::new(),
+        },
+        MergeVote {
+            node_id: "b".into(),
+            approve: true,
+            reason: String::new(),
+        },
+        MergeVote {
+            node_id: "c".into(),
+            approve: false,
+            reason: String::new(),
+        },
     ];
     assert!(GlobalMergeGate::has_quorum(&votes, 3));
 }
@@ -174,9 +187,21 @@ fn merge_gate_majority_approves_quorum() {
 #[test]
 fn merge_gate_minority_approves_no_quorum() {
     let votes = vec![
-        MergeVote { node_id: "a".into(), approve: true, reason: String::new() },
-        MergeVote { node_id: "b".into(), approve: false, reason: String::new() },
-        MergeVote { node_id: "c".into(), approve: false, reason: String::new() },
+        MergeVote {
+            node_id: "a".into(),
+            approve: true,
+            reason: String::new(),
+        },
+        MergeVote {
+            node_id: "b".into(),
+            approve: false,
+            reason: String::new(),
+        },
+        MergeVote {
+            node_id: "c".into(),
+            approve: false,
+            reason: String::new(),
+        },
     ];
     assert!(!GlobalMergeGate::has_quorum(&votes, 3));
 }
@@ -210,10 +235,8 @@ impl crosstalk::engines::swarm::RaftNetwork for AlwaysDenyNetwork {
 #[tokio::test]
 async fn election_wins_when_all_peers_grant() {
     let mut election = LeaderElection::new("node-0");
-    let peers: Vec<Arc<AlwaysGrantNetwork>> = vec![
-        Arc::new(AlwaysGrantNetwork),
-        Arc::new(AlwaysGrantNetwork),
-    ];
+    let peers: Vec<Arc<AlwaysGrantNetwork>> =
+        vec![Arc::new(AlwaysGrantNetwork), Arc::new(AlwaysGrantNetwork)];
     let (_tx, rx) = mpsc::channel(1);
     let won = election.run_election_cycle(&peers, rx).await;
     assert!(won, "should win election when all peers grant vote");

@@ -113,15 +113,29 @@ impl GoalTree {
     #[must_use]
     pub fn analyze(&self) -> GoalTreeAnalysis {
         match &self.root {
-            None => GoalTreeAnalysis { depth: 0, leaf_count: 0, total_count: 0, completion_ratio: 0.0 },
+            None => GoalTreeAnalysis {
+                depth: 0,
+                leaf_count: 0,
+                total_count: 0,
+                completion_ratio: 0.0,
+            },
             Some(root) => {
                 let depth = Self::compute_depth(root);
                 let mut total = 0usize;
                 let mut complete = 0usize;
                 let mut leaves = 0usize;
                 Self::collect_stats(root, &mut total, &mut complete, &mut leaves);
-                let completion_ratio = if total == 0 { 0.0 } else { complete as f64 / total as f64 };
-                GoalTreeAnalysis { depth, leaf_count: leaves, total_count: total, completion_ratio }
+                let completion_ratio = if total == 0 {
+                    0.0
+                } else {
+                    complete as f64 / total as f64
+                };
+                GoalTreeAnalysis {
+                    depth,
+                    leaf_count: leaves,
+                    total_count: total,
+                    completion_ratio,
+                }
             }
         }
     }
@@ -130,7 +144,12 @@ impl GoalTree {
         if node.children.is_empty() {
             return 1;
         }
-        1 + node.children.iter().map(Self::compute_depth).max().unwrap_or(0)
+        1 + node
+            .children
+            .iter()
+            .map(Self::compute_depth)
+            .max()
+            .unwrap_or(0)
     }
 
     fn collect_stats(node: &GoalNode, total: &mut usize, complete: &mut usize, leaves: &mut usize) {

@@ -1,5 +1,5 @@
 use crosstalk::engines::planning::{
-    BranchManager, BranchRegistry, CriticalPathAnalyzer, ContextPruner, DifficultyEstimator,
+    BranchManager, BranchRegistry, ContextPruner, CriticalPathAnalyzer, DifficultyEstimator,
     GoalScheduler, MilestoneDetector, PlanningEngine, SessionManager,
 };
 use crosstalk::types::conversation::{ConversationState, Turn, TurnOutcome};
@@ -44,7 +44,9 @@ fn goal_tree_empty_has_zero_leaves() {
 
 #[test]
 fn goal_tree_add_child_inserts_under_parent() {
-    let mut tree = GoalTree { root: Some(make_node("root", "Root", GoalStatus::Pending)) };
+    let mut tree = GoalTree {
+        root: Some(make_node("root", "Root", GoalStatus::Pending)),
+    };
     let child = make_node("c1", "Child 1", GoalStatus::Pending);
     assert!(tree.add_child("root", child));
     assert_eq!(tree.root.as_ref().unwrap().children.len(), 1);
@@ -52,13 +54,17 @@ fn goal_tree_add_child_inserts_under_parent() {
 
 #[test]
 fn goal_tree_add_child_returns_false_for_unknown_parent() {
-    let mut tree = GoalTree { root: Some(make_node("root", "Root", GoalStatus::Pending)) };
+    let mut tree = GoalTree {
+        root: Some(make_node("root", "Root", GoalStatus::Pending)),
+    };
     assert!(!tree.add_child("nonexistent", make_node("x", "X", GoalStatus::Pending)));
 }
 
 #[test]
 fn goal_tree_get_leaves_returns_childless_nodes() {
-    let mut tree = GoalTree { root: Some(make_node("root", "Root", GoalStatus::Pending)) };
+    let mut tree = GoalTree {
+        root: Some(make_node("root", "Root", GoalStatus::Pending)),
+    };
     tree.add_child("root", make_node("c1", "C1", GoalStatus::Complete));
     tree.add_child("root", make_node("c2", "C2", GoalStatus::Pending));
     let leaves = tree.get_leaves();
@@ -70,7 +76,9 @@ fn goal_tree_get_leaves_returns_childless_nodes() {
 
 #[test]
 fn goal_tree_get_subtree_finds_nested_node() {
-    let mut tree = GoalTree { root: Some(make_node("root", "Root", GoalStatus::Pending)) };
+    let mut tree = GoalTree {
+        root: Some(make_node("root", "Root", GoalStatus::Pending)),
+    };
     tree.add_child("root", make_node("child", "Child", GoalStatus::InProgress));
     let sub = tree.get_subtree("child");
     assert!(sub.is_some());
@@ -79,13 +87,17 @@ fn goal_tree_get_subtree_finds_nested_node() {
 
 #[test]
 fn goal_tree_get_subtree_returns_none_for_missing() {
-    let tree = GoalTree { root: Some(make_node("root", "Root", GoalStatus::Pending)) };
+    let tree = GoalTree {
+        root: Some(make_node("root", "Root", GoalStatus::Pending)),
+    };
     assert!(tree.get_subtree("missing").is_none());
 }
 
 #[test]
 fn goal_tree_analyze_depth_five_levels() {
-    let mut tree = GoalTree { root: Some(make_node("l1", "L1", GoalStatus::Pending)) };
+    let mut tree = GoalTree {
+        root: Some(make_node("l1", "L1", GoalStatus::Pending)),
+    };
     tree.add_child("l1", make_node("l2", "L2", GoalStatus::Pending));
     tree.add_child("l2", make_node("l3", "L3", GoalStatus::Pending));
     tree.add_child("l3", make_node("l4", "L4", GoalStatus::Pending));
@@ -99,7 +111,9 @@ fn goal_tree_analyze_depth_five_levels() {
 
 #[test]
 fn goal_tree_completion_ratio_all_complete() {
-    let mut tree = GoalTree { root: Some(make_node("r", "R", GoalStatus::Complete)) };
+    let mut tree = GoalTree {
+        root: Some(make_node("r", "R", GoalStatus::Complete)),
+    };
     tree.add_child("r", make_node("c1", "C1", GoalStatus::Complete));
     tree.add_child("r", make_node("c2", "C2", GoalStatus::Complete));
     assert!((tree.completion_ratio() - 1.0).abs() < 1e-9);
@@ -110,8 +124,10 @@ fn goal_tree_completion_ratio_all_complete() {
 #[test]
 fn update_goal_status_all_children_complete_marks_parent() {
     let mut root = make_node("r", "Root", GoalStatus::Pending);
-    root.children.push(make_node("c1", "C1", GoalStatus::Complete));
-    root.children.push(make_node("c2", "C2", GoalStatus::Complete));
+    root.children
+        .push(make_node("c1", "C1", GoalStatus::Complete));
+    root.children
+        .push(make_node("c2", "C2", GoalStatus::Complete));
     PlanningEngine::update_goal_status(&mut root);
     assert_eq!(root.status, GoalStatus::Complete);
 }
@@ -119,8 +135,10 @@ fn update_goal_status_all_children_complete_marks_parent() {
 #[test]
 fn update_goal_status_blocked_child_blocks_parent() {
     let mut root = make_node("r", "Root", GoalStatus::Pending);
-    root.children.push(make_node("c1", "C1", GoalStatus::Complete));
-    root.children.push(make_node("c2", "C2", GoalStatus::Blocked));
+    root.children
+        .push(make_node("c1", "C1", GoalStatus::Complete));
+    root.children
+        .push(make_node("c2", "C2", GoalStatus::Blocked));
     PlanningEngine::update_goal_status(&mut root);
     assert_eq!(root.status, GoalStatus::Blocked);
 }
@@ -128,8 +146,10 @@ fn update_goal_status_blocked_child_blocks_parent() {
 #[test]
 fn update_goal_status_inprogress_child_sets_parent_inprogress() {
     let mut root = make_node("r", "Root", GoalStatus::Pending);
-    root.children.push(make_node("c1", "C1", GoalStatus::InProgress));
-    root.children.push(make_node("c2", "C2", GoalStatus::Pending));
+    root.children
+        .push(make_node("c1", "C1", GoalStatus::InProgress));
+    root.children
+        .push(make_node("c2", "C2", GoalStatus::Pending));
     PlanningEngine::update_goal_status(&mut root);
     assert_eq!(root.status, GoalStatus::InProgress);
 }
@@ -170,16 +190,23 @@ fn scheduler_empty_tree_returns_empty() {
 
 #[test]
 fn scheduler_flat_tree_single_root_has_batches() {
-    let tree = GoalTree { root: Some(make_node("root", "Root", GoalStatus::Pending)) };
+    let tree = GoalTree {
+        root: Some(make_node("root", "Root", GoalStatus::Pending)),
+    };
     let batches = GoalScheduler::schedule(&tree).unwrap();
     assert!(!batches.is_empty());
-    let all_ids: Vec<&str> = batches.iter().flat_map(|b| b.iter().map(|s| s.as_str())).collect();
+    let all_ids: Vec<&str> = batches
+        .iter()
+        .flat_map(|b| b.iter().map(|s| s.as_str()))
+        .collect();
     assert!(all_ids.contains(&"root"));
 }
 
 #[test]
 fn scheduler_parent_in_different_batch_from_child() {
-    let mut tree = GoalTree { root: Some(make_node("parent", "Parent", GoalStatus::Pending)) };
+    let mut tree = GoalTree {
+        root: Some(make_node("parent", "Parent", GoalStatus::Pending)),
+    };
     tree.add_child("parent", make_node("child", "Child", GoalStatus::Pending));
     let batches = GoalScheduler::schedule(&tree).unwrap();
     // There should be at least 2 batches (parent depends on child)
@@ -196,13 +223,17 @@ fn critical_path_empty_tree_is_empty() {
 
 #[test]
 fn critical_path_single_node() {
-    let tree = GoalTree { root: Some(make_node("only", "Only", GoalStatus::Pending)) };
+    let tree = GoalTree {
+        root: Some(make_node("only", "Only", GoalStatus::Pending)),
+    };
     assert_eq!(CriticalPathAnalyzer::compute(&tree), vec!["only"]);
 }
 
 #[test]
 fn critical_path_follows_longest_branch() {
-    let mut tree = GoalTree { root: Some(make_node("root", "Root", GoalStatus::Pending)) };
+    let mut tree = GoalTree {
+        root: Some(make_node("root", "Root", GoalStatus::Pending)),
+    };
     tree.add_child("root", make_node("short", "Short", GoalStatus::Pending));
     tree.add_child("root", make_node("long", "Long", GoalStatus::Pending));
     tree.add_child("long", make_node("deeper", "Deeper", GoalStatus::Pending));
@@ -226,7 +257,8 @@ fn milestone_triggered_at_fifty_percent() {
     let mut sigma = ConversationState::new("ms-half");
     // 1 complete out of 2 total = 0.5 ratio
     let mut root = make_node("r", "Root", GoalStatus::Pending);
-    root.children.push(make_node("c1", "C1", GoalStatus::Complete));
+    root.children
+        .push(make_node("c1", "C1", GoalStatus::Complete));
     sigma.goal_tree = GoalTree { root: Some(root) };
     let m = MilestoneDetector::check(&sigma, 0.0);
     assert!(m.is_some());
@@ -237,7 +269,8 @@ fn milestone_triggered_at_fifty_percent() {
 fn milestone_no_duplicate_when_already_past_threshold() {
     let mut sigma = ConversationState::new("ms-dup");
     let mut root = make_node("r", "Root", GoalStatus::Pending);
-    root.children.push(make_node("c1", "C1", GoalStatus::Complete));
+    root.children
+        .push(make_node("c1", "C1", GoalStatus::Complete));
     sigma.goal_tree = GoalTree { root: Some(root) };
     // prev_ratio already at 0.5 → no duplicate trigger
     assert!(MilestoneDetector::check(&sigma, 0.5).is_none());
@@ -297,7 +330,8 @@ fn session_manager_list_returns_saved_ids() {
 fn session_manager_delete_removes_entry() {
     let dir = tempdir().unwrap();
     let mgr = SessionManager::new(dir.path().to_str().unwrap()).unwrap();
-    mgr.save("to-delete", &ConversationState::new("to-delete")).unwrap();
+    mgr.save("to-delete", &ConversationState::new("to-delete"))
+        .unwrap();
     mgr.delete("to-delete").unwrap();
     assert!(mgr.load("to-delete").is_err());
 }
@@ -311,7 +345,10 @@ fn context_pruner_returns_recent_turns() {
         sigma.turns.push(make_turn(i, TurnOutcome::Unknown));
     }
     let pruned = ContextPruner::prune(&sigma, "root", 5);
-    assert!(pruned.len() <= 5 + 5, "should return at most max_turns + 5 critical");
+    assert!(
+        pruned.len() <= 5 + 5,
+        "should return at most max_turns + 5 critical"
+    );
 }
 
 #[test]
@@ -360,7 +397,12 @@ fn checksum_mismatch_returns_error() {
     let bad_ck = [0u8; 32];
     let result = mgr.load_with_checksum("ck-fail", &bad_ck);
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Checksum mismatch"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Checksum mismatch")
+    );
 }
 
 // ── SessionManifest ────────────────────────────────────────────────────────────
@@ -390,7 +432,10 @@ fn branch_registry_records_parent_lineage() {
     let reg = BranchRegistry::new(dir.path().to_str().unwrap()).unwrap();
     reg.register("child-1", "parent-root").unwrap();
     reg.register("child-2", "parent-root").unwrap();
-    assert_eq!(reg.parent_of("child-1").unwrap().as_deref(), Some("parent-root"));
+    assert_eq!(
+        reg.parent_of("child-1").unwrap().as_deref(),
+        Some("parent-root")
+    );
     let children = reg.list_children("parent-root").unwrap();
     assert_eq!(children.len(), 2);
 }

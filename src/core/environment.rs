@@ -24,7 +24,10 @@ pub struct NixManager {
 impl NixManager {
     pub fn new(deps: Vec<String>) -> Result<Self> {
         for dep in &deps {
-            if !dep.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            if !dep
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            {
                 return Err(anyhow!("invalid dependency name: {}", dep));
             }
         }

@@ -1,27 +1,32 @@
 use crate::types::conversation::{ConversationState, Turn, TurnOutcome};
-use std::sync::OnceLock;
+pub use crate::types::memory::OutcomeRecord;
 use crate::types::memory::{
     DeletionLogEntry, MemoryRecord, MemoryStoreStats, SnapshotBundle, SnapshotMetadata,
 };
-pub use crate::types::memory::OutcomeRecord;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use arrow_array::{
     Array, Float32Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array,
     array::FixedSizeListArray,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema};
+use fastembed::{ExecutionProviderDispatch, InitOptions, TextEmbedding};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use futures::StreamExt;
-use lancedb::{connect, connection::Connection, query::{ExecutableQuery, QueryBase}, table::Table};
+use lancedb::{
+    connect,
+    connection::Connection,
+    query::{ExecutableQuery, QueryBase},
+    table::Table,
+};
+use ort::{CPUExecutionProvider, CoreMLExecutionProvider};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::sync::Arc;
-use fastembed::{TextEmbedding, InitOptions, ExecutionProviderDispatch};
-use ort::{CoreMLExecutionProvider, CPUExecutionProvider};
 use std::panic;
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 const EMBEDDING_DIM: usize = 384;
 const DEFAULT_TABLE: &str = "memory";
@@ -190,14 +195,17 @@ fn batch_to_records(batch: &RecordBatch, dim: usize) -> Result<Vec<MemoryRecord>
                 ));
             }
             let embedding: Vec<f32> = (0..dim).map(|j| float_vals.value(j)).collect();
+            let meta_str = metadata_col.value(i).to_string();
+            let is_neg = meta_str.contains("\"is_negative\":true");
             Ok(MemoryRecord {
                 turn_id: turn_ids.value(i),
                 session_id: session_ids.value(i).to_string(),
                 embedding,
                 content_hash: content_hashes.value(i).to_string(),
                 timestamp: timestamps.value(i),
-                metadata_json: metadata_col.value(i).to_string(),
+                metadata_json: meta_str,
                 outcome: None,
+                is_negative: is_neg,
             })
         })
         .collect()
@@ -223,6 +231,24 @@ fn outcome_weight(outcome: &TurnOutcome) -> f64 {
         TurnOutcome::RolledBack => 0.3,
         TurnOutcome::Rejected => 0.2,
     }
+}
+
+fn parse_outcome_from_metadata(meta: &str) -> TurnOutcome {
+    if let Some(start) = meta.find("\"outcome\":\"") {
+        let rest = &meta[start + 11..];
+        if let Some(end) = rest.find('"') {
+            return match &rest[..end] {
+                "TestsPassed" => TurnOutcome::TestsPassed,
+                "AdvancedConvergence" => TurnOutcome::AdvancedConvergence,
+                "Compiled" => TurnOutcome::Compiled,
+                "Stalled" => TurnOutcome::Stalled,
+                "RolledBack" => TurnOutcome::RolledBack,
+                "Rejected" => TurnOutcome::Rejected,
+                _ => TurnOutcome::Unknown,
+            };
+        }
+    }
+    TurnOutcome::Unknown
 }
 
 pub struct MemoryStore {
@@ -262,7 +288,10 @@ impl MemoryStore {
     }
 
     pub async fn get_or_create_table(&self, name: &str) -> Result<Table> {
-        let conn = self.conn.as_ref().ok_or_else(|| anyhow!("Database not connected"))?;
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(|| anyhow!("Database not connected"))?;
         match conn.open_table(name).execute().await {
             Ok(t) => Ok(t),
             Err(_) => {
@@ -281,10 +310,16 @@ impl MemoryStore {
                     Field::new("timestamp", DataType::UInt64, false),
                     Field::new("metadata", DataType::Utf8, false),
                 ]));
-                conn.create_table(name, RecordBatchIterator::new(vec![] as Vec<Result<RecordBatch, ArrowError>>, schema))
-                    .execute()
-                    .await
-                    .context("Failed to create LanceDB table")
+                conn.create_table(
+                    name,
+                    RecordBatchIterator::new(
+                        vec![] as Vec<Result<RecordBatch, ArrowError>>,
+                        schema,
+                    ),
+                )
+                .execute()
+                .await
+                .context("Failed to create LanceDB table")
             }
         }
     }
@@ -320,12 +355,14 @@ impl MemoryStore {
 
         let turn_ids = UInt32Array::from_iter_values(records.iter().map(|r| r.turn_id));
         let session_ids = StringArray::from_iter_values(records.iter().map(|r| &r.session_id));
-        let content_hashes =
-            StringArray::from_iter_values(records.iter().map(|r| &r.content_hash));
+        let content_hashes = StringArray::from_iter_values(records.iter().map(|r| &r.content_hash));
         let timestamps = UInt64Array::from_iter_values(records.iter().map(|r| r.timestamp));
         let metadata = StringArray::from_iter_values(records.iter().map(|r| &r.metadata_json));
 
-        let flattened: Vec<f32> = records.iter().flat_map(|r| r.embedding.iter().copied()).collect();
+        let flattened: Vec<f32> = records
+            .iter()
+            .flat_map(|r| r.embedding.iter().copied())
+            .collect();
         let vector_values = Arc::new(Float32Array::from(flattened));
         let field = Arc::new(Field::new("item", DataType::Float32, true));
         let vector_array =
@@ -361,7 +398,9 @@ impl MemoryStore {
         top_k: usize,
     ) -> Result<Vec<(MemoryRecord, f64)>> {
         let mut embeddings = embed_texts(vec![query_text.to_string()]).await?;
-        let query_vector = embeddings.pop().ok_or_else(|| anyhow!("embed_texts returned no vectors"))?;
+        let query_vector = embeddings
+            .pop()
+            .ok_or_else(|| anyhow!("embed_texts returned no vectors"))?;
 
         let table = self.get_or_create_table(table_name).await?;
 
@@ -372,6 +411,10 @@ impl MemoryStore {
             .await?;
 
         let mut weighted_results = Vec::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
 
         while let Some(batch_res) = stream.next().await {
             let batch = batch_res?;
@@ -396,28 +439,37 @@ impl MemoryStore {
             for i in 0..batch.num_rows() {
                 let similarity = 1.0 / (1.0 + distances.value(i) as f64);
 
+                let meta_str = metadata.value(i).to_string();
+                let is_neg = meta_str.contains("\"is_negative\":true");
+                let parsed_outcome = parse_outcome_from_metadata(&meta_str);
+                let ts = timestamps.value(i);
+                let age_days = (now.saturating_sub(ts)) as f64 / 86400.0;
+                let decay = (-age_days / 30.0).exp();
                 let record = MemoryRecord {
                     turn_id: turn_ids.value(i),
                     session_id: session_ids.value(i).to_string(),
                     embedding: vec![],
                     content_hash: content_hashes.value(i).to_string(),
-                    timestamp: timestamps.value(i),
-                    metadata_json: metadata.value(i).to_string(),
+                    timestamp: ts,
+                    metadata_json: meta_str,
                     outcome: None,
+                    is_negative: is_neg,
                 };
 
-                let weight = outcome_weight(&TurnOutcome::Unknown);
-                weighted_results.push((record, similarity * weight));
+                let weight = outcome_weight(&parsed_outcome);
+                weighted_results.push((record, similarity * weight * decay));
             }
         }
 
-        weighted_results
-            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        weighted_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(weighted_results.into_iter().take(top_k).collect())
     }
 
     fn validate_session_id(session_id: &str) -> Result<()> {
-        if session_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        if session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
             Ok(())
         } else {
             Err(anyhow!("Invalid session_id: must match [a-zA-Z0-9_-]+"))
@@ -431,7 +483,9 @@ impl MemoryStore {
 
     fn turn_session_filter(turn_id: u32, session_id: &str) -> Result<String> {
         Self::validate_session_id(session_id)?;
-        Ok(format!("turn_id = {turn_id} AND session_id = '{session_id}'"))
+        Ok(format!(
+            "turn_id = {turn_id} AND session_id = '{session_id}'"
+        ))
     }
 
     fn turn_ids_filter(turn_ids: &[u32]) -> String {
@@ -443,18 +497,10 @@ impl MemoryStore {
         format!("turn_id IN ({ids_str})")
     }
 
-    async fn scan_session(
-        &self,
-        table_name: &str,
-        session_id: &str,
-    ) -> Result<Vec<MemoryRecord>> {
+    async fn scan_session(&self, table_name: &str, session_id: &str) -> Result<Vec<MemoryRecord>> {
         let filter = Self::session_filter(session_id)?;
         let table = self.get_or_create_table(table_name).await?;
-        let mut stream = table
-            .query()
-            .only_if(filter)
-            .execute()
-            .await?;
+        let mut stream = table.query().only_if(filter).execute().await?;
 
         let mut records = Vec::new();
         while let Some(batch_res) = stream.next().await {
@@ -477,8 +523,8 @@ impl MemoryStore {
     pub async fn snapshot(&self, session_id: &str) -> Result<Vec<u8>> {
         let records = self.scan_session(DEFAULT_TABLE, session_id).await?;
 
-        let records_bytes = bincode::serialize(&records)
-            .map_err(|e| anyhow!("Bincode serialize failed: {e}"))?;
+        let records_bytes =
+            bincode::serialize(&records).map_err(|e| anyhow!("Bincode serialize failed: {e}"))?;
 
         let content_hash: [u8; 32] = {
             let mut h = Sha256::new();
@@ -526,7 +572,9 @@ impl MemoryStore {
         let bundle_bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
             let decoder = GzDecoder::new(&bytes[..]);
             let mut decompressed = Vec::new();
-            decoder.take(MAX_SNAPSHOT_BYTES).read_to_end(&mut decompressed)?;
+            decoder
+                .take(MAX_SNAPSHOT_BYTES)
+                .read_to_end(&mut decompressed)?;
             decompressed
         } else {
             bytes
@@ -600,11 +648,7 @@ impl MemoryStore {
 
         let filter = Self::turn_ids_filter(&turn_ids);
         let table = self.get_or_create_table(DEFAULT_TABLE).await?;
-        let mut stream = table
-            .query()
-            .only_if(filter)
-            .execute()
-            .await?;
+        let mut stream = table.query().only_if(filter).execute().await?;
 
         let mut records = Vec::new();
         while let Some(batch_res) = stream.next().await {
@@ -653,8 +697,7 @@ impl MemoryStore {
         let avg_cluster_size = if cluster_counts.is_empty() {
             0.0
         } else {
-            cluster_counts.values().map(|&c| c as f64).sum::<f64>()
-                / cluster_counts.len() as f64
+            cluster_counts.values().map(|&c| c as f64).sum::<f64>() / cluster_counts.len() as f64
         };
 
         Ok(MemoryStoreStats {
@@ -675,7 +718,11 @@ impl ContextDistiller {
     }
 
     #[must_use]
-    pub fn distill_with_decay(sigma: &ConversationState, max_chars: usize, decay_rate: f64) -> String {
+    pub fn distill_with_decay(
+        sigma: &ConversationState,
+        max_chars: usize,
+        decay_rate: f64,
+    ) -> String {
         let now = ConversationState::now();
         let mut scored_turns: Vec<(&Turn, f64)> = sigma
             .turns
@@ -687,8 +734,7 @@ impl ContextDistiller {
             })
             .collect();
 
-        scored_turns
-            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored_turns.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut distilled = format!("Session: {} (Distilled Context)\n", sigma.session_id);
 
@@ -716,7 +762,7 @@ impl ContextDistiller {
 
         let k = k.clamp(1, sigma.turns.len());
         let clusters = SemanticClusterer::cluster(&sigma.turns, k).unwrap_or_default();
-        
+
         let mut picked_indices = HashSet::new();
         for cluster in &clusters {
             // Pick the latest turn from each cluster as the representative.
@@ -725,11 +771,16 @@ impl ContextDistiller {
             }
         }
 
-        let mut distilled = format!("Session: {} (Diverse Distilled Context)\n", sigma.session_id);
-        let mut picked_turns: Vec<&Turn> = sigma.turns.iter()
+        let mut distilled = format!(
+            "Session: {} (Diverse Distilled Context)\n",
+            sigma.session_id
+        );
+        let mut picked_turns: Vec<&Turn> = sigma
+            .turns
+            .iter()
             .filter(|t| picked_indices.contains(&t.index))
             .collect();
-        
+
         // Sort by index to maintain temporal flow.
         picked_turns.sort_by_key(|t| t.index);
 
@@ -756,9 +807,7 @@ impl FailurePredictor {
         failures: &[crate::types::memory::FailureSignature],
     ) -> Option<String> {
         for failure in failures {
-            if context.contains(&failure.error_type)
-                || context.contains(&failure.error_message)
-            {
+            if context.contains(&failure.error_type) || context.contains(&failure.error_message) {
                 return Some(format!(
                     "Warning: {} detected in context",
                     failure.error_type
@@ -782,10 +831,7 @@ impl LessonExtractor {
                 approach: format!("Approach used by {}", t.model_id),
                 outcome: "Success (Tests Passed)".to_string(),
                 confidence: 0.95,
-                applicability_tags: vec![
-                    "passing_tests".to_string(),
-                    "tested".to_string(),
-                ],
+                applicability_tags: vec!["passing_tests".to_string(), "tested".to_string()],
             })
             .collect()
     }
@@ -810,16 +856,21 @@ impl MemoryBridge {
     }
 
     pub fn open_session(&mut self, session_id: String) {
-        self.sessions.entry(session_id).or_insert_with(|| BridgeSessionContext {
-            last_recall_turn: None,
-        });
+        self.sessions
+            .entry(session_id)
+            .or_insert_with(|| BridgeSessionContext {
+                last_recall_turn: None,
+            });
     }
 
     pub fn push_record(&mut self, session_id: &str, mut record: MemoryRecord) {
         if record.embedding.len() != EMBEDDING_DIM {
             record.embedding = embed_text(&record.content_hash);
         }
-        self.records.entry(session_id.to_string()).or_default().push(record);
+        self.records
+            .entry(session_id.to_string())
+            .or_default()
+            .push(record);
     }
 
     pub async fn recall_relevant(
@@ -837,18 +888,102 @@ impl MemoryBridge {
         }
 
         let query_emb = embed_text_async(query_text.to_string()).await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let mut scored: Vec<(MemoryRecord, f64)> = self
             .records
             .values()
             .flat_map(|recs| recs.iter())
+            .filter(|r| !r.is_negative)
             .map(|r| {
                 let sim = cosine_sim(&query_emb, &r.embedding) as f64;
-                (r.clone(), sim * record_weight(r))
+                let age_days = (now.saturating_sub(r.timestamp)) as f64 / 86400.0;
+                let decay = (-age_days / 30.0).exp();
+                (r.clone(), sim * record_weight(r) * decay)
             })
             .collect();
 
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(scored.into_iter().take(n_examples).map(|(r, _)| r).collect())
+        Ok(scored
+            .into_iter()
+            .take(n_examples)
+            .map(|(r, _)| r)
+            .collect())
+    }
+
+    pub async fn recall_antipatterns(
+        &mut self,
+        query_text: &str,
+        n_examples: usize,
+    ) -> Vec<MemoryRecord> {
+        let query_emb = embed_text_async(query_text.to_string()).await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut scored: Vec<(MemoryRecord, f64)> = self
+            .records
+            .values()
+            .flat_map(|recs| recs.iter())
+            .filter(|r| r.is_negative)
+            .map(|r| {
+                let sim = cosine_sim(&query_emb, &r.embedding) as f64;
+                let age_days = (now.saturating_sub(r.timestamp)) as f64 / 86400.0;
+                let decay = (-age_days / 30.0).exp();
+                (r.clone(), sim * record_weight(r) * decay)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored
+            .into_iter()
+            .take(n_examples)
+            .map(|(r, _)| r)
+            .collect()
+    }
+
+    pub fn store_failure_lesson(
+        &mut self,
+        session_id: &str,
+        mortem: &crate::types::self_improvement::PostMortem,
+    ) {
+        let content = format!(
+            "ANTIPATTERN: {:?} — {} failures in session {}",
+            mortem.root_cause,
+            mortem.failure_turn_indices.len(),
+            mortem.session_id,
+        );
+        let embedding = embed_text(&content);
+        let metadata = serde_json::json!({
+            "is_negative": true,
+            "root_cause": format!("{:?}", mortem.root_cause),
+            "failure_count": mortem.failure_turn_indices.len(),
+        });
+        let record = MemoryRecord {
+            turn_id: 0,
+            session_id: session_id.to_string(),
+            embedding,
+            content_hash: content,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            metadata_json: metadata.to_string(),
+            outcome: Some(OutcomeRecord {
+                compiled: false,
+                tests_passed: false,
+                quality_delta: -1.0,
+                was_rolled_back: true,
+                convergence_contribution: 0.0,
+            }),
+            is_negative: true,
+        };
+        self.records
+            .entry(session_id.to_string())
+            .or_default()
+            .push(record);
     }
 
     pub fn session_count(&self) -> usize {
@@ -890,7 +1025,10 @@ impl DecayCalibrator {
 
     #[must_use]
     pub fn new() -> Self {
-        Self { decay_rate: Self::DEFAULT_RATE, useful_turn_ages: Vec::new() }
+        Self {
+            decay_rate: Self::DEFAULT_RATE,
+            useful_turn_ages: Vec::new(),
+        }
     }
 
     /// Record the age (in hours) of a turn that proved useful at retrieval time.
@@ -906,7 +1044,8 @@ impl DecayCalibrator {
         if self.useful_turn_ages.len() < Self::MIN_SAMPLES {
             return;
         }
-        let mean_age = self.useful_turn_ages.iter().sum::<f64>() / self.useful_turn_ages.len() as f64;
+        let mean_age =
+            self.useful_turn_ages.iter().sum::<f64>() / self.useful_turn_ages.len() as f64;
         if mean_age > 0.0 {
             self.decay_rate = (1.0 / mean_age).clamp(0.001, 0.1);
         }
@@ -951,7 +1090,9 @@ impl SemanticClusterer {
 
         let embeddings: Vec<Vec<f32>> = turns.iter().map(|t| embed_text(&t.content)).collect();
 
-        let inertia: Vec<f64> = (1..=max).map(|k| Self::kmeans_inertia(&embeddings, k)).collect();
+        let inertia: Vec<f64> = (1..=max)
+            .map(|k| Self::kmeans_inertia(&embeddings, k))
+            .collect();
 
         // Elbow via largest second derivative (curvature) of the inertia curve.
         if inertia.len() < 3 {
@@ -1037,8 +1178,7 @@ impl SemanticClusterer {
         }
         let k = k_clusters.min(turns.len());
 
-        let embeddings: Vec<Vec<f32>> =
-            turns.iter().map(|t| embed_text(&t.content)).collect();
+        let embeddings: Vec<Vec<f32>> = turns.iter().map(|t| embed_text(&t.content)).collect();
 
         let mut centroids: Vec<Vec<f32>> = (0..k)
             .map(|i| embeddings[i * turns.len() / k].clone())

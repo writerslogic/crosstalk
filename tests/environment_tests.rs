@@ -40,7 +40,10 @@ fn test_generate_flake_uses_current_system() {
 fn test_generate_flake_empty_deps() {
     let mgr = NixManager::new(vec![]).unwrap();
     let flake = mgr.generate_flake().unwrap();
-    assert!(flake.contains("devShells"), "flake missing devShells output");
+    assert!(
+        flake.contains("devShells"),
+        "flake missing devShells output"
+    );
     assert!(flake.contains("mkShell"), "flake missing mkShell call");
 }
 
@@ -58,7 +61,10 @@ fn test_cache_hit_returns_fast() {
     write_cache_entry(&cache_path, now, &env).expect("write cache entry");
 
     let result = mgr.synthesize().unwrap();
-    assert_eq!(result.get("PATH").map(|s| s.as_str()), Some("/nix/store/bin"));
+    assert_eq!(
+        result.get("PATH").map(|s| s.as_str()),
+        Some("/nix/store/bin")
+    );
 }
 
 #[test]
@@ -75,7 +81,10 @@ fn test_cache_expired_is_miss() {
     // Without nix installed the synthesize call will fail (cache miss -> nix required).
     // We only verify the cache was NOT returned (i.e. we hit an error, not the stale data).
     if which::which("nix").is_err() {
-        assert!(mgr.synthesize().is_err(), "stale cache must not be returned");
+        assert!(
+            mgr.synthesize().is_err(),
+            "stale cache must not be returned"
+        );
     } else {
         // nix is present; synthesize may succeed or fail depending on env.
         // Just verify the stale cache timestamp didn't trick us into returning stale data.

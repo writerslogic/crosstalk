@@ -33,8 +33,16 @@ fn refinement_round0_contains_initial_proposals() {
     let rounds = solver().run_refinement_rounds(&proposals, 3);
     let round0: Vec<&RefinementRound> = rounds.iter().filter(|r| r.round_index == 0).collect();
     assert_eq!(round0.len(), 2);
-    assert!(round0.iter().any(|r| r.agent_id == "alice" && r.proposed_resolution == "proposal_a"));
-    assert!(round0.iter().any(|r| r.agent_id == "bob" && r.proposed_resolution == "proposal_b"));
+    assert!(
+        round0
+            .iter()
+            .any(|r| r.agent_id == "alice" && r.proposed_resolution == "proposal_a")
+    );
+    assert!(
+        round0
+            .iter()
+            .any(|r| r.agent_id == "bob" && r.proposed_resolution == "proposal_b")
+    );
 }
 
 #[test]
@@ -51,7 +59,10 @@ fn refinement_equilibrium_terminates_early_when_all_agree() {
     let proposals = vec![("a", "same"), ("b", "same"), ("c", "same")];
     let rounds = solver().run_refinement_rounds(&proposals, 10);
     let max_round = rounds.iter().map(|r| r.round_index).max().unwrap_or(0);
-    assert_eq!(max_round, 0, "identical proposals should terminate at round 0");
+    assert_eq!(
+        max_round, 0,
+        "identical proposals should terminate at round 0"
+    );
 }
 
 #[test]
@@ -132,7 +143,10 @@ fn resolve_empty_proposals_returns_empty() {
 fn kalman_update_moves_estimate_toward_measurement() {
     let mut k = KalmanConvergence::new(0.0);
     let updated = k.update(1.0);
-    assert!(updated > 0.0, "estimate should increase toward measurement 1.0");
+    assert!(
+        updated > 0.0,
+        "estimate should increase toward measurement 1.0"
+    );
     assert!(updated <= 1.0);
 }
 
@@ -141,7 +155,10 @@ fn kalman_variance_decreases_after_update() {
     let mut k = KalmanConvergence::new(0.5);
     let initial_var = k.variance;
     k.update(0.8);
-    assert!(k.variance < initial_var, "posterior variance must be less than prior");
+    assert!(
+        k.variance < initial_var,
+        "posterior variance must be less than prior"
+    );
 }
 
 #[test]
@@ -157,7 +174,10 @@ fn kalman_innovation_stored_correctly() {
 #[test]
 fn kalman_is_converged_false_initially() {
     let k = KalmanConvergence::new(0.5);
-    assert!(!k.is_converged(0.001), "fresh filter with variance=1.0 must not be converged");
+    assert!(
+        !k.is_converged(0.001),
+        "fresh filter with variance=1.0 must not be converged"
+    );
 }
 
 #[test]
@@ -166,7 +186,10 @@ fn kalman_is_converged_true_after_many_updates() {
     for _ in 0..50 {
         k.update(0.9);
     }
-    assert!(k.is_converged(0.1), "variance should drop below 0.1 after 50 updates");
+    assert!(
+        k.is_converged(0.1),
+        "variance should drop below 0.1 after 50 updates"
+    );
 }
 
 #[test]
@@ -174,8 +197,14 @@ fn kalman_confidence_interval_contains_p_c() {
     let mut k = KalmanConvergence::new(0.5);
     k.update(0.7);
     let (lo, hi) = k.confidence_interval();
-    assert!(lo <= k.p_c && k.p_c <= hi, "p_c must be inside its own confidence interval");
-    assert!(lo >= 0.0 && hi <= 1.0, "confidence interval must be clamped to [0, 1]");
+    assert!(
+        lo <= k.p_c && k.p_c <= hi,
+        "p_c must be inside its own confidence interval"
+    );
+    assert!(
+        lo >= 0.0 && hi <= 1.0,
+        "confidence interval must be clamped to [0, 1]"
+    );
 }
 
 #[test]
@@ -183,7 +212,10 @@ fn kalman_p_c_bounded_after_extreme_measurements() {
     let mut k = KalmanConvergence::new(0.5);
     let v1 = k.update(2.0);
     let v2 = k.update(-1.0);
-    assert!(v1 <= 1.0 && v2 >= 0.0, "p_c must stay in [0, 1] after out-of-range measurements");
+    assert!(
+        v1 <= 1.0 && v2 >= 0.0,
+        "p_c must stay in [0, 1] after out-of-range measurements"
+    );
 }
 
 // ── InfluenceWeightManager ────────────────────────────────────────────────────
@@ -214,22 +246,38 @@ fn weights_empty_state_returns_empty_map() {
 #[test]
 fn weights_tests_passed_scores_higher_than_rolled_back() {
     let mut sigma = ConversationState::new("s");
-    sigma.turns.push(make_turn("good", TurnOutcome::TestsPassed, 0.9));
-    sigma.turns.push(make_turn("bad", TurnOutcome::RolledBack, 0.5));
+    sigma
+        .turns
+        .push(make_turn("good", TurnOutcome::TestsPassed, 0.9));
+    sigma
+        .turns
+        .push(make_turn("bad", TurnOutcome::RolledBack, 0.5));
     let w = InfluenceWeightManager::calculate_weights(&sigma);
-    assert!(w["good"] > w["bad"], "TestsPassed agent must outweigh RolledBack agent");
+    assert!(
+        w["good"] > w["bad"],
+        "TestsPassed agent must outweigh RolledBack agent"
+    );
 }
 
 #[test]
 fn weights_with_recency_recent_turn_outweighs_old() {
     let mut sigma = ConversationState::new("s");
     // agent_old has a good old turn, agent_new has same quality recent turn
-    sigma.turns.push(make_turn("agent_old", TurnOutcome::TestsPassed, 0.9));
-    sigma.turns.push(make_turn("agent_new", TurnOutcome::TestsPassed, 0.9));
+    sigma
+        .turns
+        .push(make_turn("agent_old", TurnOutcome::TestsPassed, 0.9));
+    sigma
+        .turns
+        .push(make_turn("agent_new", TurnOutcome::TestsPassed, 0.9));
     // add more new turns for agent_new to push agent_old further back
-    sigma.turns.push(make_turn("agent_new", TurnOutcome::TestsPassed, 0.9));
+    sigma
+        .turns
+        .push(make_turn("agent_new", TurnOutcome::TestsPassed, 0.9));
     let w = InfluenceWeightManager::calculate_weights_with_recency(&sigma, 0.5);
-    assert!(w["agent_new"] >= w["agent_old"], "recent agent should have >= weight with decay=0.5");
+    assert!(
+        w["agent_new"] >= w["agent_old"],
+        "recent agent should have >= weight with decay=0.5"
+    );
 }
 
 #[test]
@@ -307,9 +355,17 @@ fn evaluate_proof_attachments_increase_score() {
 #[test]
 fn evaluate_high_complexity_reduces_score() {
     let mut simple = empty_artifact("a");
-    simple.metrics = ArtifactMetrics { cyclomatic_complexity: 1, line_count: 100, ..Default::default() };
+    simple.metrics = ArtifactMetrics {
+        cyclomatic_complexity: 1,
+        line_count: 100,
+        ..Default::default()
+    };
     let mut complex = empty_artifact("a");
-    complex.metrics = ArtifactMetrics { cyclomatic_complexity: 50, line_count: 100, ..Default::default() };
+    complex.metrics = ArtifactMetrics {
+        cyclomatic_complexity: 50,
+        line_count: 100,
+        ..Default::default()
+    };
     assert!(
         PayoffCalculator::evaluate(&simple) > PayoffCalculator::evaluate(&complex),
         "high cyclomatic complexity must reduce payoff"
@@ -357,5 +413,8 @@ fn best_response_picks_highest_joint_payoff() {
     let mine = vec![0.1, 0.9, 0.5];
     let theirs = vec![0.1, 0.8, 0.5];
     let idx = PayoffCalculator::best_response(&mine, &theirs);
-    assert_eq!(idx, 1, "strategy 1 has highest combined payoff (0.9+0.8=1.7)");
+    assert_eq!(
+        idx, 1,
+        "strategy 1 has highest combined payoff (0.9+0.8=1.7)"
+    );
 }

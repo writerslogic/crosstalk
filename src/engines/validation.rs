@@ -24,7 +24,9 @@ pub struct AstVersionHistory {
 impl AstVersionHistory {
     #[must_use]
     pub fn new() -> Self {
-        Self { versions: HashMap::new() }
+        Self {
+            versions: HashMap::new(),
+        }
     }
 
     pub fn record_snapshot(&mut self, turn: u32, nodes: HashMap<String, String>) {
@@ -36,7 +38,9 @@ impl AstVersionHistory {
     }
 
     pub fn revert_node(&self, node_id: &str, target_turn: u32) -> Result<String> {
-        let history = self.versions.get(node_id)
+        let history = self
+            .versions
+            .get(node_id)
             .ok_or_else(|| anyhow!("Node '{}' not found in history", node_id))?;
         history
             .iter()
@@ -90,7 +94,10 @@ impl AstValidator {
         }
 
         let mut parser = Parser::new();
-        if parser.set_language(&tree_sitter_rust::LANGUAGE.into()).is_err() {
+        if parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .is_err()
+        {
             return HashMap::new();
         }
         let tree = match parser.parse(content, None) {
@@ -125,7 +132,10 @@ impl AstValidator {
         }
 
         let mut parser = Parser::new();
-        if parser.set_language(&tree_sitter_rust::LANGUAGE.into()).is_err() {
+        if parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .is_err()
+        {
             return String::new();
         }
         let tree = match parser.parse(content, None) {

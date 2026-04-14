@@ -21,8 +21,8 @@ pub fn draw_inject_dialog(frame: &mut Frame, input_buffer: &str) {
     let inner = dialog.inner(area);
     frame.render_widget(dialog, area);
 
-    let input_para = Paragraph::new(format!("> {input_buffer}_"))
-        .style(Style::default().fg(Color::White));
+    let input_para =
+        Paragraph::new(format!("> {input_buffer}_")).style(Style::default().fg(Color::White));
     frame.render_widget(input_para, inner);
 }
 

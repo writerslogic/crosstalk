@@ -2,10 +2,12 @@ use crosstalk::core::agent_trait::PromptAgent;
 use crosstalk::core::factory::ModelFactory;
 use crosstalk::core::orchestrator::Orchestrator;
 use crosstalk::core::state::StateManager;
+use crosstalk::types::conversation::{
+    ConversationState, TaskCategory, Turn, TurnOutcome, TurnStructure,
+};
 use crosstalk::types::events::{ControlSignal, StreamEvent};
-use crosstalk::types::conversation::{ConversationState, TaskCategory, Turn, TurnOutcome, TurnStructure};
 use crosstalk::ui::app::App;
-use crosstalk::ui::events::run_event_loop;
+use crosstalk::ui::events::{self as ui_events, Action};
 use crosstalk::ui::model_select;
 use crosstalk::ui::render;
 use crossterm::ExecutableCommand;
@@ -121,9 +123,7 @@ async fn main() -> anyhow::Result<()> {
         loop {
             let sigma_in = Arc::clone(&sigma_orch);
             let omicron_in = Arc::clone(&omicron_orch);
-            let res = tokio::task::spawn(async move {
-                omicron_in.run_turn(sigma_in).await
-            }).await;
+            let res = tokio::task::spawn(async move { omicron_in.run_turn(sigma_in).await }).await;
 
             match res {
                 Ok(Ok(optimal)) => {
@@ -136,7 +136,9 @@ async fn main() -> anyhow::Result<()> {
                     let mut app_err = app_orch.lock().await;
                     app_err.push_event(format!("ORCHESTRATOR ERROR: {}", e));
                     tokio::time::sleep(Duration::from_secs(2)).await;
-                    if iterations > 0 && i >= iterations { break; }
+                    if iterations > 0 && i >= iterations {
+                        break;
+                    }
                 }
                 Err(e) => {
                     let mut app_err = app_orch.lock().await;
@@ -149,31 +151,47 @@ async fn main() -> anyhow::Result<()> {
         app_orch.lock().await.shutdown = true;
     });
 
-    let event_app = Arc::clone(&app);
+    let mut event_rx = event_rx;
     let ctrl_tx = control_tx;
-    tokio::spawn(async move {
-        let _ = run_event_loop(event_app, ctrl_tx, event_rx).await;
-    });
 
     // 8. Initialize TUI
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-    // 9. Main TUI render loop with signal handling
-    let sigterm = tokio::signal::ctrl_c();
-    tokio::pin!(sigterm);
+    // 9. Main loop: drain events, handle keys, render
     loop {
-        tokio::select! {
-            _ = &mut sigterm => break,
-            _ = tokio::time::sleep(Duration::from_millis(16)) => {}
+        let action = {
+            let mut a = app.lock().await;
+            ui_events::drain_stream_events(&mut a, &mut event_rx);
+            if a.shutdown {
+                break;
+            }
+
+            let action = match ui_events::poll_key(Duration::from_millis(16)) {
+                Some(key) => ui_events::handle_key(&mut a, key),
+                None => Action::None,
+            };
+
+            a.tick_fps();
+            terminal.draw(|f| render::draw(f, &a))?;
+            action
+        };
+
+        match action {
+            Action::Shutdown => {
+                let _ = ctrl_tx.send(ControlSignal::Shutdown).await;
+                break;
+            }
+            Action::Send(sig) => {
+                let _ = ctrl_tx.send(sig).await;
+            }
+            Action::SendTwo(s1, s2) => {
+                let _ = ctrl_tx.send(s1).await;
+                let _ = ctrl_tx.send(s2).await;
+            }
+            Action::None => {}
         }
-        let mut app_guard = app.lock().await;
-        if app_guard.shutdown {
-            break;
-        }
-        app_guard.tick_fps();
-        terminal.draw(|f| render::draw(f, &app_guard))?;
     }
 
     disable_raw_mode()?;

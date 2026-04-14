@@ -1,7 +1,7 @@
 use crosstalk::engines::collective_intelligence::{
     CapabilityGapScanner, CollectiveIntelligenceEngine, DynamicTeamComposer, EnsembleEngine,
-    KnowledgeTransfer, MetaStrategy, MetaStrategyOptimizer, PeerReview,
-    RoleSequenceRecorder, SkillProgressionTracker, SwarmPremiumCalculator, UCB1ProtocolSelector,
+    KnowledgeTransfer, MetaStrategy, MetaStrategyOptimizer, PeerReview, RoleSequenceRecorder,
+    SkillProgressionTracker, SwarmPremiumCalculator, UCB1ProtocolSelector,
 };
 use crosstalk::types::conversation::{TaskCategory, Turn, TurnOutcome};
 use crosstalk::types::intelligence::AgentProfile;
@@ -41,7 +41,11 @@ fn profile_with_score(model_id: &str, cat: TaskCategory, score: f64) -> AgentPro
 #[test]
 fn specialization_creates_profile_on_first_turn() {
     let mut engine = CollectiveIntelligenceEngine::new();
-    let turn = make_turn("m1", TurnOutcome::TestsPassed, Some(TaskCategory::CodeGeneration));
+    let turn = make_turn(
+        "m1",
+        TurnOutcome::TestsPassed,
+        Some(TaskCategory::CodeGeneration),
+    );
     engine.update_specialization(&turn);
     assert!(engine.profiles.contains_key("m1"));
 }
@@ -50,7 +54,11 @@ fn specialization_creates_profile_on_first_turn() {
 fn specialization_ema_moves_toward_score() {
     let mut engine = CollectiveIntelligenceEngine::new();
     // Default 0.5. TestPassed = 1.0. EMA: 0.5 * 0.9 + 1.0 * 0.1 = 0.55
-    let turn = make_turn("m1", TurnOutcome::TestsPassed, Some(TaskCategory::CodeGeneration));
+    let turn = make_turn(
+        "m1",
+        TurnOutcome::TestsPassed,
+        Some(TaskCategory::CodeGeneration),
+    );
     engine.update_specialization(&turn);
     let p = engine.profiles.get("m1").unwrap();
     let score = p.capabilities.get(&TaskCategory::CodeGeneration).unwrap();
@@ -92,8 +100,16 @@ fn peer_review_penalizes_incomplete_code() {
 #[test]
 fn ensemble_merge_selects_best_paragraphs() {
     let proposals = vec![
-        ("m1".to_string(), "Para 1 from m1.\n\nPara 2 from m1.".to_string(), 0.8),
-        ("m2".to_string(), "Para 1 from m2.\n\nPara 2 from m2.".to_string(), 0.9),
+        (
+            "m1".to_string(),
+            "Para 1 from m1.\n\nPara 2 from m1.".to_string(),
+            0.8,
+        ),
+        (
+            "m2".to_string(),
+            "Para 1 from m2.\n\nPara 2 from m2.".to_string(),
+            0.9,
+        ),
     ];
     let merged = EnsembleEngine::merge_proposals(proposals);
     assert!(merged.contains("Para 1 from m2"));
@@ -129,9 +145,18 @@ fn meta_optimizer_records_and_ranks_strategies() {
 #[test]
 fn team_composer_selects_best_models_per_role() {
     let mut profiles = BTreeMap::new();
-    profiles.insert("m1".to_string(), profile_with_score("m1", TaskCategory::Architecture, 0.9));
-    profiles.insert("m2".to_string(), profile_with_score("m2", TaskCategory::Architecture, 0.7));
-    profiles.insert("m3".to_string(), profile_with_score("m3", TaskCategory::Architecture, 0.5));
+    profiles.insert(
+        "m1".to_string(),
+        profile_with_score("m1", TaskCategory::Architecture, 0.9),
+    );
+    profiles.insert(
+        "m2".to_string(),
+        profile_with_score("m2", TaskCategory::Architecture, 0.7),
+    );
+    profiles.insert(
+        "m3".to_string(),
+        profile_with_score("m3", TaskCategory::Architecture, 0.5),
+    );
 
     let team = DynamicTeamComposer::compose(&profiles, "arch");
     assert_eq!(team.architect, Some("m1".to_string()));
@@ -155,8 +180,11 @@ fn skill_tracker_detects_plateau() {
 fn gap_scanner_identifies_weak_task_types() {
     let mut profiles = BTreeMap::new();
     // Best score for CodeGeneration is 0.4, threshold is 0.6
-    profiles.insert("m1".to_string(), profile_with_score("m1", TaskCategory::CodeGeneration, 0.4));
-    
+    profiles.insert(
+        "m1".to_string(),
+        profile_with_score("m1", TaskCategory::CodeGeneration, 0.4),
+    );
+
     let gaps = CapabilityGapScanner::scan_default(&profiles);
     assert!(gaps.iter().any(|g| g.task_type == "CodeGeneration"));
 }
@@ -178,7 +206,7 @@ fn role_recorder_returns_best_ordering() {
     let mut rec = RoleSequenceRecorder::new();
     rec.record("coding", vec![("m1".to_string(), "arch".to_string())], 0.5);
     rec.record("coding", vec![("m2".to_string(), "arch".to_string())], 0.9);
-    
+
     let best = rec.best_ordering("coding").unwrap();
     assert_eq!(best[0].0, "m2");
 }

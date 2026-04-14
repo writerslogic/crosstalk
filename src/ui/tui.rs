@@ -320,7 +320,8 @@ impl CrosstalkUI {
         use std::fs::File;
         use std::io::Write;
 
-        let safe_id: String = sigma.session_id
+        let safe_id: String = sigma
+            .session_id
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
             .collect();

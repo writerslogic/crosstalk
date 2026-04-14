@@ -6,7 +6,14 @@ use tempfile::tempdir;
 
 fn make_profile(model_id: &str, category: TaskCategory, mean: f64) -> ModelProfile {
     let mut task_scores = BTreeMap::new();
-    task_scores.insert(category, RunningAverage { mean, count: 1, variance: 0.0 });
+    task_scores.insert(
+        category,
+        RunningAverage {
+            mean,
+            count: 1,
+            variance: 0.0,
+        },
+    );
     ModelProfile {
         model_id: model_id.to_string(),
         task_scores,
@@ -24,11 +31,16 @@ async fn test_intelligence_routing_with_storage() {
 
     {
         let engine = IntelligenceEngine::new();
-        engine.profiles.insert("m1".to_string(), make_profile("m1", TaskCategory::CodeGeneration, 0.9));
+        engine.profiles.insert(
+            "m1".to_string(),
+            make_profile("m1", TaskCategory::CodeGeneration, 0.9),
+        );
         // We can't easily test the background saver here without waiting, so we manually trigger or assume it works.
     }
 
-    let _engine = IntelligenceEngine::with_storage(path_str).await.expect("load failed");
+    let _engine = IntelligenceEngine::with_storage(path_str)
+        .await
+        .expect("load failed");
     // If it was saved, it should be here.
 }
 
@@ -72,7 +84,13 @@ async fn test_intelligence_update_profile() {
     engine.update_profile(&turn, 0.9);
     let p = engine.profiles.get("m1").unwrap();
     assert_eq!(p.total_turns, 1);
-    assert!(p.task_scores.get(&TaskCategory::CodeGeneration).unwrap().mean > 0.8);
+    assert!(
+        p.task_scores
+            .get(&TaskCategory::CodeGeneration)
+            .unwrap()
+            .mean
+            > 0.8
+    );
 }
 
 #[test]

@@ -1,4 +1,5 @@
 use crate::types::conversation::Turn;
+use crate::types::events::ArtifactSnapshot;
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
@@ -39,8 +40,7 @@ pub struct App {
     pub session_id: String,
     pub turn_index: u32,
     pub streaming_buffer: String,
-    /// (name, skeleton) pairs
-    pub artifacts: Vec<(String, String)>,
+    pub artifacts: Vec<ArtifactSnapshot>,
     pub convergence: f64,
     pub certainty: f64,
     pub agent_weights: HashMap<String, f64>,
@@ -49,7 +49,9 @@ pub struct App {
     pub mode: AppMode,
     /// Row offset for events log scroll
     pub scroll_offset: usize,
+    pub events_auto_scroll: bool,
     pub ghost_scroll: usize,
+    pub ghost_auto_scroll: bool,
     pub artifact_scroll: usize,
     pub entropy_scroll: usize,
     /// Set to true to signal the render loop to exit
@@ -85,7 +87,9 @@ impl App {
             recent_events: VecDeque::new(),
             mode: AppMode::Streaming,
             scroll_offset: 0,
+            events_auto_scroll: true,
             ghost_scroll: 0,
+            ghost_auto_scroll: true,
             artifact_scroll: 0,
             entropy_scroll: 0,
             shutdown: false,
@@ -104,10 +108,14 @@ impl App {
         if !self.agent_list.contains(&agent_id.to_string()) {
             self.agent_list.push(agent_id.to_string());
         }
-        if !self.streaming_buffer.is_empty() && !self.streaming_buffer.ends_with(' ') && !token.starts_with(' ') && !token.starts_with('\n') {
+        if !self.streaming_buffer.is_empty()
+            && !self.streaming_buffer.ends_with(' ')
+            && !token.starts_with(' ')
+            && !token.starts_with('\n')
+        {
             // Potential word break across tokens
         }
-        
+
         let prefix = if self.streaming_buffer.is_empty() || self.streaming_buffer.ends_with('\n') {
             format!("[{agent_id}] ")
         } else {
@@ -119,12 +127,18 @@ impl App {
         const BUF_CAP: usize = 50 * 1024;
         if self.streaming_buffer.len() > BUF_CAP {
             let trim = self.streaming_buffer.len() - BUF_CAP;
-            let safe = self.streaming_buffer
+            let safe = self
+                .streaming_buffer
                 .char_indices()
                 .find(|(i, _)| *i >= trim)
                 .map(|(i, _)| i)
                 .unwrap_or(trim);
             self.streaming_buffer.drain(..safe);
+        }
+
+        if self.ghost_auto_scroll {
+            let line_count = self.streaming_buffer.chars().filter(|&c| c == '\n').count();
+            self.ghost_scroll = line_count.saturating_sub(1);
         }
     }
 
@@ -161,10 +175,8 @@ impl App {
         for (artifact_name, agent_map) in &self.artifact_change_history {
             if agent_map.len() < 2 {
                 // Only one agent touched this artifact — no disagreement possible
-                let single_score: Vec<(String, f64)> = agent_map
-                    .keys()
-                    .map(|a| (a.clone(), 0.0))
-                    .collect();
+                let single_score: Vec<(String, f64)> =
+                    agent_map.keys().map(|a| (a.clone(), 0.0)).collect();
                 self.entropy_scores.push(EntropyRow {
                     artifact: artifact_name.clone(),
                     agents: single_score,
@@ -181,16 +193,13 @@ impl App {
                 })
                 .collect();
 
-            let max_mean = agent_means
-                .iter()
-                .map(|(_, m)| *m)
-                .fold(0.0_f64, f64::max);
+            let max_mean = agent_means.iter().map(|(_, m)| *m).fold(0.0_f64, f64::max);
 
             let agents: Vec<(String, f64)> = if max_mean == 0.0 {
                 agent_means.into_iter().map(|(a, _)| (a, 0.0)).collect()
             } else {
-                let global_mean = agent_means.iter().map(|(_, m)| m).sum::<f64>()
-                    / agent_means.len() as f64;
+                let global_mean =
+                    agent_means.iter().map(|(_, m)| m).sum::<f64>() / agent_means.len() as f64;
                 agent_means
                     .into_iter()
                     .map(|(a, m)| {
@@ -206,7 +215,8 @@ impl App {
             });
         }
 
-        self.entropy_scores.sort_by(|a, b| a.artifact.cmp(&b.artifact));
+        self.entropy_scores
+            .sort_by(|a, b| a.artifact.cmp(&b.artifact));
     }
 
     pub fn set_convergence(&mut self, p: f64, certainty: f64) {
@@ -220,50 +230,84 @@ impl App {
             self.recent_events.pop_front();
             self.scroll_offset = self.scroll_offset.saturating_sub(1);
         }
+        if self.events_auto_scroll {
+            self.scroll_offset = self.recent_events.len().saturating_sub(1);
+        }
     }
 
-        pub fn scroll_up(&mut self) {
+    pub fn scroll_up(&mut self) {
         match self.focused_pane {
-            FocusedPane::GhostStream => self.ghost_scroll = self.ghost_scroll.saturating_sub(1),
+            FocusedPane::GhostStream => {
+                self.ghost_auto_scroll = false;
+                self.ghost_scroll = self.ghost_scroll.saturating_sub(1);
+            }
             FocusedPane::Artifacts => self.artifact_scroll = self.artifact_scroll.saturating_sub(1),
             FocusedPane::EntropyMap => self.entropy_scroll = self.entropy_scroll.saturating_sub(1),
-            FocusedPane::Events => self.scroll_offset = self.scroll_offset.saturating_sub(1),
+            FocusedPane::Events => {
+                self.events_auto_scroll = false;
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+            }
         }
     }
 
     pub fn scroll_down(&mut self) {
         match self.focused_pane {
-            FocusedPane::GhostStream => self.ghost_scroll += 1, // Paragraph handles wrapping, exact limit hard to pre-calc
+            FocusedPane::GhostStream => {
+                self.ghost_auto_scroll = false;
+                self.ghost_scroll += 1;
+            }
             FocusedPane::Artifacts => {
                 let max = self.artifacts.len().saturating_sub(1);
-                if self.artifact_scroll < max { self.artifact_scroll += 1; }
+                if self.artifact_scroll < max {
+                    self.artifact_scroll += 1;
+                }
             }
             FocusedPane::EntropyMap => {
                 let max = self.entropy_scores.len().saturating_sub(1);
-                if self.entropy_scroll < max { self.entropy_scroll += 1; }
+                if self.entropy_scroll < max {
+                    self.entropy_scroll += 1;
+                }
             }
             FocusedPane::Events => {
+                self.events_auto_scroll = false;
                 let max = self.recent_events.len().saturating_sub(1);
-                if self.scroll_offset < max { self.scroll_offset += 1; }
+                if self.scroll_offset < max {
+                    self.scroll_offset += 1;
+                }
             }
         }
     }
 
     pub fn scroll_top(&mut self) {
         match self.focused_pane {
-            FocusedPane::GhostStream => self.ghost_scroll = 0,
+            FocusedPane::GhostStream => {
+                self.ghost_auto_scroll = false;
+                self.ghost_scroll = 0;
+            }
             FocusedPane::Artifacts => self.artifact_scroll = 0,
             FocusedPane::EntropyMap => self.entropy_scroll = 0,
-            FocusedPane::Events => self.scroll_offset = 0,
+            FocusedPane::Events => {
+                self.events_auto_scroll = false;
+                self.scroll_offset = 0;
+            }
         }
     }
 
     pub fn scroll_bottom(&mut self) {
         match self.focused_pane {
-            FocusedPane::GhostStream => self.ghost_scroll = 1000, // Reasonable heuristic for "end" of streaming text
+            FocusedPane::GhostStream => {
+                self.ghost_auto_scroll = true;
+                let line_count = self.streaming_buffer.chars().filter(|&c| c == '\n').count();
+                self.ghost_scroll = line_count.saturating_sub(1);
+            }
             FocusedPane::Artifacts => self.artifact_scroll = self.artifacts.len().saturating_sub(1),
-            FocusedPane::EntropyMap => self.entropy_scroll = self.entropy_scores.len().saturating_sub(1),
-            FocusedPane::Events => self.scroll_offset = self.recent_events.len().saturating_sub(1),
+            FocusedPane::EntropyMap => {
+                self.entropy_scroll = self.entropy_scores.len().saturating_sub(1)
+            }
+            FocusedPane::Events => {
+                self.events_auto_scroll = true;
+                self.scroll_offset = self.recent_events.len().saturating_sub(1);
+            }
         }
     }
 
