@@ -1,3 +1,5 @@
+pub mod transport;
 pub mod bridge;
 pub mod gateway;
-pub mod transport;
+
+pub use transport::McpTransport;

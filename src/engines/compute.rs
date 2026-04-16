@@ -139,74 +139,36 @@ impl Default for ComputeManager {
 pub struct ParallelInference;
 
 impl ParallelInference {
-    /// Runs inference across multiple models in parallel.
-    /// Fails if any model fails.
-    pub async fn run<F, Fut>(
+    /// Runs parallel inference and returns the best response based on quality scores.
+    pub async fn select_best<F, Fut, S>(
         prompt: String,
         models: Vec<String>,
-        mut f: F,
-    ) -> Result<Vec<(String, String)>>
+        mut inference_fn: F,
+        scorer: S,
+    ) -> Result<(String, String, f64)>
     where
         F: FnMut(String, String) -> Fut,
         Fut: std::future::Future<Output = Result<String>> + Send + 'static,
+        S: Fn(&str) -> f64,
     {
-        let mut set: tokio::task::JoinSet<(String, Result<String>)> = tokio::task::JoinSet::new();
-
+        let mut set = tokio::task::JoinSet::new();
         for model in models {
-            let fut = f(prompt.clone(), model.clone());
+            let fut = inference_fn(prompt.clone(), model.clone());
             set.spawn(async move { (model, fut.await) });
         }
 
-        let mut results = Vec::new();
+        let mut candidates = Vec::new();
         while let Some(res) = set.join_next().await {
-            match res {
-                Ok((model, output)) => results.push((model, output?)),
-                Err(e) => return Err(anyhow::anyhow!("Task join error: {:?}", e)),
+            if let Ok((model, Ok(text))) = res {
+                let score = scorer(&text);
+                candidates.push((model, text, score));
             }
         }
-        Ok(results)
-    }
 
-    /// Runs inference across multiple models in parallel with a timeout.
-    /// Returns only the successes within the timeout.
-    pub async fn run_robust<F, Fut>(
-        prompt: String,
-        models: Vec<String>,
-        timeout: Duration,
-        mut f: F,
-    ) -> Vec<(String, String)>
-    where
-        F: FnMut(String, String) -> Fut,
-        Fut: std::future::Future<Output = Result<String>> + Send + 'static,
-    {
-        let mut set: tokio::task::JoinSet<(String, Result<String>)> = tokio::task::JoinSet::new();
-
-        for model in models {
-            let fut = f(prompt.clone(), model.clone());
-            set.spawn(async move { (model, fut.await) });
-        }
-
-        let mut results = Vec::new();
-        let timeout_fut = tokio::time::sleep(timeout);
-        tokio::pin!(timeout_fut);
-
-        loop {
-            tokio::select! {
-                res = set.join_next() => {
-                    if let Some(join_res) = res {
-                        if let Ok((model, Ok(output))) = join_res {
-                            results.push((model, output));
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                _ = &mut timeout_fut => {
-                    break;
-                }
-            }
-        }
-        results
+        candidates
+            .into_iter()
+            .max_by(|a, b| a.2.total_cmp(&b.2))
+            .ok_or_else(|| anyhow::anyhow!("All parallel inference tasks failed"))
     }
 }
 
@@ -411,5 +373,18 @@ impl RequestRateLimiter {
             entries.retain(|t| now.duration_since(*t) < window);
             entries.push(now);
         }
+    }
+}
+
+pub struct LocalInference;
+
+impl LocalInference {
+    /// Placeholder for llama-cpp-rs integration.
+    /// In emergency mode, this performs low-cost local synthesis.
+    pub fn generate_emergency(prompt: &str) -> String {
+        format!("[EMERGENCY LOCAL INFERENCE] Fallback active for prompt: {}
+
+Note: Switched to offline synthesis to preserve final 5% budget.", 
+                prompt.chars().take(100).collect::<String>())
     }
 }

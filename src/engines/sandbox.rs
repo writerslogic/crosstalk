@@ -1,134 +1,87 @@
-use crate::types::conversation::ConversationState;
-use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
+use anyhow::Result;
 use wasmtime::*;
-use wasmtime_wasi::pipe::MemoryOutputPipe;
-use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::sync::WasiCtxBuilder;
+use std::time::Instant;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+pub struct SandboxConfig {
+    pub memory_limit_bytes: usize,
+    pub cpu_fuel_limit: u64,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            memory_limit_bytes: 256 * 1024 * 1024, // 256MB
+            cpu_fuel_limit: 100_000_000,           // 100M units
+        }
+    }
+}
+
 pub struct SandboxResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
-}
-
-pub struct SandboxConfig {
-    pub memory_limit_bytes: usize,
-    pub fuel_limit: u64,
-    pub output_buffer_bytes: usize,
-    pub entry_point: Option<String>,
-}
-
-struct MyState {
-    wasi_ctx: WasiCtx,
-    table: ResourceTable,
-    stdout: MemoryOutputPipe,
-    stderr: MemoryOutputPipe,
-    resource_limiter: StoreLimits,
-}
-
-impl WasiView for MyState {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.wasi_ctx
-    }
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
-    }
-}
-
-impl MyState {
-    fn new(mem_limit: usize, buf_size: usize) -> Self {
-        let stdout = MemoryOutputPipe::new(buf_size);
-        let stderr = MemoryOutputPipe::new(buf_size);
-        let wasi_ctx = WasiCtxBuilder::new()
-            .stdout(stdout.clone())
-            .stderr(stderr.clone())
-            .build();
-
-        Self {
-            wasi_ctx,
-            table: ResourceTable::new(),
-            stdout,
-            stderr,
-            resource_limiter: StoreLimitsBuilder::new().memory_size(mem_limit).build(),
-        }
-    }
+    pub elapsed_ms: u64,
+    pub fuel_consumed: Option<u64>,
 }
 
 pub struct SandboxManager {
     engine: Engine,
+    config: SandboxConfig,
 }
 
 impl SandboxManager {
-    pub fn new() -> Result<Self> {
-        let mut config = Config::new();
-        config.consume_fuel(true);
-        let engine = Engine::new(&config)?;
-        Ok(Self { engine })
+    pub fn new(config: SandboxConfig) -> Result<Self> {
+        let mut wasm_cfg = Config::new();
+        wasm_cfg.consume_fuel(true);
+        let engine = Engine::new(&wasm_cfg)?;
+        Ok(Self { engine, config })
     }
 
-    pub async fn execute_with_rollback(
-        &self,
-        wasm_bytes: &[u8],
-        config: &SandboxConfig,
-        snapshot: &ConversationState,
-    ) -> Result<(SandboxResult, Option<ConversationState>)> {
-        match self.execute(wasm_bytes, config).await {
-            Ok(result) if result.exit_code == 0 => Ok((result, None)),
-            Ok(result) => Ok((result, Some(snapshot.clone()))),
-            Err(e) => Ok((
-                SandboxResult {
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: e.to_string(),
-                },
-                Some(snapshot.clone()),
-            )),
-        }
-    }
+    pub fn execute(&self, wasm_bytes: &[u8]) -> Result<SandboxResult> {
+        let start = Instant::now();
+        let mut linker = Linker::new(&self.engine);
+        wasmtime_wasi::add_to_linker(&mut linker, |s| s)?;
 
-    pub async fn execute(
-        &self,
-        wasm_bytes: &[u8],
-        config: &SandboxConfig,
-    ) -> Result<SandboxResult> {
-        if config.fuel_limit == 0 {
-            return Err(anyhow!("fuel_limit must be > 0"));
-        }
-        if config.memory_limit_bytes == 0 {
-            return Err(anyhow!("memory_limit_bytes must be > 0"));
-        }
+        let wasi = WasiCtxBuilder::new()
+            .inherit_stdout()
+            .inherit_stderr()
+            .build();
 
-        let mut store = Store::new(
-            &self.engine,
-            MyState::new(config.memory_limit_bytes, config.output_buffer_bytes),
-        );
-        store.set_fuel(config.fuel_limit)?;
-        store.limiter(|s| &mut s.resource_limiter);
+        let mut store = Store::new(&self.engine, wasi);
+        store.set_fuel(self.config.cpu_fuel_limit)?;
 
-        let component = wasmtime::component::Component::from_binary(&self.engine, wasm_bytes)?;
-        let mut linker: wasmtime::component::Linker<MyState> =
-            wasmtime::component::Linker::new(&self.engine);
-        wasmtime_wasi::add_to_linker_sync(&mut linker)?;
+        let module = Module::from_binary(&self.engine, wasm_bytes)?;
+        linker.module(&mut store, "", &module)?;
 
-        let instance = linker.instantiate_async(&mut store, &component).await?;
-        // entry_point defaults to "_start" (WASI convention)
-        let entry = config.entry_point.as_deref().unwrap_or("_start");
-        let run_func = instance.get_typed_func::<(), ()>(&mut store, entry)?;
+        let func = linker
+            .get_default(&mut store, "")?
+            .typed::<(), ()>(&store)?;
 
-        let exit_code = run_func
-            .call_async(&mut store, ())
-            .await
-            .map(|_| 0)
-            .unwrap_or(-1);
-
-        let stdout_bytes = store.data().stdout.contents();
-        let stderr_bytes = store.data().stderr.contents();
+        let res = func.call(&mut store, ());
+        let fuel_consumed = store.get_fuel().ok().map(|f| self.config.cpu_fuel_limit - f);
+        
+        let exit_code = match res {
+            Ok(_) => 0,
+            Err(e) => {
+                if let Some(trap) = e.downcast_ref::<Trap>() {
+                    match trap {
+                        Trap::OutOfFuel => 137,
+                        _ => 1,
+                    }
+                } else {
+                    1
+                }
+            }
+        };
 
         Ok(SandboxResult {
             exit_code,
-            stdout: String::from_utf8_lossy(&stdout_bytes).to_string(),
-            stderr: String::from_utf8_lossy(&stderr_bytes).to_string(),
+            stdout: String::new(),
+            stderr: String::new(),
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            fuel_consumed,
         })
     }
 }

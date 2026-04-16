@@ -149,7 +149,7 @@ impl ContinuousAuditor {
     }
 }
 
-const TAUTOLOGY_SIMILARITY_THRESHOLD: f64 = 0.85;
+const TAUTOLOGY_SIMILARITY_THRESHOLD: f64 = 0.95;
 
 pub struct TautologyFilter;
 

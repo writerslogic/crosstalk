@@ -159,3 +159,18 @@ pub struct FailurePattern {
     pub frequency: u32,
     pub last_seen: u64,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TurnStrategy {
+    pub task_category: TaskCategory,
+    pub agent_sequence: Vec<String>,
+    pub avg_quality: f64,
+    pub sample_size: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum IterationDecision {
+    Continue,
+    StopEarly,
+    Extend,
+}

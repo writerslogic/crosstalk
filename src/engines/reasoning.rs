@@ -87,6 +87,48 @@ impl ReasoningEngine {
             code_blocks,
         }
     }
+impl ReasoningEngine {
+    /// Anchors claims to evidence found in artifacts and prior turns.
+    pub fn anchor_evidence(content: &str, sigma: &ConversationState) -> Vec<AnchoredClaim> {
+        let mut anchored = Vec::new();
+        let signals = Self::extract_signals(content);
+        
+        for claim in signals.decisions {
+            let mut anchors = Vec::new();
+            let mut confidence = 0.2; // Base unanchored weight
+
+            // 1. Check for Code References
+            for artifact in sigma.artifacts.values() {
+                if claim.contains(&artifact.name) {
+                    anchors.push(EvidenceAnchor::CodeRef { 
+                        file: artifact.name.clone(), 
+                        line: 0 
+                    });
+                    confidence += 0.4;
+                }
+            }
+
+            // 2. Check for Turn Citations
+            for turn in &sigma.turns {
+                if claim.contains(&format!("i_{}", turn.index)) {
+                    anchors.push(EvidenceAnchor::Citation { 
+                        source: turn.model_id.clone(), 
+                        quote: String::new() 
+                    });
+                    confidence += 0.2;
+                }
+            }
+
+            anchored.push(AnchoredClaim { 
+                claim, 
+                anchors, 
+                confidence: confidence.min(1.0) 
+            });
+        }
+        anchored
+    }
+}
+
 }
 
 pub struct SignalExtractor;
@@ -212,31 +254,43 @@ impl FallacyDetector {
         })
     }
 
-    fn detect_straw_man(content: &str) -> Option<FallacyReport> {
+    pub fn detect_straw_man_robust(content: &str, prior_turns: &[Turn]) -> Option<FallacyReport> {
         let lower = content.to_lowercase();
-        let setups = [
-            "they claim",
-            "their argument is",
-            "they believe",
-            "their position is",
-        ];
-        let dismissals = [
-            "is absurd",
-            "is ridiculous",
-            "is clearly wrong",
-            "is obviously false",
-        ];
-        let has_setup = setups.iter().any(|&s| lower.contains(s));
-        let has_dismissal = dismissals.iter().any(|&d| lower.contains(d));
-        if has_setup && has_dismissal {
-            Some(FallacyReport {
-                fallacy_type: "StrawMan".to_string(),
-                evidence_span: "exaggerated attribution followed by dismissal".to_string(),
-                confidence: 0.70,
-            })
-        } else {
-            None
+        
+        // Find segments that look like attributions/summaries of others
+        let markers = ["they said", "the other agent claims", "it was argued that"];
+        let mut target_span = None;
+        for m in markers {
+            if let Some(idx) = lower.find(m) {
+                let end = content[idx..].find(['.', '
+']).unwrap_or(content.len() - idx);
+                target_span = Some(&content[idx..idx+end]);
+                break;
+            }
         }
+
+        if let Some(span) = target_span {
+            // Check if this span is a misrepresentation (low similarity to any prior turn content)
+            let mut max_sim = 0.0;
+            for t in prior_turns {
+                let sim = crate::engines::diff::DiffEngine::calculate_similarity(span, &t.content);
+                if sim > max_sim { max_sim = sim; }
+            }
+
+            // If we are quoting someone but similarity to their actual words is low, it might be a straw man
+            if max_sim < 0.2 && (lower.contains("absurd") || lower.contains("wrong") || lower.contains("false")) {
+                return Some(FallacyReport {
+                    fallacy_type: "StrawMan".to_string(),
+                    evidence_span: span.to_string(),
+                    confidence: 0.85,
+                });
+            }
+        }
+        None
+    }
+
+    fn detect_straw_man(content: &str) -> Option<FallacyReport> {
+        Self::detect_straw_man_robust(content, &[])
     }
 
     /// Upgraded from $O(N^2)$ to $O(N)$ using a semantic hash-binning approach.
@@ -382,13 +436,35 @@ impl StructureSelector {
         });
     }
 
+    /// Recommends a turn structure using an ε-greedy exploration strategy.
+    /// ε = 0.1 (10% exploration).
     #[must_use]
-    pub fn recommend(&self, task: TaskCategory, agent_id: &str) -> TurnStructure {
+    pub fn recommend_with_exploration(&self, task: TaskCategory, agent_id: &str) -> TurnStructure {
+        use rand::Rng;
+        let mut rng = rand::rng();
+        
+        if rng.random_bool(0.1) {
+            // Exploration: pick a random structure
+            let all = [
+                TurnStructure::FreeForm,
+                TurnStructure::StepByStep,
+                TurnStructure::ProsCons,
+                TurnStructure::HypothesisTest,
+                TurnStructure::CodeFirst,
+            ];
+            return all[rng.random_range(0..all.len())];
+        }
+
+        // Exploitation: pick best from mixer
         self.mixer
             .blend(task, Some(agent_id))
             .first()
             .map(|(s, _)| *s)
-            .unwrap_or(TurnStructure::FreeForm)
+            .unwrap_or(TurnStructure::StepByStep)
+    }
+
+    pub fn recommend(&self, task: TaskCategory, agent_id: &str) -> TurnStructure {
+        self.recommend_with_exploration(task, agent_id)
     }
 }
 
@@ -612,7 +688,7 @@ impl SynthesisEngine {
     #[must_use]
     pub fn merge(
         base_content: &str,
-        proposals: Vec<ArtifactDiff>,
+        proposals: Vec<(String, ArtifactDiff)>, // (ModelID, Diff)
         language: &str,
     ) -> Option<String> {
         if proposals.is_empty() {
@@ -621,13 +697,13 @@ impl SynthesisEngine {
         if proposals.len() == 1 {
             return Some(crate::engines::diff::DiffEngine::apply_patch(
                 base_content,
-                &proposals[0],
+                &proposals[0].1,
             ));
         }
 
         let versions: Vec<String> = proposals
             .iter()
-            .map(|p| crate::engines::diff::DiffEngine::apply_patch(base_content, p))
+            .map(|(_, p)| crate::engines::diff::DiffEngine::apply_patch(base_content, p))
             .collect();
 
         Self::semantic_ast_merge(base_content, &versions, language)
@@ -661,28 +737,66 @@ impl SynthesisEngine {
             }
         }
 
-        // Collect winning replacements for all changed blocks.
-        let mut replacements: Vec<(std::ops::Range<usize>, String)> = base_blocks
-            .iter()
-            .filter_map(|base_block| {
-                let proposals = block_proposals.get(&base_block.signature)?;
-                let changes: Vec<&String> = proposals
-                    .iter()
-                    .filter(|c| **c != base_block.content)
-                    .collect();
-                if changes.is_empty() {
-                    return None;
-                }
-                let mut frequency: HashMap<&String, usize> = HashMap::new();
-                for change in &changes {
-                    *frequency.entry(*change).or_insert(0) += 1;
-                }
-                let (winning_change, _) = frequency.into_iter().max_by_key(|&(_, count)| count)?;
-                Some((base_block.byte_range.clone(), winning_change.clone()))
-            })
-            .collect();
+        // 1. Process existing blocks (Keep, Replace, or Delete)
+        let mut replacements: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+        let mut handled_signatures = std::collections::HashSet::new();
+        let threshold = versions.len() / 2;
 
-        // Sort by start offset for a single forward-pass reconstruction (O(n) vs O(n*k)).
+        for base_block in &base_blocks {
+            handled_signatures.insert(base_block.signature.clone());
+            let proposals = match block_proposals.get(&base_block.signature) {
+                Some(p) => p,
+                None => {
+                    // Deleted by majority (0 proposals exist)
+                    replacements.push((base_block.byte_range.clone(), String::new()));
+                    continue;
+                }
+            };
+
+            // If majority deleted it, we delete it
+            if proposals.len() <= threshold {
+                replacements.push((base_block.byte_range.clone(), String::new()));
+                continue;
+            }
+
+            // Majority kept/replaced it, find winning content
+            let mut frequency: HashMap<&String, usize> = HashMap::new();
+            for change in proposals {
+                *frequency.entry(change).or_insert(0) += 1;
+            }
+            let (winning_content, winning_count) =
+                frequency.into_iter().max_by_key(|&(_, count)| count).unwrap();
+
+            // If majority says delete (empty content proposed), or if winning content is different
+            if winning_count > threshold && *winning_content != base_block.content {
+                replacements.push((base_block.byte_range.clone(), winning_content.clone()));
+            } else if winning_count <= threshold {
+                // No consensus? Fallback to base.
+            }
+        }
+
+        // 2. Process additions (New signatures present in majority of proposals)
+        let mut additions = Vec::new();
+        for (sig, proposals) in &block_proposals {
+            if handled_signatures.contains(sig) {
+                continue;
+            }
+            if proposals.len() > threshold {
+                let mut frequency: HashMap<&String, usize> = HashMap::new();
+                for content in proposals {
+                    *frequency.entry(content).or_insert(0) += 1;
+                }
+                if let Some((winning_content, count)) =
+                    frequency.into_iter().max_by_key(|&(_, count)| count)
+                {
+                    if count > threshold {
+                        additions.push(winning_content.clone());
+                    }
+                }
+            }
+        }
+
+        // Sort by start offset for a single forward-pass reconstruction.
         replacements.sort_unstable_by_key(|(r, _)| r.start);
 
         let mut result = String::with_capacity(base.len());
@@ -695,6 +809,15 @@ impl SynthesisEngine {
             }
         }
         result.push_str(&base[cursor..]);
+
+        // Append new blocks at the end
+        for add in additions {
+            if !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str("\n");
+            result.push_str(&add);
+        }
 
         Some(result)
     }
@@ -745,5 +868,48 @@ impl SynthesisEngine {
         } else {
             format!("{}_{}", node.kind(), node.start_byte())
         }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum CriticVerdict {
+    Approve,
+    RequestChanges,
+    Reject,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CritiqueReport {
+    pub strengths: Vec<String>,
+    pub weaknesses: Vec<(String, f64, String)>, // (description, severity, evidence)
+    pub suggested_fixes: Vec<String>,
+    pub verdict: CriticVerdict,
+}
+
+pub struct AdversarialCritic;
+
+impl AdversarialCritic {
+    /// Parses a raw critic response into a structured report.
+    pub fn parse_critique(text: &str) -> CritiqueReport {
+        let mut strengths = Vec::new();
+        let mut weaknesses = Vec::new();
+        let mut fixes = Vec::new();
+        let mut verdict = CriticVerdict::Approve;
+
+        for line in text.lines() {
+            let lower = line.to_lowercase();
+            if lower.contains("strength:") || lower.contains("+ ") {
+                strengths.push(line.trim().to_string());
+            } else if lower.contains("weakness:") || lower.contains("error:") || lower.contains("bug:") {
+                weaknesses.push((line.trim().to_string(), 0.8, String::new()));
+                verdict = CriticVerdict::RequestChanges;
+            } else if lower.contains("fix:") || lower.contains("suggest:") {
+                fixes.push(line.trim().to_string());
+            } else if lower.contains("reject") || lower.contains("critical failure") {
+                verdict = CriticVerdict::Reject;
+            }
+        }
+
+        CritiqueReport { strengths, weaknesses, suggested_fixes: fixes, verdict }
     }
 }

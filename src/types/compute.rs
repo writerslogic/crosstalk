@@ -78,6 +78,16 @@ impl BudgetLedger {
     }
 
     #[must_use]
+    
+    pub fn predict_final_cost(&self, total_expected_turns: u32) -> f64 {
+        let burn = self.burn_rate();
+        burn * f64::from(total_expected_turns)
+    }
+
+    pub fn is_at_risk(&self, total_expected_turns: u32) -> bool {
+        self.predict_final_cost(total_expected_turns) > self.session_budget * 1.2
+    }
+
     pub fn summary(&self) -> String {
         format!(
             "budget={:.4} spent={:.4} remaining={:.4} burn_rate={:.6} mode={:?}",

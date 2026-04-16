@@ -1,81 +1,45 @@
-use anyhow::{Result, anyhow};
-use futures::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use anyhow::Result;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use serde_json::{json, Value};
+use std::fs;
 use std::path::Path;
-use tokio::net::UnixStream;
-use tokio_util::codec::{Framed, LinesCodec};
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct JsonRpcRequest {
-    pub jsonrpc: String,
-    pub method: String,
-    pub params: serde_json::Value,
-    pub id: serde_json::Value,
+pub struct McpTransport {
+    pub socket_path: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct JsonRpcResponse {
-    pub jsonrpc: String,
-    pub result: Option<serde_json::Value>,
-    pub error: Option<serde_json::Value>,
-    pub id: serde_json::Value,
-}
-
-pub struct JsonRpcTransport {
-    framed: Framed<UnixStream, LinesCodec>,
-}
-
-impl JsonRpcTransport {
-    pub async fn connect<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let stream = UnixStream::connect(path).await?;
-        let framed = Framed::new(stream, LinesCodec::new());
-        Ok(Self { framed })
+impl McpTransport {
+    pub fn new(path: &str) -> Self {
+        Self { socket_path: path.to_string() }
     }
 
-    pub fn new(stream: UnixStream) -> Self {
-        let framed = Framed::new(stream, LinesCodec::new());
-        Self { framed }
-    }
-
-    pub async fn send_request(
-        &mut self,
-        method: &str,
-        params: serde_json::Value,
-        id: i64,
-    ) -> Result<()> {
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            method: method.to_string(),
-            params,
-            id: serde_json::json!(id),
-        };
-        let msg = serde_json::to_string(&req)?;
-        self.framed.send(msg).await?;
-        Ok(())
-    }
-
-    pub async fn send_response(
-        &mut self,
-        result: Option<serde_json::Value>,
-        error: Option<serde_json::Value>,
-        id: serde_json::Value,
-    ) -> Result<()> {
-        let resp = JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            result,
-            error,
-            id,
-        };
-        let msg = serde_json::to_string(&resp)?;
-        self.framed.send(msg).await?;
-        Ok(())
-    }
-
-    pub async fn next_message(&mut self) -> Result<Option<String>> {
-        match self.framed.next().await {
-            Some(Ok(line)) => Ok(Some(line)),
-            Some(Err(e)) => Err(anyhow!("Transport error: {:?}", e)),
-            None => Ok(None),
+    pub async fn listen(&self) -> Result<UnixListener> {
+        let path = Path::new(&self.socket_path);
+        if path.exists() {
+            let _ = fs::remove_file(path);
         }
+        UnixListener::bind(path).map_err(|e| anyhow::anyhow!(e))
+    }
+
+    pub async fn handle_connection(stream: UnixStream) -> Result<()> {
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        while let Some(line) = lines.next_line().await? {
+            let request: Value = serde_json::from_str(&line)?;
+            let id = request.get("id").cloned();
+            
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": "Connected to Crosstalk MCP Gateway"
+            });
+
+            let mut resp_str = serde_json::to_string(&response)?;
+            resp_str.push('\n');
+            writer.write_all(resp_str.as_bytes()).await?;
+        }
+        Ok(())
     }
 }

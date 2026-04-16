@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use crate::types::conversation::{ConversationState, Turn, TurnOutcome};
 pub use crate::types::memory::OutcomeRecord;
 use crate::types::memory::{
@@ -464,6 +465,48 @@ impl MemoryStore {
         weighted_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(weighted_results.into_iter().take(top_k).collect())
     }
+    /// Performs a hybrid ANN + Keyword search.
+    /// Result Score = 0.7 * VectorSimilarity + 0.3 * KeywordMatchScore.
+    pub async fn query_hybrid(
+        &self,
+        table_name: &str,
+        query_text: &str,
+        top_k: usize,
+    ) -> Result<Vec<(MemoryRecord, f64)>> {
+        let weighted_results = self.query_weighted(table_name, query_text, top_k * 3).await?;
+        
+        let query_keywords: HashSet<String> = query_text
+            .to_lowercase()
+            .split_whitespace()
+            .filter(|s| s.len() > 3)
+            .map(|s| s.to_string())
+            .collect();
+
+        let mut hybrid_results = Vec::new();
+        for (record, vector_score) in weighted_results {
+            let record_text = record.content_hash.to_lowercase();
+            let mut match_count = 0;
+            for kw in &query_keywords {
+                if record_text.contains(kw) {
+                    match_count += 1;
+                }
+            }
+            
+            let keyword_score = if !query_keywords.is_empty() {
+                match_count as f64 / query_keywords.len() as f64
+            } else {
+                0.0
+            };
+
+            let final_score = 0.7 * vector_score + 0.3 * keyword_score;
+            hybrid_results.push((record, final_score));
+        }
+
+        hybrid_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(hybrid_results.into_iter().take(top_k).collect())
+    }
+}
+
 
     fn validate_session_id(session_id: &str) -> Result<()> {
         if session_id
@@ -707,7 +750,6 @@ impl MemoryStore {
             storage_size: dir_size(&self.uri),
         })
     }
-}
 
 pub struct ContextDistiller;
 
@@ -801,16 +843,22 @@ impl ContextDistiller {
 pub struct FailurePredictor;
 
 impl FailurePredictor {
-    #[must_use]
-    pub fn proactive_warning(
+    /// Queries the memory bridge for matching antipatterns and returns a preventive warning.
+    pub async fn proactive_avoidance(
         context: &str,
-        failures: &[crate::types::memory::FailureSignature],
+        bridge: &mut MemoryBridge,
     ) -> Option<String> {
-        for failure in failures {
-            if context.contains(&failure.error_type) || context.contains(&failure.error_message) {
+        let antipatterns = bridge.recall_antipatterns(context, 1).await;
+        
+        if let Some(failure) = antipatterns.first() {
+            // Calculate actual similarity
+            let query_emb = embed_text_async(context.to_string()).await;
+            let sim = cosine_sim(&query_emb, &failure.embedding);
+            
+            if sim > 0.8 {
                 return Some(format!(
-                    "Warning: {} detected in context",
-                    failure.error_type
+                    "[PROACTIVE AVOIDANCE] A similar approach previously failed (similarity: {:.2}). Antipattern detected: {}. Avoid this trajectory.",
+                    sim, failure.content_hash
                 ));
             }
         }
@@ -821,19 +869,49 @@ impl FailurePredictor {
 pub struct LessonExtractor;
 
 impl LessonExtractor {
+    /// Extracts structured lessons from a completed session.
+    /// Identifies high-performing agent/task pairs and recurring failure modes.
     #[must_use]
     pub fn extract(turns: &[Turn]) -> Vec<crate::types::memory::Lesson> {
-        turns
-            .iter()
-            .filter(|t| t.outcome == TurnOutcome::TestsPassed)
-            .map(|t| crate::types::memory::Lesson {
-                context_type: "coding".to_string(),
-                approach: format!("Approach used by {}", t.model_id),
-                outcome: "Success (Tests Passed)".to_string(),
-                confidence: 0.95,
-                applicability_tags: vec!["passing_tests".to_string(), "tested".to_string()],
-            })
-            .collect()
+        let mut lessons = Vec::new();
+        let mut agent_performance: HashMap<String, (u32, u32)> = HashMap::new(); // (success, total)
+
+        for t in turns {
+            let stats = agent_performance.entry(t.model_id.clone()).or_insert((0, 0));
+            stats.1 += 1;
+            if t.outcome == TurnOutcome::TestsPassed || t.outcome == TurnOutcome::AdvancedConvergence {
+                stats.0 += 1;
+            }
+        }
+
+        // 1. Extract Specialist Success Lessons
+        for (agent_id, (success, total)) in &agent_performance {
+            let rate = *success as f64 / *total as f64;
+            if rate > 0.8 && *total >= 3 {
+                lessons.push(crate::types::memory::Lesson {
+                    context_type: "agent_specialization".to_string(),
+                    approach: format!("Deploy {} for high-reliability tasks", agent_id),
+                    outcome: format!("Success Rate: {:.0}% over {} turns", rate * 100.0, total),
+                    confidence: rate,
+                    applicability_tags: vec![agent_id.clone(), "reliable".to_string()],
+                });
+            }
+        }
+
+        // 2. Extract Task-Specific Successes
+        for t in turns {
+            if t.outcome == TurnOutcome::TestsPassed {
+                lessons.push(crate::types::memory::Lesson {
+                    context_type: "logic_pattern".to_string(),
+                    approach: format!("Successful logic by {}: {}", t.model_id, t.content.chars().take(100).collect::<String>()),
+                    outcome: "Verified via tests".to_string(),
+                    confidence: 0.9,
+                    applicability_tags: vec!["tested".to_string(), t.model_id.clone()],
+                });
+            }
+        }
+
+        lessons
     }
 }
 
@@ -1243,5 +1321,76 @@ impl SemanticClusterer {
         }
 
         Ok(clusters)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TieredConfig {
+    pub warm_max_bytes: u64,
+    pub warm_ttl_secs: u64,
+}
+
+impl Default for TieredConfig {
+    fn default() -> Self {
+        Self {
+            warm_max_bytes: 512 * 1024 * 1024,
+            warm_ttl_secs: 3600,
+        }
+    }
+}
+
+pub struct TieredMemoryManager {
+    hot: VecDeque<MemoryRecord>,
+    warm: HashMap<String, (MemoryRecord, u64)>, // session_id -> (record, last_access)
+    cold: Arc<MemoryStore>,
+    config: TieredConfig,
+}
+
+impl TieredMemoryManager {
+    pub fn new(cold: Arc<MemoryStore>, config: TieredConfig) -> Self {
+        Self {
+            hot: VecDeque::new(),
+            warm: HashMap::new(),
+            cold,
+            config,
+        }
+    }
+
+    pub fn promote_to_hot(&mut self, record: MemoryRecord) {
+        if self.hot.len() >= 20 {
+            self.hot.pop_front();
+        }
+        self.hot.push_back(record);
+    }
+
+    pub async fn recall_tiered(&mut self, query: &str, k: usize) -> Result<Vec<MemoryRecord>> {
+        // 1. Check Hot (Active Context)
+        let mut results = Vec::new();
+        let query_emb = embed_text_async(query.to_string()).await;
+        
+        for r in &self.hot {
+            let sim = cosine_sim(&query_emb, &r.embedding);
+            if sim > 0.9 {
+                results.push(r.clone());
+            }
+        }
+
+        // 2. Check Warm (RAM Cache)
+        for (r, _ts) in self.warm.values() {
+            let sim = cosine_sim(&query_emb, &r.embedding);
+            if sim > 0.85 {
+                results.push(r.clone());
+            }
+        }
+
+        // 3. Fallback to Cold (LanceDB)
+        if results.len() < k {
+            let cold_results = self.cold.query_weighted(DEFAULT_TABLE, query, k - results.len()).await?;
+            for (r, _) in cold_results {
+                results.push(r);
+            }
+        }
+
+        Ok(results.into_iter().take(k).collect())
     }
 }

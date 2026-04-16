@@ -772,13 +772,59 @@ impl SafetyInterlock {
 pub struct SelfCodeModifier;
 
 impl SelfCodeModifier {
-    const PATTERNS: &'static [(&'static str, &'static str)] =
-        &[(".unwrap_or_else(|_| panic!())", ".unwrap()")];
+    /// Identifies actionable logic hotspots and TODOs for self-modification.
+    pub fn identify_improvements(file_path: &str, content: &str) -> Vec<(String, String)> {
+        let mut improvements = Vec::new();
+        if !SafetyInterlock::is_modification_allowed(file_path) {
+            return improvements;
+        }
+
+        // 1. Actionable TODO Fixes
+        for (i, line) in content.lines().enumerate() {
+            if line.contains("TODO") || line.contains("FIXME") {
+                improvements.push((
+                    format!("L{}: Actionable comment found", i + 1),
+                    format!("Implement the logic described in: {}", line.trim())
+                ));
+            }
+        }
+
+        // 2. Performance Hotspots (Cyclomatic Complexity)
+        // We approximate this by counting branches in the current file string
+        let branches = content.matches("if ").count() + content.matches("match ").count() + content.matches("for ").count();
+        if branches > 20 {
+            improvements.push((
+                "Complexity Optimization".to_string(),
+                format!("File {} has {} branch points. Propose refactoring into sub-modules.", file_path, branches)
+            ));
+        }
+
+        improvements
+    }
 
     pub fn propose_improvement(file_path: &str, current_content: &str) -> Result<String> {
         if !SafetyInterlock::is_modification_allowed(file_path) {
-            return Err(anyhow!(
-                "Modification rejected: {} is a protected file",
+            return Err(anyhow!("Modification rejected: {} is a protected file", file_path));
+        }
+        
+        let mut result = current_content.to_string();
+        let mut changed = false;
+        
+        // Pattern: replace simplistic unwrap_or_else panics with more diagnostic ones
+        let old_panic = ".unwrap_or_else(|_| panic!())";
+        if result.contains(old_panic) {
+            let new_panic = ".expect("Invariant violation in self-modified code: check safety interlock")";
+            result = result.replace(old_panic, new_panic);
+            changed = true;
+        }
+
+        if changed {
+            Ok(result)
+        } else {
+            Err(anyhow!("No sub-optimal code patterns identified in {}", file_path))
+        }
+    }
+} is a protected file",
                 file_path
             ));
         }
@@ -1276,6 +1322,19 @@ impl FileWriter {
                 );
             }
         }
+    }
+
+
+    pub async fn write_artifact_with_proof(&self, artifact: &crate::types::artifact::Artifact) -> Result<WriteOutcome> {
+        let outcome = self.write_artifact(&artifact.name, &artifact.content).await?;
+        if let WriteOutcome::Written(ref path) = outcome {
+            if let Some(proof) = artifact.proof_attachments.last() {
+                let proof_path = path.with_extension(format!("{}.proof", path.extension().and_then(|e| e.to_str()).unwrap_or("txt")));
+                let proof_json = serde_json::to_string_pretty(proof)?;
+                tokio::fs::write(proof_path, proof_json).await?;
+            }
+        }
+        Ok(outcome)
     }
 
     pub async fn write_artifact(&self, name: &str, content: &str) -> Result<WriteOutcome> {

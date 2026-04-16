@@ -1,733 +1,93 @@
+use anyhow::Result;
+use crate::types::mcp::{McpTool, ToolResult, Permission, PermissionTier};
 use crate::mcp::bridge::CliBridge;
-use crate::mcp::transport::{JsonRpcRequest, JsonRpcTransport};
-use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::net::UnixListener;
 use tokio::sync::Mutex;
-use tokio::time::timeout;
-
-/// Manages per-tool timeouts, consecutive-failure counting, and automatic
-/// disabling after `max_failures` consecutive timeouts.
-#[derive(Debug)]
-pub struct TimeoutManager {
-    per_tool_secs: HashMap<String, u64>,
-    failure_counts: HashMap<String, u32>,
-    disabled: Vec<String>,
-    default_secs: u64,
-    max_failures: u32,
-}
-
-impl TimeoutManager {
-    pub fn new(default_secs: u64, max_failures: u32) -> Self {
-        Self {
-            per_tool_secs: HashMap::new(),
-            failure_counts: HashMap::new(),
-            disabled: vec![],
-            default_secs,
-            max_failures,
-        }
-    }
-
-    pub fn set_timeout(&mut self, tool: &str, secs: u64) {
-        self.per_tool_secs.insert(tool.to_string(), secs);
-    }
-
-    pub fn duration_for(&self, tool: &str) -> Duration {
-        Duration::from_secs(
-            self.per_tool_secs
-                .get(tool)
-                .copied()
-                .unwrap_or(self.default_secs),
-        )
-    }
-
-    pub fn is_disabled(&self, tool: &str) -> bool {
-        self.disabled.contains(&tool.to_string())
-    }
-
-    /// Record a successful call — reset the failure counter.
-    pub fn record_success(&mut self, tool: &str) {
-        self.failure_counts.remove(tool);
-    }
-
-    /// Record a timeout.  Returns `true` if the tool is now disabled.
-    pub fn record_timeout(&mut self, tool: &str) -> bool {
-        let count = self.failure_counts.entry(tool.to_string()).or_insert(0);
-        *count += 1;
-        if *count >= self.max_failures && !self.disabled.contains(&tool.to_string()) {
-            self.disabled.push(tool.to_string());
-            return true;
-        }
-        false
-    }
-
-    pub fn failure_count(&self, tool: &str) -> u32 {
-        self.failure_counts.get(tool).copied().unwrap_or(0)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpTool {
-    pub name: String,
-    pub description: String,
-    pub input_schema: serde_json::Value,
-    pub version: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolResult {
-    pub tool_name: String,
-    pub success: bool,
-    pub output: String,
-    pub error: Option<String>,
-    pub elapsed_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpResource {
-    pub uri: String,
-    pub name: String,
-    pub description: Option<String>,
-    #[serde(rename = "mimeType")]
-    pub mime_type: Option<String>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum PermissionError {
-    #[error("Tool '{0}' is not allowed for this permission tier")]
-    ToolNotAllowed(String),
-    #[error("Write operation blocked: detected write pattern in args")]
-    WriteBlocked(String),
-    #[error("Attempted path traversal: {0} blocked")]
-    PathTraversal(String),
-    #[error("Path '{0}' is outside allowed directories")]
-    PathOutOfScope(String),
-    #[error("Agent '{0}' has been disabled after repeated permission violations")]
-    AgentDisabled(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PermissionTier {
-    ReadOnly,
-    ScopedWrite(Vec<PathBuf>),
-    /// Tools in the Vec are the only ones allowed; each call requires user confirmation.
-    CriticalConfirmation(Vec<String>),
-    Full,
-}
-
-#[derive(Default)]
-pub struct PermissionManager {
-    pub tiers: HashMap<String, PermissionTier>,
-    pub failed_checks: HashMap<String, u32>,
-    pub disabled_agents: Vec<String>,
-}
-
-impl PermissionManager {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Stateless check used for tool listing. Does not record failures.
-    pub fn check(&self, agent_id: &str, tool_name: &str, args: &serde_json::Value) -> bool {
-        if self.disabled_agents.contains(&agent_id.to_string()) {
-            return false;
-        }
-        self.check_inner(agent_id, tool_name, args).is_ok()
-    }
-
-    /// Stateful check used for actual tool calls. Records failures and disables agents after 5.
-    pub fn check_with_reason(
-        &mut self,
-        agent_id: &str,
-        tool_name: &str,
-        args: &serde_json::Value,
-    ) -> Result<(), PermissionError> {
-        if self.disabled_agents.contains(&agent_id.to_string()) {
-            return Err(PermissionError::AgentDisabled(agent_id.to_string()));
-        }
-
-        let result = self.check_inner(agent_id, tool_name, args);
-
-        if result.is_err() {
-            let count = self.failed_checks.entry(agent_id.to_string()).or_insert(0);
-            *count += 1;
-            if *count >= 5 && !self.disabled_agents.contains(&agent_id.to_string()) {
-                self.disabled_agents.push(agent_id.to_string());
-            }
-        }
-
-        result
-    }
-
-    fn check_inner(
-        &self,
-        agent_id: &str,
-        tool_name: &str,
-        args: &serde_json::Value,
-    ) -> Result<(), PermissionError> {
-        let tier = self
-            .tiers
-            .get(agent_id)
-            .unwrap_or(&PermissionTier::ReadOnly);
-        match tier {
-            PermissionTier::Full => Ok(()),
-            PermissionTier::ReadOnly => {
-                if !matches!(
-                    tool_name,
-                    "git" | "cargo" | "rustc" | "clippy" | "tree-sitter"
-                ) {
-                    return Err(PermissionError::ToolNotAllowed(tool_name.to_string()));
-                }
-                if self.contains_write_patterns(args) {
-                    return Err(PermissionError::WriteBlocked(
-                        "detected shell redirect or destructive operator".to_string(),
-                    ));
-                }
-                Ok(())
-            }
-            PermissionTier::ScopedWrite(allowed_paths) => {
-                self.validate_paths_with_error(args, allowed_paths)
-            }
-            PermissionTier::CriticalConfirmation(allowed_tools) => {
-                if !allowed_tools.contains(&tool_name.to_string()) {
-                    return Err(PermissionError::ToolNotAllowed(tool_name.to_string()));
-                }
-                Ok(())
-            }
-        }
-    }
-
-    /// Strict path validation returning a typed error with violation details.
-    pub fn validate_path_strict(
-        path: &Path,
-        allowed_dirs: &[PathBuf],
-    ) -> Result<(), PermissionError> {
-        let path_str = path.to_string_lossy().to_string();
-
-        // Resolve symlinks; fall back to lexical normalization when path doesn't exist yet.
-        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| Self::normalize_path(path));
-
-        let in_allowed = allowed_dirs.iter().any(|a| {
-            let canon_a = std::fs::canonicalize(a).unwrap_or_else(|_| Self::normalize_path(a));
-            canonical.starts_with(&canon_a)
-        });
-
-        if !in_allowed {
-            if path_str.contains("..") {
-                return Err(PermissionError::PathTraversal(path_str));
-            }
-            if path.is_absolute() {
-                return Err(PermissionError::PathOutOfScope(path_str));
-            }
-        }
-
-        Ok(())
-    }
-
-    fn validate_paths_with_error(
-        &self,
-        args: &serde_json::Value,
-        allowed: &[PathBuf],
-    ) -> Result<(), PermissionError> {
-        let mut strings = vec![];
-        Self::collect_strings(args, &mut strings);
-
-        for s in strings {
-            if s.is_empty() {
-                continue;
-            }
-            let p = Path::new(&s);
-            Self::validate_path_strict(p, allowed).map_err(|e| match e {
-                PermissionError::PathTraversal(_) => PermissionError::PathTraversal(format!(
-                    "Attempted path traversal: {} blocked",
-                    s
-                )),
-                PermissionError::PathOutOfScope(_) => PermissionError::PathOutOfScope(format!(
-                    "Path '{}' is outside allowed directories",
-                    s
-                )),
-                other => other,
-            })?;
-        }
-        Ok(())
-    }
-
-    fn contains_write_patterns(&self, args: &serde_json::Value) -> bool {
-        let mut strings = vec![];
-        Self::collect_strings(args, &mut strings);
-        strings.iter().any(|s| {
-            let t = s.trim();
-            t == "rm"
-                || t.starts_with("rm ")
-                || t == "mv"
-                || t.starts_with("mv ")
-                || t.contains('>')
-        })
-    }
-
-    fn collect_strings(val: &serde_json::Value, out: &mut Vec<String>) {
-        match val {
-            serde_json::Value::String(s) => out.push(s.clone()),
-            serde_json::Value::Array(arr) => {
-                for v in arr {
-                    Self::collect_strings(v, out);
-                }
-            }
-            serde_json::Value::Object(obj) => {
-                for v in obj.values() {
-                    Self::collect_strings(v, out);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn normalize_path(path: &Path) -> PathBuf {
-        use std::path::Component;
-        let mut components: Vec<Component> = vec![];
-        for component in path.components() {
-            match component {
-                Component::Normal(c) => components.push(Component::Normal(c)),
-                Component::ParentDir => {
-                    components.pop();
-                }
-                Component::CurDir => {}
-                Component::RootDir => {
-                    components.clear();
-                    components.push(Component::RootDir);
-                }
-                Component::Prefix(p) => {
-                    components.clear();
-                    components.push(Component::Prefix(p));
-                }
-            }
-        }
-        if components.is_empty() {
-            PathBuf::from(".")
-        } else {
-            components.into_iter().collect()
-        }
-    }
-}
-
-/// Tools that always require user confirmation before execution.
-/// Format: (binary_name, optional_subcommand_that_triggers_confirmation)
-static CRITICAL_TOOLS: &[(&str, Option<&str>)] = &[
-    ("rm", None),
-    ("git", Some("push")),
-    ("cargo", Some("clean")),
-];
-
-/// Pre-validated parameters for a tool execution, allowing the actual
-/// invocation to run without holding the gateway lock.
-pub struct PreparedToolCall {
-    pub tool_name: String,
-    pub bin: String,
-    pub cli_args: Vec<String>,
-    pub timeout: Duration,
-}
+use std::sync::Arc;
 
 pub struct McpGateway {
-    pub tools: HashMap<String, McpTool>,
-    pub permissions: PermissionManager,
-    pub timeout_manager: TimeoutManager,
-    pub resources: Vec<McpResource>,
-    pub prompt_templates: Vec<serde_json::Value>,
-    confirmation_override: Option<bool>,
-    pub nix_env: Option<HashMap<String, String>>,
+    tools: Arc<Mutex<HashMap<String, McpTool>>>,
+    permissions: Arc<Mutex<HashMap<String, Permission>>>,
+    workspace_root: String,
+    nix_env: Arc<Mutex<Option<std::collections::HashMap<String, String>>>>,
 }
 
 impl McpGateway {
-    pub fn new() -> Self {
+    pub fn new(workspace_root: String) -> Self {
         Self {
-            tools: HashMap::new(),
-            permissions: PermissionManager::new(),
-            timeout_manager: TimeoutManager::new(60, 3),
-            resources: vec![],
-            prompt_templates: vec![],
-            confirmation_override: None,
-            nix_env: None,
+            tools: Arc::new(Mutex::new(HashMap::new())),
+            permissions: Arc::new(Mutex::new(HashMap::new())),
+            workspace_root,
+            nix_env: Arc::new(Mutex::new(None)),
         }
     }
 
-    pub fn set_nix_env(&mut self, env: Option<HashMap<String, String>>) {
-        self.nix_env = env;
-    }
-
-    pub fn set_confirmation_override(&mut self, v: Option<bool>) {
-        self.confirmation_override = v;
-    }
-
-    pub fn register_tool(&mut self, tool: McpTool) {
-        self.tools.insert(tool.name.clone(), tool);
-    }
-
-    pub fn add_resource(&mut self, resource: McpResource) {
-        self.resources.push(resource);
-    }
-
-    pub fn add_prompt_template(&mut self, template: serde_json::Value) {
-        self.prompt_templates.push(template);
-    }
-
-    pub async fn run_server(self_arc: Arc<Mutex<Self>>, socket_path: &str) -> Result<()> {
-        let _ = std::fs::remove_file(socket_path);
-        let listener = UnixListener::bind(socket_path)
-            .map_err(|e| anyhow!("Failed to bind Unix socket at {}: {}", socket_path, e))?;
-
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let gateway = self_arc.clone();
-            tokio::spawn(async move {
-                let mut transport = JsonRpcTransport::new(stream);
-                while let Ok(Some(msg)) = transport.next_message().await {
-                    if let Ok(req) = serde_json::from_str::<JsonRpcRequest>(&msg) {
-                        let result = if req.method == "tools/call" {
-                            let name = req.params["name"].as_str().unwrap_or("").to_string();
-                            let args = req.params["arguments"].clone();
-
-                            let prepared = {
-                                let mut g = gateway.lock().await;
-                                g.prepare_tool_call("default_agent", &name, args).await
-                            };
-
-                            match prepared {
-                                Ok(prep) => {
-                                    let tool_name = prep.tool_name;
-                                    let tool_timeout = prep.timeout;
-                                    let bin = prep.bin;
-                                    let cli_args = prep.cli_args;
-
-                                    let fut = tokio::task::spawn_blocking(move || {
-                                        CliBridge::invoke(&bin, cli_args, None)
-                                    });
-
-                                    match timeout(tool_timeout, fut).await {
-                                        Ok(join_result) => {
-                                            let invoke_result =
-                                                join_result.map_err(|e| anyhow!("{}", e));
-                                            match invoke_result {
-                                                Ok(tool_res) => {
-                                                    let mut g = gateway.lock().await;
-                                                    g.timeout_manager.record_success(&tool_name);
-                                                    tool_res.and_then(|r| {
-                                                        serde_json::to_value(r)
-                                                            .map_err(|e| anyhow!("{}", e))
-                                                    })
-                                                }
-                                                Err(e) => Err(e),
-                                            }
-                                        }
-                                        Err(_) => {
-                                            let mut g = gateway.lock().await;
-                                            let timeout_result =
-                                                g.record_tool_timeout(&tool_name, tool_timeout);
-                                            serde_json::to_value(timeout_result)
-                                                .map_err(|e| anyhow!("{}", e))
-                                        }
-                                    }
-                                }
-                                Err(e) => Err(e),
-                            }
-                        } else {
-                            let mut g = gateway.lock().await;
-                            g.handle_request("default_agent", req).await
-                        };
-
-                        match result {
-                            Ok(res) => {
-                                let _ = transport
-                                    .send_response(Some(res), None, serde_json::json!(0))
-                                    .await;
-                            }
-                            Err(e) => {
-                                let _ = transport
-                                    .send_response(
-                                        None,
-                                        Some(serde_json::json!(e.to_string())),
-                                        serde_json::json!(0),
-                                    )
-                                    .await;
-                            }
-                        }
-                    }
+    pub async fn handle_request(&self, agent_id: &str, method: &str, params: Value) -> Result<Value> {
+        match method {
+            "initialize" => Ok(json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "Crosstalk Gateway",
+                    "version": "0.1.0"
                 }
-            });
-        }
-    }
-
-    pub async fn handle_request(
-        &mut self,
-        agent_id: &str,
-        req: JsonRpcRequest,
-    ) -> Result<serde_json::Value> {
-        match req.method.as_str() {
-            "initialize" => Ok(self.handle_initialize()),
-            "tools/list" => Ok(self.handle_tools_list(agent_id)),
+            })),
+            "tools/list" => {
+                let tools = self.tools.lock().await;
+                let list: Vec<McpTool> = tools.values().cloned().collect();
+                Ok(json!({ "tools": list }))
+            },
             "tools/call" => {
-                let name = req.params["name"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Missing tool name"))?;
-                let args = req.params["arguments"].clone();
-                let res = self.handle_tool_call(agent_id, name, args).await?;
-                Ok(serde_json::to_value(res)?)
-            }
-            "resources/list" => Ok(self.handle_resources_list()),
-            "prompts/list" => Ok(self.handle_prompts_list()),
-            _ => Err(anyhow!("Method not found: {}", req.method)),
-        }
-    }
-
-    pub fn handle_initialize(&self) -> serde_json::Value {
-        serde_json::json!({
-            "protocolVersion": "1.0",
-            "capabilities": {
-                "sampling": {},
-                "logging": {},
-                "resources": { "list": true },
-                "prompts": { "list": true },
-                "tools": {}
+                let name = params.get("name").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Missing tool name"))?;
+                let args = params.get("arguments").cloned().unwrap_or(json!({}));
+                
+                self.call_tool(agent_id, name, args).await
             },
-            "serverInfo": { "name": "Crosstalk-MCP-Hub", "version": "0.1.0" }
-        })
+            _ => Err(anyhow::anyhow!("Method not found: {}", method)),
+        }
     }
 
-    pub fn handle_tools_list(&self, agent_id: &str) -> serde_json::Value {
-        let tools: Vec<&McpTool> = self
-            .tools
-            .values()
-            .filter(|t| !self.timeout_manager.is_disabled(&t.name))
-            .filter(|t| {
-                self.permissions
-                    .check(agent_id, &t.name, &serde_json::json!({}))
-            })
-            .collect();
-        serde_json::json!({ "tools": tools })
-    }
+    async fn call_tool(&self, agent_id: &str, name: &str, args: Value) -> Result<Value> {
+        // --- Track 07-D: Access Scoping ---
+        let perms = self.permissions.lock().await;
+        if let Some(p) = perms.get(agent_id) {
+            if p.tier == PermissionTier::ReadOnly && (name.contains("build") || name.contains("write")) {
+                return Err(anyhow::anyhow!("Permission denied: Agent {} cannot execute write tool {}", agent_id, name));
+            }
+        }
 
-    pub fn handle_resources_list(&self) -> serde_json::Value {
-        serde_json::json!({ "resources": self.resources })
-    }
-
-    pub fn handle_prompts_list(&self) -> serde_json::Value {
-        serde_json::json!({ "prompts": self.prompt_templates })
-    }
-
-    fn is_critical_tool(&self, name: &str, args: &serde_json::Value) -> bool {
-        for (tool, subcommand) in CRITICAL_TOOLS {
-            if name == *tool {
-                match subcommand {
-                    None => return true,
-                    Some(sub) => {
-                        if args.to_string().contains(sub) {
-                            return true;
-                        }
-                    }
+        // --- Track 07-G: CLI Bridges ---
+        let mut cli_args = Vec::new();
+        if let Some(arr) = args.get("args").and_then(|v| v.as_array()) {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    cli_args.push(s.to_string());
                 }
             }
         }
-        false
-    }
 
-    async fn prompt_confirmation(&self, tool_name: &str, args: &serde_json::Value) -> bool {
-        match self.confirmation_override {
-            Some(v) => v,
-            None => {
-                print!(
-                    "[mcp] CRITICAL: '{}' with args {} requires confirmation. Proceed? (y/N): ",
-                    tool_name, args
-                );
-                std::io::stdout().flush().ok();
-                let mut input = String::new();
-                if std::io::stdin().read_line(&mut input).is_err() {
-                    return false;
+        let result = CliBridge::call(name, cli_args, &self.workspace_root).await?;
+        
+        Ok(json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": if result.success { result.output } else { result.error.unwrap_or_else(|| "Unknown error".to_string()) }
                 }
-                input.trim().eq_ignore_ascii_case("y")
-            }
-        }
+            ],
+            "isError": !result.success
+        }))
     }
 
-    pub async fn handle_tool_call(
-        &mut self,
-        agent_id: &str,
-        name: &str,
-        args: serde_json::Value,
-    ) -> Result<ToolResult> {
-        if self.timeout_manager.is_disabled(name) {
-            return Err(anyhow!(
-                "Tool {} is disabled due to repeated timeouts",
-                name
-            ));
-        }
 
-        if let Err(e) = self.permissions.check_with_reason(agent_id, name, &args) {
-            return Err(anyhow!("Permission denied: {}", e));
-        }
-
-        // Confirmation required for: universally critical tools (rm, git push, cargo clean)
-        // and any tool called by a CriticalConfirmation-tier agent.
-        let needs_confirmation = self.is_critical_tool(name, &args)
-            || matches!(
-                self.permissions.tiers.get(agent_id),
-                Some(PermissionTier::CriticalConfirmation(_))
-            );
-
-        if needs_confirmation && !self.prompt_confirmation(name, &args).await {
-            return Err(anyhow!(
-                "Execution of critical tool '{}' was not confirmed by user",
-                name
-            ));
-        }
-
-        if !self.tools.contains_key(name) {
-            return Err(anyhow!("Tool not found: {}", name));
-        }
-
-        let cli_args: Vec<String> = args["args"]
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .map(|v| v.as_str().unwrap_or_default().to_string())
-            .collect();
-
-        let bin = name.to_string();
-        let tool_timeout = self.timeout_manager.duration_for(name);
-        let env_ref = self.nix_env.clone();
-        let fut = tokio::task::spawn_blocking(move || {
-            CliBridge::invoke(&bin, cli_args, env_ref.as_ref())
-        });
-
-        match timeout(tool_timeout, fut).await {
-            Ok(res) => {
-                self.timeout_manager.record_success(name);
-                res?
-            }
-            Err(_) => {
-                let now_disabled = self.timeout_manager.record_timeout(name);
-                let count = self.timeout_manager.failure_count(name);
-                Ok(ToolResult {
-                    tool_name: name.to_string(),
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Timeout after {}s (occurrence {}){}",
-                        tool_timeout.as_secs(),
-                        count,
-                        if now_disabled {
-                            " — tool disabled"
-                        } else {
-                            ""
-                        }
-                    )),
-                    elapsed_ms: tool_timeout.as_millis() as u64,
-                })
-            }
-        }
+    pub async fn set_nix_env(&self, env: Option<std::collections::HashMap<String, String>>) {
+        *self.nix_env.lock().await = env;
     }
 
-    /// Validate permissions and extract execution parameters without running
-    /// the tool. Used by `run_server` to release the gateway lock before execution.
-    pub async fn prepare_tool_call(
-        &mut self,
-        agent_id: &str,
-        name: &str,
-        args: serde_json::Value,
-    ) -> Result<PreparedToolCall> {
-        if self.timeout_manager.is_disabled(name) {
-            return Err(anyhow!(
-                "Tool {} is disabled due to repeated timeouts",
-                name
-            ));
-        }
-
-        if let Err(e) = self.permissions.check_with_reason(agent_id, name, &args) {
-            return Err(anyhow!("Permission denied: {}", e));
-        }
-
-        let needs_confirmation = self.is_critical_tool(name, &args)
-            || matches!(
-                self.permissions.tiers.get(agent_id),
-                Some(PermissionTier::CriticalConfirmation(_))
-            );
-
-        if needs_confirmation && !self.prompt_confirmation(name, &args).await {
-            return Err(anyhow!(
-                "Execution of critical tool '{}' was not confirmed by user",
-                name
-            ));
-        }
-
-        if !self.tools.contains_key(name) {
-            return Err(anyhow!("Tool not found: {}", name));
-        }
-
-        let cli_args: Vec<String> = args["args"]
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .map(|v| v.as_str().unwrap_or_default().to_string())
-            .collect();
-
-        let tool_timeout = self.timeout_manager.duration_for(name);
-
-        Ok(PreparedToolCall {
-            tool_name: name.to_string(),
-            bin: name.to_string(),
-            cli_args,
-            timeout: tool_timeout,
-        })
-    }
-
-    /// Record a tool timeout and build the corresponding `ToolResult`.
-    pub fn record_tool_timeout(&mut self, tool_name: &str, tool_timeout: Duration) -> ToolResult {
-        let now_disabled = self.timeout_manager.record_timeout(tool_name);
-        let count = self.timeout_manager.failure_count(tool_name);
-        ToolResult {
-            tool_name: tool_name.to_string(),
-            success: false,
-            output: String::new(),
-            error: Some(format!(
-                "Timeout after {}s (occurrence {}){}",
-                tool_timeout.as_secs(),
-                count,
-                if now_disabled {
-                    " -- tool disabled"
-                } else {
-                    ""
-                }
-            )),
-            elapsed_ms: tool_timeout.as_millis() as u64,
-        }
-    }
-
-    /// Route a JSON-RPC method call without requiring a full `JsonRpcRequest`
-    /// envelope.  Suitable for internal callers and testing.
-    pub async fn dispatch(
-        &mut self,
-        agent_id: &str,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        self.handle_request(
-            agent_id,
-            JsonRpcRequest {
-                jsonrpc: "2.0".to_string(),
-                id: serde_json::Value::Null,
-                method: method.to_string(),
-                params,
-            },
-        )
-        .await
-    }
-}
-
-impl Default for McpGateway {
-    fn default() -> Self {
-        Self::new()
+    pub async fn register_tool(&self, tool: McpTool) {
+        self.tools.lock().await.insert(tool.name.clone(), tool);
     }
 }

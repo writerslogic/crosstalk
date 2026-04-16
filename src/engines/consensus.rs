@@ -75,10 +75,7 @@ impl NashSolver {
         max_rounds: usize,
     ) -> Vec<RefinementRound> {
         let mut rounds = Vec::new();
-
-        if proposals.is_empty() || max_rounds == 0 {
-            return rounds;
-        }
+        if proposals.is_empty() || max_rounds == 0 { return rounds; }
 
         for (agent_id, proposal) in proposals {
             rounds.push(RefinementRound {
@@ -90,35 +87,16 @@ impl NashSolver {
             });
         }
 
-        let mut prev_resolutions: Vec<String> =
-            proposals.iter().map(|(_, p)| p.to_string()).collect();
-
+        let mut prev_resolutions: Vec<String> = proposals.iter().map(|(_, p)| p.to_string()).collect();
         for round in 1..max_rounds {
             let all_same = prev_resolutions.windows(2).all(|w| w[0] == w[1]);
-            if all_same {
-                for r in rounds
-                    .iter_mut()
-                    .filter(|r| r.round_index == round as u32 - 1)
-                {
-                    r.accepted = true;
-                }
-                break;
-            }
+            if all_same { break; }
 
             let mut current_resolutions = Vec::new();
             for (i, (agent_id, proposal)) in proposals.iter().enumerate() {
-                let others: Vec<&str> = prev_resolutions
-                    .iter()
-                    .enumerate()
-                    .filter(|(j, _)| *j != i)
-                    .map(|(_, p)| p.as_str())
-                    .collect();
+                let others: Vec<&str> = prev_resolutions.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, p)| p.as_str()).collect();
                 current_resolutions.push(proposal.to_string());
-                let critique = if others.is_empty() {
-                    String::new()
-                } else {
-                    format!("Disputes: {}", others.join("; "))
-                };
+                let critique = if others.is_empty() { String::new() } else { format!("Disputes: {}", others.join("; ")) };
                 rounds.push(RefinementRound {
                     round_index: round as u32,
                     agent_id: agent_id.to_string(),
@@ -127,92 +105,87 @@ impl NashSolver {
                     accepted: false,
                 });
             }
-
-            let round_converged = current_resolutions.windows(2).all(|w| w[0] == w[1]);
-            if round_converged {
-                for r in rounds.iter_mut().filter(|r| r.round_index == round as u32) {
-                    r.accepted = true;
-                }
-                break;
-            }
+            if current_resolutions.windows(2).all(|w| w[0] == w[1]) { break; }
             prev_resolutions = current_resolutions;
         }
-
         rounds
     }
 
     /// Resolve disagreements using the given strategy.
-    /// `proposals`: (agent_id, influence_weight, proposal_text)
     #[must_use]
     pub fn resolve(proposals: &[(&str, f64, &str)], strategy: ResolutionStrategy) -> String {
-        if proposals.is_empty() {
-            return String::new();
-        }
-
+        if proposals.is_empty() { return String::new(); }
         match strategy {
             ResolutionStrategy::Voting => {
-                let mut counts: HashMap<&str, usize> = HashMap::new();
-                for (_, _, text) in proposals {
-                    *counts.entry(text).or_insert(0) += 1;
-                }
-                counts
-                    .into_iter()
-                    .max_by(|(t1, c1), (t2, c2)| c1.cmp(c2).then_with(|| t1.cmp(t2)))
-                    .map(|(t, _)| t.to_string())
-                    .unwrap_or_default()
+                let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+                for (_, _, text) in proposals { *counts.entry(text).or_insert(0) += 1; }
+                counts.into_iter().max_by(|(t1, c1), (t2, c2)| c1.cmp(c2).then_with(|| t1.cmp(t2))).map(|(t, _)| t.to_string()).unwrap_or_default()
             }
             ResolutionStrategy::WeightedAverage => {
-                let mut weights: HashMap<&str, f64> = HashMap::new();
-                for (_, w, text) in proposals {
-                    *weights.entry(text).or_insert(0.0) += w;
-                }
-                weights
-                    .into_iter()
-                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
-                    .map(|(t, _)| t.to_string())
-                    .unwrap_or_default()
+                let mut weights: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
+                for (_, w, text) in proposals { *weights.entry(text).or_insert(0.0) += w; }
+                weights.into_iter().max_by(|(_, a), (_, b)| a.total_cmp(b)).map(|(t, _)| t.to_string()).unwrap_or_default()
             }
-            ResolutionStrategy::ExpertDeference => proposals
-                .iter()
-                .max_by(|(_, a, _), (_, b, _)| a.total_cmp(b))
-                .map(|(_, _, t)| t.to_string())
-                .unwrap_or_default(),
+            ResolutionStrategy::ExpertDeference => proposals.iter().max_by(|(_, a, _), (_, b, _)| a.total_cmp(b)).map(|(_, _, t)| t.to_string()).unwrap_or_default(),
             ResolutionStrategy::Mediation => {
-                if proposals.is_empty() {
-                    return String::new();
-                }
-
-                let all_words: Vec<std::collections::HashSet<&str>> = proposals
-                    .iter()
-                    .map(|(_, _, t)| t.split_whitespace().collect())
-                    .collect();
-
-                // Return the proposal with the most overlap with all others (most central).
-                proposals
-                    .iter()
-                    .max_by_key(|(_, _, t)| {
-                        let words: std::collections::HashSet<&str> = t.split_whitespace().collect();
-                        all_words
-                            .iter()
-                            .map(|other| words.intersection(other).count())
-                            .sum::<usize>()
-                    })
-                    .map(|(_, _, t)| t.to_string())
-                    .unwrap_or_default()
+                let all_words: Vec<std::collections::HashSet<&str>> = proposals.iter().map(|(_, _, t)| t.split_whitespace().collect()).collect();
+                proposals.iter().max_by_key(|(_, _, t)| {
+                    let words: std::collections::HashSet<&str> = t.split_whitespace().collect();
+                    all_words.iter().map(|other| words.intersection(other).count()).sum::<usize>()
+                }).map(|(_, _, t)| t.to_string()).unwrap_or_default()
             }
         }
     }
 
-    /// Solves a 2x2 payoff matrix for pure strategy equilibria.
-    #[must_use]
+    /// Find the Pure Strategy Nash Equilibria (PSNE) for an N-player game.
+    pub fn find_nash_equilibrium(matrix: &[Vec<Vec<f64>>]) -> Option<usize> {
+        let n = matrix.len();
+        if n == 0 { return None; }
+        let strategies = matrix[0].len();
+        let mut psne_indices = Vec::new();
+        for s in 0..strategies {
+            let mut is_nash = true;
+            for i in 0..n {
+                let current_payoff = matrix[i][s][s];
+                for alt_s in 0..strategies {
+                    if alt_s != s && matrix[i][alt_s][s] > current_payoff + 1e-5 {
+                        is_nash = false;
+                        break;
+                    }
+                }
+                if !is_nash { break; }
+            }
+            if is_nash { psne_indices.push(s); }
+        }
+        // Pareto Efficiency: maximize total welfare among Nash Equilibria
+        psne_indices.into_iter().max_by(|&a, &b| {
+            let welfare_a: f64 = (0..n).map(|i| matrix[i][a][a]).sum();
+            let welfare_b: f64 = (0..n).map(|i| matrix[i][b][b]).sum();
+            welfare_a.total_cmp(&welfare_b)
+        })
+    }
+
+    /// Resolves the optimal artifact proposal using Game Theoretical consensus.
+    pub fn resolve_optimal_proposal(proposals: &[(&str, &Artifact, TurnOutcome)], current: &Artifact) -> usize {
+        let matrix = PayoffCalculator::compute_payoff_matrix(proposals, current);
+        Self::find_nash_equilibrium(&matrix).unwrap_or_else(|| {
+            // Fallback to Social Welfare Maximization
+            let n = proposals.len();
+            (0..n).max_by(|&a, &b| {
+                let welfare_a: f64 = (0..n).map(|i| matrix[i][a][a]).sum();
+                let welfare_b: f64 = (0..n).map(|i| matrix[i][b][b]).sum();
+                welfare_a.total_cmp(&welfare_b)
+            }).unwrap_or(0)
+        })
+    }
+
+    /// Legacy 2x2 solver for backward compatibility and testing.
     pub fn solve_2x2_pure(matrix: &[[(f64, f64); 2]; 2]) -> Vec<(usize, usize)> {
         let mut equilibria = vec![];
         for r in 0..2 {
             for c in 0..2 {
                 let (p1_payoff, p2_payoff) = matrix[r][c];
-                let p1_is_best = p1_payoff >= matrix[1 - r][c].0;
-                let p2_is_best = p2_payoff >= matrix[r][1 - c].1;
-                if p1_is_best && p2_is_best {
+                if p1_payoff >= matrix[1 - r][c].0 && p2_payoff >= matrix[r][1 - c].1 {
                     equilibria.push((r, c));
                 }
             }
@@ -237,28 +210,28 @@ pub struct KalmanConvergence {
 }
 
 impl KalmanConvergence {
-    const PROCESS_NOISE: f64 = 0.01;
-    const MEASUREMENT_NOISE: f64 = 0.1;
+    const PROCESS_NOISE: f64 = 0.002; // Low drift assumption
 
-    #[must_use]
     pub fn new(initial_p: f64) -> Self {
         Self {
             p_c: initial_p.clamp(0.0, 1.0),
-            variance: 1.0,
+            variance: 0.2,
             innovation: 0.0,
         }
     }
 
-    /// Run one Kalman predict-update cycle with fixed process/measurement noise.
-    ///
-    /// Returns the updated `p_c` estimate.
-    pub fn update(&mut self, measurement: f64) -> f64 {
-        // Predict step: propagate variance forward.
+    /// Adaptive Update: adjust measurement noise R based on turn certainty.
+    /// Certainty 2208 [0, 1]. R = R_base / (Certainty + 03b5)
+    pub fn update_adaptive(&mut self, measurement: f64, certainty: f64) -> f64 {
         self.variance += Self::PROCESS_NOISE;
 
-        // Update step.
-        let innovation_covariance = self.variance + Self::MEASUREMENT_NOISE;
+        // Adaptive Measurement Noise: lower certainty = higher noise = lower Kalman Gain
+        let r_base = 0.1;
+        let r_adaptive = r_base / (certainty.max(0.01));
+
+        let innovation_covariance = self.variance + r_adaptive;
         let kalman_gain = self.variance / innovation_covariance;
+
         self.innovation = measurement - self.p_c;
         self.p_c += kalman_gain * self.innovation;
         self.variance *= 1.0 - kalman_gain;
@@ -266,6 +239,14 @@ impl KalmanConvergence {
 
         self.p_c.clamp(0.0, 1.0)
     }
+
+
+    pub fn check_stalling(&self, history: &[f64]) -> bool {
+        if history.len() < 3 { return false; }
+        let mean_velocity = history.windows(2).map(|w| w[1] - w[0]).sum::<f64>() / (history.len() - 1) as f64;
+        mean_velocity.abs() < 0.01
+    }
+
 
     /// Returns `true` once the posterior variance falls below `threshold`,
     /// indicating the estimate has stabilised.
@@ -441,81 +422,38 @@ impl InfluenceWeightManager {
 pub struct PayoffCalculator;
 
 impl PayoffCalculator {
-    /// Score a single artifact on [0, 1].
-    ///
-    /// Uses `ArtifactMetrics` when populated, falling back to raw content
-    /// length. Proof attachments are a strong positive signal.
-    #[must_use]
-    pub fn evaluate(artifact: &Artifact) -> f64 {
+    pub fn evaluate(artifact: &Artifact, outcome: &TurnOutcome) -> f64 {
         let m = &artifact.metrics;
-        let has_metrics = m.line_count > 0;
-
-        let base = if has_metrics {
-            let complexity_penalty = (m.cyclomatic_complexity as f64 * 0.015).min(0.25);
-            let coupling_penalty = (m.coupling_factor as f64 * 0.008).min(0.15);
-            let comment_bonus = (m.comment_density * 0.15).min(0.12);
-            let size_bonus = (m.line_count as f64 / 600.0).min(0.12);
-            0.65 + comment_bonus + size_bonus - complexity_penalty - coupling_penalty
-        } else {
-            #[allow(clippy::cast_precision_loss)]
-            let length_bonus = (artifact.content.len() as f64 / 2000.0).min(0.18);
-            #[allow(clippy::cast_precision_loss)]
-            let churn_penalty = (artifact.history.len() as f64 * 0.04).min(0.25);
-            0.65 + length_bonus - churn_penalty
+        let correctness = match outcome {
+            TurnOutcome::TestsPassed => 1.0,
+            TurnOutcome::Compiled => 0.8,
+            TurnOutcome::AdvancedConvergence => 0.7,
+            TurnOutcome::Rejected | TurnOutcome::RolledBack => 0.0,
+            _ => 0.5,
         };
-
-        let proof_bonus = (artifact.proof_attachments.len() as f64 * 0.04).min(0.12);
-        let version_penalty = if artifact.version > 15 {
-            ((artifact.version - 15) as f64 * 0.008).min(0.08)
-        } else {
-            0.0
-        };
-
-        (base + proof_bonus - version_penalty).clamp(0.0, 1.0)
+        let performance = if m.line_count > 0 {
+            let size_penalty = (m.line_count as f64 / 2000.0).min(0.2);
+            1.0 - size_penalty
+        } else { 0.6 };
+        let maintainability = if m.line_count > 0 {
+            let complexity_penalty = (m.cyclomatic_complexity as f64 * 0.02).min(0.3);
+            let coupling_penalty = (m.coupling_factor as f64 * 0.01).min(0.2);
+            let comment_bonus = (m.comment_density * 0.2).min(0.15);
+            (0.8 - complexity_penalty - coupling_penalty + comment_bonus).clamp(0.0, 1.0)
+        } else { 0.6 };
+        let alignment = (artifact.proof_attachments.len() as f64 * 0.05).min(1.0);
+        (correctness * 0.4 + performance * 0.2 + maintainability * 0.3 + alignment * 0.1).clamp(0.0, 1.0)
     }
 
-    /// Compute an N×N payoff matrix for N competing artifact proposals.
-    ///
-    /// Entry `[i][j]` is agent `i`'s payoff when facing agent `j`'s proposal.
-    /// Payoffs blend relative quality advantage (70 %) with coordination
-    /// incentive toward the current artifact baseline (30 %).
-    #[must_use]
-    pub fn compute_payoff_matrix(
-        proposals: &[(&str, &Artifact)],
-        current: &Artifact,
-    ) -> Vec<Vec<f64>> {
-        let current_score = Self::evaluate(current);
-        let scores: Vec<f64> = proposals.iter().map(|(_, a)| Self::evaluate(a)).collect();
-
-        scores
-            .iter()
-            .map(|&my_score| {
-                scores
-                    .iter()
-                    .map(|&their_score| {
-                        // Relative advantage: normalised to [0, 1].
-                        let relative = ((my_score - their_score) * 0.5 + 0.5).clamp(0.0, 1.0);
-                        // Coordination bonus: reward improvement over current baseline.
-                        let coordination = (1.0 - (my_score - current_score).abs()).clamp(0.0, 1.0);
-                        relative * 0.7 + coordination * 0.3
-                    })
-                    .collect()
-            })
-            .collect()
-    }
-
-    /// Return the strategy index (row in the payoff matrix) that maximises
-    /// the sum of `my_payoffs[i] + opponent_payoffs[i]` — the Nash-optimal
-    /// joint response given what the opponent will also receive.
-    #[must_use]
-    pub fn best_response(my_payoffs: &[f64], opponent_payoffs: &[f64]) -> usize {
-        my_payoffs
-            .iter()
-            .copied()
-            .zip(opponent_payoffs.iter().copied())
-            .enumerate()
-            .max_by(|(_, (a1, b1)), (_, (a2, b2))| (a1 + b1).total_cmp(&(a2 + b2)))
-            .map(|(i, _)| i)
-            .unwrap_or(0)
-    }
+    pub fn compute_payoff_matrix(proposals: &[(&str, &Artifact, TurnOutcome)], current: &Artifact) -> Vec<Vec<f64>> {
+        let current_score = Self::evaluate(current, &TurnOutcome::Unknown);
+        let scores: Vec<f64> = proposals.iter().map(|(_, a, o)| Self::evaluate(a, o)).collect();
+        scores.iter().map(|&my_score| {
+            scores.iter().map(|&their_score| {
+                let relative = ((my_score - their_score) * 0.5 + 0.5).clamp(0.0, 1.0);
+                let coordination = (1.0 - (my_score - current_score).abs()).clamp(0.0, 1.0);
+                relative * 0.7 + coordination * 0.3
+            }).collect()
+        }).collect()
+    } 
 }

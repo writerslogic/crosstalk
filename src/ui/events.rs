@@ -26,6 +26,12 @@ pub fn drain_stream_events(app: &mut App, stream_rx: &mut mpsc::Receiver<StreamE
                 app.agent_weights = agent_weights.into_iter().collect();
             }
             StreamEvent::ArtifactsUpdated(list) => app.artifacts = list,
+            StreamEvent::EntropyUpdated(entries) => {
+                app.entropy_scores = entries.into_iter().map(|e| crate::ui::app::EntropyRow {
+                    artifact: e.artifact_name,
+                    agents: e.scores,
+                }).collect();
+            }
             StreamEvent::CheckpointWritten(idx) => {
                 app.push_event(format!("Checkpoint i_{idx}"));
             }

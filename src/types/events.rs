@@ -9,6 +9,12 @@ pub struct ArtifactSnapshot {
 }
 
 #[derive(Debug, Clone)]
+pub struct EntropyEntry {
+    pub artifact_name: String,
+    pub scores: Vec<(String, f64)>, // (agent_id, score)
+}
+
+#[derive(Debug, Clone)]
 pub enum StreamEvent {
     TokenReceived {
         agent_id: String,
@@ -21,6 +27,7 @@ pub enum StreamEvent {
         agent_weights: Vec<(String, f64)>,
     },
     ArtifactsUpdated(Vec<ArtifactSnapshot>),
+    EntropyUpdated(Vec<EntropyEntry>),
     CheckpointWritten(u32),
     Error(String),
 }

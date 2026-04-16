@@ -157,6 +157,10 @@ impl App {
 
         // Update per-artifact change history for entropy computation
         for (artifact_name, diff) in &turn.diffs {
+            let added = diff.diff_text.lines().filter(|l| l.starts_with('+')).count();
+            let removed = diff.diff_text.lines().filter(|l| l.starts_with('-')).count();
+            self.push_event(format!("  [diff] {} (+{}, -{})", artifact_name, added, removed));
+
             let entry = self
                 .artifact_change_history
                 .entry(artifact_name.clone())

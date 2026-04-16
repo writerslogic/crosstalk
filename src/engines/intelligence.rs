@@ -1,6 +1,7 @@
 use crate::types::conversation::{ConversationState, TaskCategory, Turn, TurnOutcome};
 use crate::types::intelligence::{ModelProfile, PromptTemplate, RegressionAlert};
 use anyhow::{Context, Result, anyhow};
+use sled;
 use dashmap::DashMap;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -85,6 +86,8 @@ pub struct IntelligenceEngine {
     pub templates: Arc<RwLock<Vec<PromptTemplate>>>,
     pub storage_path: Option<String>,
     pub latency_predictor: LatencyPredictor,
+    pub failures: Arc<FailurePatternStore>,
+    pub learner: StrategyLearner,
     checkpoint: CheckpointService,
 }
 
@@ -110,6 +113,8 @@ impl IntelligenceEngine {
             templates: Arc::new(RwLock::new(Vec::new())),
             storage_path: None,
             latency_predictor: LatencyPredictor::new(),
+            failures: Arc::new(FailurePatternStore::new(".crosstalk/intel").unwrap()),
+            learner: StrategyLearner::new(),
             checkpoint: CheckpointService::new(),
         }
     }
@@ -121,6 +126,8 @@ impl IntelligenceEngine {
             templates: Arc::new(RwLock::new(Vec::new())),
             storage_path: Some(path.to_string()),
             latency_predictor: LatencyPredictor::new(),
+            failures: Arc::new(FailurePatternStore::new(".crosstalk/intel").unwrap()),
+            learner: StrategyLearner::new(),
             checkpoint: CheckpointService::new(),
         };
 
@@ -387,6 +394,27 @@ impl IntelligenceEngine {
     }
 
     #[must_use]
+    
+    pub async fn evolve_prompts(&self, category: TaskCategory) -> Result<()> {
+        let mut templates = self.templates.write().await;
+        let mut top_performers: Vec<_> = templates.iter()
+            .filter(|t| t.category() == category)
+            .collect();
+            
+        top_performers.sort_by(|a, b| b.mean_performance().total_cmp(&a.mean_performance()));
+        
+        if let Some(best) = top_performers.first() {
+            if best.mean_performance() > 0.8 {
+                let mutation = crate::types::intelligence::MutationStrategy::Append(
+                    "Be precise and follow all project invariants strictly.".to_string()
+                );
+                let new_version = best.mutate(mutation);
+                templates.push(new_version);
+            }
+        }
+        Ok(())
+    }
+
     pub fn estimate_tokens(category: TaskCategory) -> u32 {
         category.token_estimate()
     }
@@ -432,9 +460,9 @@ impl QualityScorer {
 pub struct ConvergenceMonitor;
 
 impl ConvergenceMonitor {
-    pub fn should_continue(sigma: &ConversationState) -> bool {
+    pub fn monitor_convergence(sigma: &ConversationState) -> crate::types::intelligence::IterationDecision {
         if sigma.turns.len() < 3 {
-            return true;
+            return crate::types::intelligence::IterationDecision::Continue;
         }
 
         let recent_p: Vec<f64> = sigma
@@ -447,37 +475,50 @@ impl ConvergenceMonitor {
         let velocity = recent_p[0] - recent_p[recent_p.len() - 1];
 
         if sigma.completion_probability > 0.98 {
-            return false;
+            return crate::types::intelligence::IterationDecision::StopEarly;
         }
-        if velocity < 0.01 && sigma.turns.len() > 10 {
-            return false;
+        
+        if velocity > 0.15 {
+            return crate::types::intelligence::IterationDecision::Extend;
         }
 
-        true
+        if velocity < 0.01 && sigma.turns.len() > 10 {
+            return crate::types::intelligence::IterationDecision::StopEarly;
+        }
+
+        crate::types::intelligence::IterationDecision::Continue
     }
 }
 
 pub struct ContextBudgeter;
 
 impl ContextBudgeter {
+    /// Allocates token budget based on information density:
+    /// Score = (unique_decisions + unresolved_conflicts) / token_count
     #[must_use]
-    pub fn allocate(available_tokens: usize, segments: &[(&str, usize)]) -> Vec<usize> {
-        let total_weight: usize = segments.iter().map(|s| s.1).sum();
-        if total_weight == 0 {
-            let n = segments.len().max(1);
-            return vec![available_tokens / n; segments.len()];
+    pub fn allocate_by_density(available_tokens: usize, segments: &[(&str, usize)]) -> Vec<usize> {
+        let mut density_weights = Vec::new();
+        for (text, token_count) in segments {
+            let decisions = text.matches("[decision]").count() + text.matches("###").count();
+            let conflicts = text.matches("TODO").count() + text.matches("FIXME").count();
+            let density = if *token_count > 0 {
+                (decisions + conflicts) as f64 / (*token_count as f64)
+            } else {
+                0.0
+            };
+            density_weights.push(density.max(0.1)); // Minimum weight to prevent starvation
         }
 
-        let mut allocation: Vec<usize> = segments
-            .iter()
-            .map(|s| (s.1 * available_tokens) / total_weight)
-            .collect();
+        let total_weight: f64 = density_weights.iter().sum();
+        let mut allocation = Vec::new();
+        for w in density_weights {
+            allocation.push(((w / total_weight) * available_tokens as f64) as usize);
+        }
 
         let allocated_total: usize = allocation.iter().sum();
-        let remainder = available_tokens - allocated_total;
+        let remainder = available_tokens.saturating_sub(allocated_total);
         if remainder > 0 && !allocation.is_empty() {
-            let last_idx = allocation.len() - 1;
-            allocation[last_idx] += remainder;
+            allocation[0] += remainder;
         }
 
         allocation
@@ -913,5 +954,82 @@ impl ParetoOptimizer {
                 })
             })
             .collect()
+    }
+}
+
+pub struct FailurePatternStore {
+    db: Arc<sled::Db>,
+}
+
+impl FailurePatternStore {
+    pub fn new(path: &str) -> Result<Self> {
+        let db = sled::open(format!("{}/failures", path))?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
+    pub fn record_failure(&self, pattern: crate::types::intelligence::FailurePattern) -> Result<()> {
+        let key = format!("failure:{}", pattern.pattern_id);
+        let encoded = serde_json::to_vec(&pattern)?;
+        self.db.insert(key, encoded)?;
+        Ok(())
+    }
+
+    pub fn find_matches(&self, context_emb: &[f32], threshold: f32) -> Vec<crate::types::intelligence::FailurePattern> {
+        let mut matches = Vec::new();
+        for entry in self.db.scan_prefix("failure:") {
+            if let Ok((_, v)) = entry {
+                if let Ok(p) = serde_json::from_slice::<crate::types::intelligence::FailurePattern>(&v) {
+                    let sim = self.cosine_similarity(context_emb, &p.context_signature);
+                    if sim > threshold {
+                        matches.push(p);
+                    }
+                }
+            }
+        }
+        matches
+    }
+
+    fn cosine_similarity(&self, a: &[f32], b: &[f32]) -> f32 {
+        if a.len() != b.len() || a.is_empty() { return 0.0; }
+        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let mag_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let mag_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if mag_a == 0.0 || mag_b == 0.0 { return 0.0; }
+        dot / (mag_a * mag_b)
+    }
+}
+
+pub struct StrategyLearner {
+    strategies: Arc<DashMap<TaskCategory, Vec<crate::types::intelligence::TurnStrategy>>>,
+}
+
+impl StrategyLearner {
+    pub fn new() -> Self {
+        Self {
+            strategies: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub fn record_session_sequence(&self, category: TaskCategory, sequence: Vec<String>, quality: f64) {
+        let mut list = self.strategies.entry(category).or_default();
+        if let Some(existing) = list.iter_mut().find(|s| s.agent_sequence == sequence) {
+            let total = existing.avg_quality * f64::from(existing.sample_size) + quality;
+            existing.sample_size += 1;
+            existing.avg_quality = total / f64::from(existing.sample_size);
+        } else {
+            list.push(crate::types::intelligence::TurnStrategy {
+                task_category: category,
+                agent_sequence: sequence,
+                avg_quality: quality,
+                sample_size: 1,
+            });
+        }
+    }
+
+    pub fn get_best_strategy(&self, category: TaskCategory) -> Option<Vec<String>> {
+        let list = self.strategies.get(&category)?;
+        list.iter()
+            .max_by(|a, b| a.avg_quality.total_cmp(&b.avg_quality))
+            .map(|s| s.agent_sequence.clone())
     }
 }

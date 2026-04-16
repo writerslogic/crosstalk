@@ -47,15 +47,21 @@ impl QualityEngine {
             0.0
         };
 
-        let health_score =
-            1.0 - (f64::from(complexity) / 100.0) - (f64::from(coupling) / 20.0) + comment_density;
+        // Complexity score: 1.0 is simple, 0.0 is unmaintainable (complexity > 50)
+        let comp_score = (1.0 - (f64::from(complexity) / 50.0)).max(0.0);
+        // Coupling score: 1.0 is decoupled, 0.0 is highly coupled (coupling > 15)
+        let coup_score = (1.0 - (f64::from(coupling) / 15.0)).max(0.0);
+        // Comment score: 1.0 is well-documented (density > 0.2)
+        let comm_score = (comment_density / 0.2).min(1.0);
+
+        let health_score = (comp_score * 0.5 + coup_score * 0.3 + comm_score * 0.2).clamp(0.0, 1.0);
 
         ArtifactMetrics {
             cyclomatic_complexity: complexity,
             coupling_factor: coupling,
             comment_density,
             line_count: total_lines,
-            health_score: health_score.clamp(0.0, 1.0),
+            health_score,
         }
     }
 
@@ -236,10 +242,18 @@ impl ValidatorRegistry {
 pub struct RegressionDetector;
 
 impl RegressionDetector {
+    /// Returns true if the new artifact metrics represent a regression (quality floor check).
+    /// Regression = health_score drop > 5% OR complexity increase > 20%.
     #[must_use]
     pub fn is_regressive(old: &ArtifactMetrics, new: &ArtifactMetrics) -> bool {
-        new.cyclomatic_complexity > old.cyclomatic_complexity + 5
-            || new.comment_density < old.comment_density - 0.1
+        let health_drop = old.health_score - new.health_score;
+        let complexity_pct_increase = if old.cyclomatic_complexity > 0 {
+            (new.cyclomatic_complexity as f64 - old.cyclomatic_complexity as f64) / old.cyclomatic_complexity as f64
+        } else {
+            0.0
+        };
+
+        health_drop > 0.05 || complexity_pct_increase > 0.20
     }
 }
 

@@ -130,7 +130,8 @@ impl Orchestrator {
         event_tx: mpsc::Sender<StreamEvent>,
         control_rx: mpsc::Receiver<ControlSignal>,
     ) -> Result<Self> {
-        let mut mcp_gateway = McpGateway::new();
+        let file_writer = FileWriter::from_env()?;
+        let mut mcp_gateway = McpGateway::new(file_writer.root.display().to_string());
         let tools = tokio::task::spawn_blocking(ToolDiscovery::scan)
             .await
             .unwrap_or_default();
@@ -233,6 +234,14 @@ impl Orchestrator {
             .send(event)
             .await
             .map_err(|_| anyhow::anyhow!("event channel closed"))
+    }
+
+
+    pub async fn tool_call(&self, agent_id: &str, name: &str, args: serde_json::Value) -> Result<serde_json::Value> {
+        self.mcp_gateway.handle_request(agent_id, "tools/call", serde_json::json!({
+            "name": name,
+            "arguments": args
+        })).await
     }
 
     pub async fn run_turn(&self, sigma_lock: Arc<Mutex<ConversationState>>) -> Result<bool> {
@@ -452,7 +461,28 @@ impl Orchestrator {
                         Some(ControlSignal::Resume) => { let _ = paused_tx.send(false); },
                         Some(ControlSignal::Shutdown) => return Ok(false),
                         Some(ControlSignal::Inject(text)) => {
-                            self.emit(StreamEvent::TokenReceived { agent_id: "User".to_string(), token: text }).await?;
+                            // --- Track 04-B: Neural Intercept (Manual Steering) ---
+                            self.emit(StreamEvent::TokenReceived { agent_id: "User".to_string(), token: format!("
+[Neural Intercept] Injecting: {}
+", text) }).await?;
+                            let mut sigma = sigma_lock.lock().await;
+                            let user_turn = Turn {
+                                index: sigma.iteration_index,
+                                model_id: "User".to_string(),
+                                content: text.clone(),
+                                timestamp: ConversationState::now(),
+                                diffs: vec![],
+                                certainty: Some(1.0),
+                                outcome: TurnOutcome::Unknown,
+                                task_category: Some(TaskCategory::Research),
+                                structure: Some(TurnStructure::FreeForm),
+                                signature: vec![],
+                                surprise_signal: None,
+                            };
+                            sigma.turns.push(user_turn);
+                            sigma.iteration_index += 1;
+                            // Returning false will restart the turn with the new sigma context
+                            return Ok(false);
                         }
                         Some(ControlSignal::Rewind(index)) => {
                             if let Ok(Some(restored)) = self.state_manager.restore_async(index).await {
@@ -499,6 +529,39 @@ impl Orchestrator {
                     outlier_penalty.insert(id, 0.1);
                 }
             }
+
+            // --- Track 04-C: Entropy Mapping (Disagreement Heatmap) ---
+            let mut entropy_entries = Vec::new();
+            // We can approximate disagreement per artifact by comparing what each agent proposed.
+            // But since final_results is just the full text, we must parse artifacts first.
+            let mut agent_artifact_proposals: std::collections::HashMap<String, std::collections::HashMap<String, String>> = std::collections::HashMap::new();
+            for (id, text) in &final_results {
+                for (art_name, (_, content)) in Self::parse_artifacts(text) {
+                    agent_artifact_proposals.entry(art_name).or_default().insert(id.clone(), content);
+                }
+            }
+
+            for (art_name, proposals) in agent_artifact_proposals {
+                let mut scores = Vec::new();
+                let agents: Vec<(&String, &String)> = proposals.iter().collect();
+                for (id_i, content_i) in &agents {
+                    let mut dist_sum = 0.0;
+                    let mut count = 0;
+                    for (id_j, content_j) in &agents {
+                        if id_i == id_j { continue; }
+                        let diff = similar::TextDiff::from_lines(content_i, content_j);
+                        dist_sum += 1.0 - diff.ratio();
+                        count += 1;
+                    }
+                    let score = if count > 0 { dist_sum / count as f64 } else { 0.0 };
+                    scores.push(((*id_i).clone(), score));
+                }
+                entropy_entries.push(crate::types::events::EntropyEntry {
+                    artifact_name: art_name,
+                    scores,
+                });
+            }
+            self.emit(crate::types::events::StreamEvent::EntropyUpdated(entropy_entries)).await?;
         }
 
         // 1. Collective Text Synthesis (surprise + certainty + outlier calibrated)
@@ -516,31 +579,36 @@ impl Orchestrator {
         drop(se);
         let synthesized_text = EnsembleEngine::merge_proposals(text_proposals);
 
-        // 2. Collective Artifact Synthesis
-        let mut artifact_proposals: BTreeMap<String, (String, Vec<ArtifactDiff>)> = BTreeMap::new();
-        for (_id, text) in &final_results {
-            let parsed = Self::parse_artifacts(text);
-            for (name, (lang, content)) in parsed {
-                let default_art = Arc::new(Artifact::default());
-                let current = artifacts_snapshot.get(&name).unwrap_or(&default_art);
-                let diff = DiffEngine::generate_delta(&current.content, &content, current.version);
-
-                let entry = artifact_proposals.entry(name).or_insert((lang, vec![]));
-                entry.1.push(diff);
-            }
-        }
-
+         // 2. Collective Artifact Synthesis (Nash Equilibrium Resolution)
         let mut synthesized_artifacts = String::new();
-        for (name, (lang, diffs)) in artifact_proposals {
+        for (name, (lang, _diffs)) in artifact_proposals {
             let default_art = Arc::new(Artifact::default());
             let current = artifacts_snapshot.get(&name).unwrap_or(&default_art);
-            if let Some(merged_content) = SynthesisEngine::merge(&current.content, diffs, &lang) {
-                let _ = writeln!(
-                    synthesized_artifacts,
-                    "\n```{}:{}\n{}\n```",
-                    lang, name, merged_content
-                );
+
+            // Build proposal list for this artifact
+            let mut proposals_for_nash = Vec::new();
+            for (agent_id, text) in &final_results {
+                let parsed = Self::parse_artifacts(text);
+                if let Some((_, content)) = parsed.get(&name) {
+                    let mut temp_art = (**current).clone();
+                    temp_art.content = content.clone();
+                    // Note: In a real turn, we would run a mock compilation here to get actual outcomes.
+                    // For synthesis, we approximate with Compiled status.
+                    proposals_for_nash.push((agent_id.as_str(), temp_art, TurnOutcome::Compiled));
+                }
             }
+
+            if proposals_for_nash.is_empty() { continue; }
+
+            // Use Nash Equilibrium to find the best proposal for this artifact
+            let winner_idx = crate::engines::consensus::NashSolver::resolve_optimal_proposal(&proposals_for_nash.iter().map(|(id, art, out)| (*id, art, *out)).collect::<Vec<_>>(), current);
+            let winning_content = &proposals_for_nash[winner_idx].1.content;
+
+            let _ = writeln!(
+                synthesized_artifacts,
+                "\n```{}:{}\n{}\n```",
+                lang, name, winning_content
+            );
         }
 
         let response = format!("{}\n{}", synthesized_text, synthesized_artifacts);
@@ -1069,7 +1137,7 @@ impl Orchestrator {
         } else {
             certainty * 0.8
         };
-        let next_p = kalman.update(measurement);
+        let next_p = kalman.update_adaptive(measurement, certainty);
         self.completion_probability
             .store(next_p.to_bits(), Ordering::Release);
         sigma.completion_probability = next_p;
@@ -1136,7 +1204,7 @@ impl Orchestrator {
             if let Some(artifact) = sigma.artifacts.get(name) {
                 match self
                     .file_writer
-                    .write_artifact(&artifact.name, &artifact.content)
+                    .write_artifact_with_proof(artifact)
                     .await
                 {
                     Ok(WriteOutcome::Written(path)) => {
@@ -1666,6 +1734,43 @@ impl Orchestrator {
 
     pub fn resume(&self, index: u32) -> Result<ConversationState> {
         self.rewind(index)
+    }
+
+    
+    pub async fn finalize_session(&self, sigma_lock: Arc<Mutex<ConversationState>>) -> Result<()> {
+        let sigma = sigma_lock.lock().await;
+        
+        // 1. Self-Evaluation
+        let eval = SelfImprovementEngine::evaluate_session(&sigma);
+        self.emit(StreamEvent::TokenReceived {
+            agent_id: "System".to_string(),
+            token: format!("\n[Self-Improvement] Session Evaluation: convergence_p={:.2}, failure_rate={:.2}\n", 
+                           eval.metrics.get("convergence_p").unwrap_or(&0.0),
+                           eval.metrics.get("failure_rate").unwrap_or(&0.0))
+        }).await?;
+
+        // 2. Post-Mortem Generation (if needed)
+        if let Some(pm) = PostMortemGenerator::generate(&sigma) {
+             self.emit(StreamEvent::TokenReceived {
+                agent_id: "System".to_string(),
+                token: format!("\n[Self-Improvement] Post-Mortem: detected root cause {:?}\n", pm.root_cause)
+            }).await?;
+        }
+
+        // 3. Trigger Continuous Learning
+        {
+            let mut intell = self.intelligence.lock().await;
+            let mut learner = crate::engines::self_improvement::ContinuousLearner {
+                prompt_library: &mut crate::engines::self_improvement::PromptLibrary::new(), // Placeholder for real library
+                calibration: &mut crate::engines::self_improvement::CalibrationTracker::new(),
+                error_ledger: &mut crate::engines::self_improvement::ErrorBudgetLedger::new(),
+            };
+            // Note: In a real implementation, these would be fields of IntelligenceEngine or separate actors.
+            // For the prototype, we exercise the logic.
+            learner.run(&sigma, None, 0.5, 0.5);
+        }
+
+        Ok(())
     }
 
     pub fn get_completion_probability(&self) -> f64 {

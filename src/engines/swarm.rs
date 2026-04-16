@@ -142,8 +142,9 @@ impl SwarmController {
                 tokio::select! {
                     result = turn_rx.recv() => {
                         match result {
-                            Ok(_turn) => {
-                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            Ok(turn) => {
+                                // σ-Syncing: apply the global turn delta to local view
+                                // In production, this would update the node's local Sled tree
                                 nodes_ref.insert(id_clone.clone(), NodeStatus::WaitingMerge);
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
