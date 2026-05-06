@@ -166,8 +166,6 @@ async fn main() -> anyhow::Result<()> {
     let sigma = Arc::new(Mutex::new(ConversationState::new(session_id)));
 
     if let Some(ref ws) = args.workspace {
-        // SAFETY: called before spawning threads; sets workspace root for FileWriter
-        unsafe { std::env::set_var("CROSSTALK_PROJECT_ROOT", ws) };
         let patterns = if args.files.is_empty() {
             vec!["**/*".to_string()]
         } else {
@@ -194,7 +192,8 @@ async fn main() -> anyhow::Result<()> {
     let (control_tx, control_rx) = mpsc::channel::<ControlSignal>(100);
 
     // 5. Initialize Orchestrator (may fail if engines fail to init)
-    let omicron = match Orchestrator::new(manager, agents, event_tx, control_rx).await {
+    let workspace_root = args.workspace.as_deref().map(std::path::PathBuf::from);
+    let omicron = match Orchestrator::new(manager, agents, event_tx, control_rx, workspace_root).await {
         Ok(o) => o,
         Err(e) => {
             eprintln!("ORCHESTRATOR INIT ERROR: {}", e);

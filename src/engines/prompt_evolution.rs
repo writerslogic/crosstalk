@@ -311,6 +311,7 @@ mod tests {
             template_text: text.to_string(),
             task_category: TaskCategory::CodeGeneration,
             variables: vec![],
+            tags: vec![],
             performance_history: vec![],
         };
         for i in 0..6 {

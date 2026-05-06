@@ -645,8 +645,10 @@ impl ConvergenceMonitor {
             return crate::types::intelligence::IterationDecision::Continue;
         }
 
-        let p_history: Vec<f64> = sigma.turns.iter().map(|_| sigma.completion_probability).collect();
-        let last_p = *p_history.last().unwrap_or(&0.0);
+        let last_p = sigma.completion_probability;
+        let p_history: Vec<f64> = sigma.turns.iter()
+            .map(|t| t.certainty.unwrap_or(0.0))
+            .collect();
         
         if last_p > 0.98 { return crate::types::intelligence::IterationDecision::StopEarly; }
 

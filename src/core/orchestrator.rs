@@ -155,9 +155,13 @@ impl Orchestrator {
         agents: Vec<Box<dyn PromptAgent>>,
         event_tx: mpsc::Sender<StreamEvent>,
         control_rx: mpsc::Receiver<ControlSignal>,
+        workspace_root: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         let agent_count = agents.len();
-        let file_writer = FileWriter::from_env()?;
+        let file_writer = match workspace_root {
+            Some(root) => FileWriter::new(root),
+            None => FileWriter::from_env()?,
+        };
         let mut mcp_gateway = McpGateway::with_workspace(file_writer.root.display().to_string());
         let tools = match tokio::task::spawn_blocking(ToolDiscovery::scan).await {
             Ok(t) => t,
@@ -231,7 +235,7 @@ impl Orchestrator {
             analytics: AnalyticsEngine,
             collective: Mutex::new(CollectiveIntelligenceEngine::new()),
             viz: Mutex::new(GodView::new()),
-            file_writer: FileWriter::from_env()?,
+            file_writer,
             auditor_tx,
             audit_rx: Mutex::new(alert_rx),
             surprise_engine: Mutex::new(SurpriseEngine::new()),

@@ -413,6 +413,10 @@ pub struct FileWriter {
 }
 
 impl FileWriter {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
     pub fn from_env() -> Result<Self> {
         let root = std::env::var("CROSSTALK_PROJECT_ROOT").unwrap_or_else(|_| ".".to_string());
         Ok(Self { root: PathBuf::from(root) })
