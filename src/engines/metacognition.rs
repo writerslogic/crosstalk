@@ -426,7 +426,7 @@ impl MetacognitiveObserver {
             if !state.evidence.is_empty() {
                 continue;
             }
-            if recent_quality.get(id).map_or(false, |q| *q > 0.6) {
+            if recent_quality.get(id).is_some_and(|q| *q > 0.6) {
                 continue;
             }
             state.confidence = (state.confidence - rate).max(0.0);

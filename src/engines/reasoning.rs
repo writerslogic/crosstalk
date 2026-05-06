@@ -731,16 +731,9 @@ impl SynthesisEngine {
                     result_lines.push(String::new());
                     continue;
                 }
-                let freq = line_freq.get(&normalized).copied().unwrap_or(1);
+                let _freq = line_freq.get(&normalized).copied().unwrap_or(1);
                 // Include the line if it's in the base and passes consensus (or is the only base).
-                if freq > consensus_threshold || total == 1 {
-                    result_lines.push(raw_line.to_string());
-                }
-                // Lines that appear in only the base but not in the majority are still kept
-                // (they're the base proposal's unique contribution).
-                else {
-                    result_lines.push(raw_line.to_string());
-                }
+                result_lines.push(raw_line.to_string());
             }
         }
 

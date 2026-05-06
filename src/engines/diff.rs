@@ -44,11 +44,10 @@ impl DiffEngine {
                 if base_idx < base_lines.len() {
                     base_idx += 1;
                 }
-            } else if line.starts_with('-') {
-                if base_idx < base_lines.len() {
+            } else if line.starts_with('-')
+                && base_idx < base_lines.len() {
                     base_idx += 1;
                 }
-            }
         }
         for line in base_lines.iter().skip(base_idx) {
             result.push_str(line);

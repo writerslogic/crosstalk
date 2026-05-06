@@ -35,13 +35,12 @@ fn log_event(ev: &StreamEvent) {
             }
             out
         });
-        if !lines.is_empty() {
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/crosstalk.log") {
+        if !lines.is_empty()
+            && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/crosstalk.log") {
                 for line in lines {
                     crate::log_warn!(writeln!(f, "{line}"), "failed to write log event");
                 }
             }
-        }
         return;
     }
 

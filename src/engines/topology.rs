@@ -260,11 +260,10 @@ impl TopologyManager {
         // Cross-check with session completion probability: if the session is
         // far from complete and quality is dropping, escalate to Ensemble for
         // breadth, otherwise Critique for depth.
-        if let Some(candidate) = best {
-            if candidate != self.current {
+        if let Some(candidate) = best
+            && candidate != self.current {
                 return candidate;
             }
-        }
 
         // Fall back based on completion probability signal from sigma.
         if sigma.completion_probability < 0.3 {

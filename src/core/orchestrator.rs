@@ -337,7 +337,7 @@ impl Orchestrator {
             let recent: Vec<Turn> = s.turns.iter().rev().take(5).cloned().collect();
             (s.session_id.clone(), s.iteration_index, recent)
         };
-        tracing::Span::current().record("session", &pre_session_id.as_str());
+        tracing::Span::current().record("session", pre_session_id.as_str());
         tracing::Span::current().record("turn", pre_turn_idx);
 
         let mut memory_examples = vec![];
@@ -526,11 +526,10 @@ impl Orchestrator {
             }
 
             // Adaptive strategy: pin preferred specialist to front when DirectImplementation fires.
-            if let Some(AdaptiveSelection { preferred_agent: Some(ref preferred), .. }) = adaptive_selection {
-                if let Some(pos) = active.iter().position(|(_, n)| n == preferred) {
+            if let Some(AdaptiveSelection { preferred_agent: Some(ref preferred), .. }) = adaptive_selection
+                && let Some(pos) = active.iter().position(|(_, n)| n == preferred) {
                     active.swap(0, pos);
                 }
-            }
 
             // Apply topology-driven agent grouping
             {
@@ -572,9 +571,9 @@ impl Orchestrator {
                 }
                 // Inject topology prompt modifier from the same directive
                 if let Some(modifier) = &directive.prompt_modifier {
-                    distilled_prompt.push_str("\n");
+                    distilled_prompt.push('\n');
                     distilled_prompt.push_str(modifier);
-                    distilled_prompt.push_str("\n");
+                    distilled_prompt.push('\n');
                 }
             }
 
@@ -624,8 +623,8 @@ impl Orchestrator {
             {
                 let obs = self.observer.lock().await;
                 for (_, name) in &active {
-                    if let Some(state) = obs.epistemic_state(name) {
-                        if state.confidence < 0.5 && !state.defeated.is_empty() {
+                    if let Some(state) = obs.epistemic_state(name)
+                        && state.confidence < 0.5 && !state.defeated.is_empty() {
                             crate::log_warn!(writeln!(
                                 final_prompt,
                                 "\n[EPISTEMIC UPDATE for {name}] Confidence: {:.0}%. \
@@ -634,7 +633,6 @@ impl Orchestrator {
                                 state.defeated
                             ), "Failed to write epistemic update to prompt");
                         }
-                    }
                 }
             }
 
@@ -741,7 +739,7 @@ impl Orchestrator {
             // --- Suggestion 2: Closed-Loop Agent Prompt Evolution ---
             let feedback = {
                 let collective = self.collective.lock().await;
-                collective.profiles.get(&agent_id).and_then(|p| crate::engines::prompt_evolution::ClosedLoopFeedback::generate_corrective_directive(p))
+                collective.profiles.get(&agent_id).and_then(crate::engines::prompt_evolution::ClosedLoopFeedback::generate_corrective_directive)
             };
 
             tasks.push(async move {
@@ -855,10 +853,10 @@ impl Orchestrator {
                         Some(ControlSignal::Shutdown) => return Ok(false),
                         Some(ControlSignal::LockCode(name)) => {
                             let mut sigma = sigma_lock.lock().await;
-                            sigma.goal_tree.root.as_mut().map(|r| {
+                            if let Some(r) = sigma.goal_tree.root.as_mut() {
                                 r.title = format!("{} [LOCKED: {}]", r.title, name);
                                 r.status = crate::types::planning::GoalStatus::Complete;
-                            });
+                            }
                             self.emit(StreamEvent::TokenReceived { agent_id: "System".to_string(), token: format!("[Steer] Locked artifact: {}\n", name) }).await?;
                         }
                         Some(ControlSignal::MuteAgent(id)) => {
@@ -868,7 +866,7 @@ impl Orchestrator {
                         }
                         Some(ControlSignal::DampenSwarm(factor)) => {
                             let mut sigma = sigma_lock.lock().await;
-                            for (_, w) in &mut sigma.agent_weights {
+                            for w in sigma.agent_weights.values_mut() {
                                 *w *= factor;
                             }
                             self.emit(StreamEvent::TokenReceived { agent_id: "System".to_string(), token: format!("[Steer] Dampened swarm by factor: {:.2}\n", factor) }).await?;
@@ -1322,7 +1320,7 @@ impl Orchestrator {
                     consistency_score: None,
                     diff_quality_score: None,
                 };
-                let agent_interventions = obs.observe_turn(&agent_turn, &pre_recent_turns, &mut *surprise);
+                let agent_interventions = obs.observe_turn(&agent_turn, &pre_recent_turns, &mut surprise);
                 interventions.extend(agent_interventions);
             }
             drop(surprise);
@@ -1356,7 +1354,7 @@ impl Orchestrator {
                 diff_quality_score: None,
             };
             let current_quality = QualityScorer::score(&winner_turn);
-            let prior_quality = pre_recent_turns.first().map(|t| QualityScorer::score(t)).unwrap_or(0.5);
+            let prior_quality = pre_recent_turns.first().map(QualityScorer::score).unwrap_or(0.5);
             let improved = current_quality > prior_quality;
             {
                 let pending = self.pending_interventions.lock().await;
@@ -1901,13 +1899,11 @@ impl Orchestrator {
         // Trigger self-improvement on successful outcomes
         if matches!(turn_outcome, TurnOutcome::TestsPassed | TurnOutcome::Compiled) {
             for (name, artifact) in &sigma.artifacts {
-                if let Ok(improved) = crate::engines::self_improvement::SelfCodeModifier::propose_improvement(name, &artifact.content) {
-                    if improved != artifact.content && AstValidator::validate(&improved, &artifact.language).is_ok() {
-                        if let Err(e) = self.file_writer.write_artifact(name, &improved).await {
+                if let Ok(improved) = crate::engines::self_improvement::SelfCodeModifier::propose_improvement(name, &artifact.content)
+                    && improved != artifact.content && AstValidator::validate(&improved, &artifact.language).is_ok()
+                        && let Err(e) = self.file_writer.write_artifact(name, &improved).await {
                             warn!(artifact = %name, error = %e, "self-improvement write failed");
                         }
-                    }
-                }
             }
         }
 

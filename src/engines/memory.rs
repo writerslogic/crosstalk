@@ -259,12 +259,12 @@ impl MemoryBridge {
         );
 
         if is_positive {
-            for i in 0..4 {
-                self.ranker_weights[i] += 0.01 * feature_avgs[i];
+            for (i, avg) in feature_avgs.iter().enumerate() {
+                self.ranker_weights[i] += 0.01 * avg;
             }
         } else if is_negative {
-            for i in 0..4 {
-                self.ranker_weights[i] -= 0.005 * feature_avgs[i];
+            for (i, avg) in feature_avgs.iter().enumerate() {
+                self.ranker_weights[i] -= 0.005 * avg;
             }
         } else {
             return;
@@ -1021,26 +1021,23 @@ impl TieredMemoryManager {
         // ── Cold tier (LanceDB) — only if hot+warm didn't fill quota ────────
         if scored.len() < k {
             let cold_limit = k - scored.len();
-            match self.cold.query_hybrid(DEFAULT_TABLE, query, cold_limit * 2).await {
-                Ok(cold_results) => {
-                    for (rec, _dist) in cold_results {
-                        if seen.contains(&rec.content_hash) {
-                            continue;
-                        }
-                        let sim = local_cosine_similarity(&query_emb, &rec.embedding) as f64;
-                        let age_hours = now.saturating_sub(rec.timestamp) as f64 / 3600.0;
-                        let decay = (-0.01 * age_hours).exp();
-                        let outcome_boost = rec.outcome.as_ref()
-                            .map_or(0.0, |o| if o.tests_passed { 1.0 } else { 0.0 });
-                        let surprise = 0.0_f64;
-                        let score = w[0] * sim + w[1] * decay + w[2] * outcome_boost + w[3] * surprise;
-                        let fp = hash_to_u64(&rec.content_hash);
-                        seen.insert(rec.content_hash.clone());
-                        scored.push((score, fp, rec));
+            // Cold tier may be uninitialized or empty; degrade gracefully.
+            if let Ok(cold_results) = self.cold.query_hybrid(DEFAULT_TABLE, query, cold_limit * 2).await {
+                for (rec, _dist) in cold_results {
+                    if seen.contains(&rec.content_hash) {
+                        continue;
                     }
+                    let sim = local_cosine_similarity(&query_emb, &rec.embedding) as f64;
+                    let age_hours = now.saturating_sub(rec.timestamp) as f64 / 3600.0;
+                    let decay = (-0.01 * age_hours).exp();
+                    let outcome_boost = rec.outcome.as_ref()
+                        .map_or(0.0, |o| if o.tests_passed { 1.0 } else { 0.0 });
+                    let surprise = 0.0_f64;
+                    let score = w[0] * sim + w[1] * decay + w[2] * outcome_boost + w[3] * surprise;
+                    let fp = hash_to_u64(&rec.content_hash);
+                    seen.insert(rec.content_hash.clone());
+                    scored.push((score, fp, rec));
                 }
-                // Cold tier may be uninitialized or empty; degrade gracefully.
-                Err(_) => {}
             }
         }
 
@@ -1114,7 +1111,7 @@ impl TieredMemoryManager {
             feature_sums[3] += surprise;
             count += 1;
         }
-        for (_, (rec, _)) in &self.warm {
+        for (rec, _) in self.warm.values() {
             let fp = hash_to_u64(&rec.content_hash);
             if !hash_set.contains(&fp) {
                 continue;
@@ -1153,12 +1150,12 @@ impl TieredMemoryManager {
         );
 
         if is_positive {
-            for i in 0..4 {
-                self.ranker_weights[i] += 0.01 * feature_avgs[i];
+            for (i, avg) in feature_avgs.iter().enumerate() {
+                self.ranker_weights[i] += 0.01 * avg;
             }
         } else if is_negative {
-            for i in 0..4 {
-                self.ranker_weights[i] -= 0.005 * feature_avgs[i];
+            for (i, avg) in feature_avgs.iter().enumerate() {
+                self.ranker_weights[i] -= 0.005 * avg;
             }
         } else {
             // Stalled / Unknown — no gradient
