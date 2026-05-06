@@ -80,6 +80,7 @@ impl EpistemicState {
 
     /// Extract epistemic state from a turn's content by parsing structured markers.
     pub fn extract_from_content(content: &str) -> Self {
+        const MAX_ASSUMPTIONS: usize = 20;
         let mut state = Self::default();
         let mut in_assumptions = false;
 
@@ -91,7 +92,6 @@ impl EpistemicState {
                     .trim_start_matches("ASSUMPTION:")
                     .trim()
                     .to_string();
-                const MAX_ASSUMPTIONS: usize = 20;
                 if !claim.is_empty() && state.assumptions.len() < MAX_ASSUMPTIONS {
                     state.assumptions.push(Assumption {
                         claim,
@@ -118,7 +118,10 @@ impl EpistemicState {
                 if !ev.is_empty() {
                     state.evidence.push(ev);
                 }
-            } else if in_assumptions && trimmed.starts_with("- ") {
+            } else if in_assumptions
+                && trimmed.starts_with("- ")
+                && state.assumptions.len() < MAX_ASSUMPTIONS
+            {
                 state.assumptions.push(Assumption {
                     claim: trimmed[2..].to_string(),
                     confidence: 0.6,

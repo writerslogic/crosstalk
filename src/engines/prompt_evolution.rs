@@ -91,8 +91,17 @@ impl PromptEvolver {
         if self.population.is_empty() {
             return None;
         }
-        let mut rng = rand::rng();
         let k = self.tournament_size.min(self.population.len());
+        // When the tournament covers the whole population, skip random sampling
+        // and return the global best directly (avoids with-replacement misses).
+        if k >= self.population.len() {
+            return self.population.iter().max_by(|a, b| {
+                a.mean_performance()
+                    .partial_cmp(&b.mean_performance())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        let mut rng = rand::rng();
         let mut best_idx = rng.random_range(0..self.population.len());
         for _ in 1..k {
             let idx = rng.random_range(0..self.population.len());

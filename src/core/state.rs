@@ -156,12 +156,16 @@ fn run_migrations(db: &Db) -> Result<()> {
         match version {
             0 => {
                 // v0 → v1: no structural changes; initial schema baseline.
+                // Write the version bump atomically so a crash here doesn't
+                // replay this migration on restart.
+                let mut batch = sled::Batch::default();
+                batch.insert(SCHEMA_KEY, &1u64.to_le_bytes());
+                db.apply_batch(batch)?;
             }
             v => bail!("No migration defined for schema version {}", v),
         }
     }
 
-    db.insert(SCHEMA_KEY, &SCHEMA_VERSION.to_le_bytes())?;
     db.flush()?;
     Ok(())
 }
