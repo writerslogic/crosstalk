@@ -83,8 +83,73 @@ impl AstValidator {
     pub fn validate(content: &str, language: &str) -> Result<(), ValidationError> {
         match language.to_lowercase().as_str() {
             "rust" | "rs" => Self::validate_rust(content),
-            _ => Err(ValidationError::UnsupportedLanguage(language.to_string())),
+            "python" | "py" => Self::validate_python(content),
+            _ => Ok(()),
         }
+    }
+
+    fn validate_python(content: &str) -> Result<(), ValidationError> {
+        let mut depth: i32 = 0;
+        let mut in_string: Option<char> = None;
+        let mut in_triple: Option<char> = None;
+        let chars: Vec<char> = content.chars().collect();
+        let len = chars.len();
+        let mut i = 0;
+        while i < len {
+            let ch = chars[i];
+            if let Some(q) = in_triple {
+                if ch == q && i + 2 < len && chars[i + 1] == q && chars[i + 2] == q {
+                    in_triple = None;
+                    i += 3;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if let Some(q) = in_string {
+                if ch == '\\' { i += 2; continue; }
+                if ch == q { in_string = None; }
+                i += 1;
+                continue;
+            }
+            if ch == '#' {
+                while i < len && chars[i] != '\n' { i += 1; }
+                continue;
+            }
+            if (ch == '"' || ch == '\'') && i + 2 < len && chars[i + 1] == ch && chars[i + 2] == ch {
+                in_triple = Some(ch);
+                i += 3;
+                continue;
+            }
+            if ch == '"' || ch == '\'' {
+                in_string = Some(ch);
+                i += 1;
+                continue;
+            }
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                _ => {}
+            }
+            if depth < 0 {
+                return Err(ValidationError::ParseError {
+                    language: "python".to_string(),
+                    line: content[..i].lines().count(),
+                    column: 0,
+                    message: "Unmatched closing delimiter".to_string(),
+                });
+            }
+            i += 1;
+        }
+        if depth != 0 {
+            return Err(ValidationError::ParseError {
+                language: "python".to_string(),
+                line: content.lines().count(),
+                column: 0,
+                message: format!("Unclosed delimiters: {} open at end of file", depth),
+            });
+        }
+        Ok(())
     }
 
     /// Extracts top-level nodes (fn, struct, impl) with their content.
@@ -268,7 +333,7 @@ impl AstValidator {
                 language: "rust".to_string(),
                 line: 0,
                 column: 0,
-                message: "Failed to parse content".to_string(),
+                message: format!("Tree-sitter parser returned None ({} bytes input)", content.len()),
             })?;
 
         let root_node = tree.root_node();

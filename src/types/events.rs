@@ -28,6 +28,12 @@ pub enum StreamEvent {
     },
     ArtifactsUpdated(Vec<ArtifactSnapshot>),
     EntropyUpdated(Vec<EntropyEntry>),
+    GodViewUpdated {
+        frame: u64,
+        avg_certainty: f64,
+        avg_surprise: f64,
+        agent_count: usize,
+    },
     CheckpointWritten(u32),
     Error(String),
 }
@@ -39,4 +45,7 @@ pub enum ControlSignal {
     Rewind(u32),
     Shutdown,
     Inject(String),
+    LockCode(String), // artifact name
+    MuteAgent(String), // agent id
+    DampenSwarm(f64), // dampening factor
 }

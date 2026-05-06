@@ -419,7 +419,7 @@ pub async fn run_model_selector() -> Result<Vec<String>> {
                 .await
                 .unwrap_or_default();
 
-                let _ = tx.send((provider_name, ids)).await;
+                crate::log_warn!(tx.send((provider_name, ids)).await, "failed to send model list");
             });
         }
     }

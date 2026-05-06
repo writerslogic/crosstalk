@@ -66,6 +66,9 @@ pub struct App {
     pub entropy_scores: Vec<EntropyRow>,
     /// Ordered list of active agent IDs (columns for heatmap)
     pub agent_list: Vec<String>,
+    pub godview_certainty: f64,
+    pub godview_surprise: f64,
+    pub godview_frame: u64,
     /// Measured frames per second
     pub fps: f32,
     /// Tracks last render time for FPS computation
@@ -98,6 +101,9 @@ impl App {
             focused_pane: FocusedPane::GhostStream,
             entropy_scores: Vec::new(),
             agent_list: Vec::new(),
+            godview_certainty: 0.0,
+            godview_surprise: 0.0,
+            godview_frame: 0,
             fps: 0.0,
             last_render: Instant::now(),
             artifact_change_history: HashMap::new(),
@@ -138,13 +144,33 @@ impl App {
 
         if self.ghost_auto_scroll {
             let line_count = self.streaming_buffer.chars().filter(|&c| c == '\n').count();
-            self.ghost_scroll = line_count.saturating_sub(1);
+            self.ghost_scroll = line_count;
         }
     }
 
     pub fn commit_turn(&mut self, turn: &Turn) {
         self.turn_index = turn.index + 1;
-        self.streaming_buffer.clear();
+
+        // Append turn separator instead of clearing — keep rolling conversation history
+        let outcome_label = match turn.outcome {
+            crate::types::conversation::TurnOutcome::Compiled => "COMPILED",
+            crate::types::conversation::TurnOutcome::TestsPassed => "PASS",
+            crate::types::conversation::TurnOutcome::AdvancedConvergence => "CONVERGING",
+            crate::types::conversation::TurnOutcome::RolledBack => "ROLLBACK",
+            crate::types::conversation::TurnOutcome::Rejected => "REJECTED",
+            crate::types::conversation::TurnOutcome::Stalled => "STALLED",
+            crate::types::conversation::TurnOutcome::Unknown => "OK",
+            crate::types::conversation::TurnOutcome::VerificationFailed => "VERIFY_FAIL",
+        };
+        let certainty_str = turn
+            .certainty
+            .map(|c| format!("{:.0}%", c * 100.0))
+            .unwrap_or_else(|| "?".to_string());
+        self.streaming_buffer.push_str(&format!(
+            "\n--- Turn {} | {} | {} | cert {} ---\n",
+            turn.index, turn.model_id, outcome_label, certainty_str
+        ));
+
         self.push_event(format!(
             "Turn {} by {} ({:?})",
             turn.index, turn.model_id, turn.outcome
@@ -302,7 +328,7 @@ impl App {
             FocusedPane::GhostStream => {
                 self.ghost_auto_scroll = true;
                 let line_count = self.streaming_buffer.chars().filter(|&c| c == '\n').count();
-                self.ghost_scroll = line_count.saturating_sub(1);
+                self.ghost_scroll = line_count;
             }
             FocusedPane::Artifacts => self.artifact_scroll = self.artifacts.len().saturating_sub(1),
             FocusedPane::EntropyMap => {

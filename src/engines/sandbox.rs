@@ -1,19 +1,33 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use wasmtime::*;
-use wasmtime_wasi::sync::WasiCtxBuilder;
+use wasmtime_wasi::WasiCtxBuilder;
+use wasmtime_wasi::pipe::MemoryOutputPipe;
+use wasmtime_wasi::preview1::{self, WasiP1Ctx};
+use std::sync::Arc;
 use std::time::Instant;
+
+/// Default execution timeout in seconds for sandbox operations.
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct SandboxConfig {
     pub memory_limit_bytes: usize,
     pub cpu_fuel_limit: u64,
+    /// Maximum wall-clock seconds before the sandbox execution is aborted.
+    pub timeout_secs: u64,
+}
+
+struct SandboxState {
+    wasi: WasiP1Ctx,
+    limits: StoreLimits,
 }
 
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            memory_limit_bytes: 256 * 1024 * 1024, // 256MB
-            cpu_fuel_limit: 100_000_000,           // 100M units
+            memory_limit_bytes: 256 * 1024 * 1024,
+            cpu_fuel_limit: 100_000_000,
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
         }
     }
 }
@@ -22,8 +36,6 @@ pub struct SandboxResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
-    pub elapsed_ms: u64,
-    pub fuel_consumed: Option<u64>,
 }
 
 pub struct SandboxManager {
@@ -35,53 +47,98 @@ impl SandboxManager {
     pub fn new(config: SandboxConfig) -> Result<Self> {
         let mut wasm_cfg = Config::new();
         wasm_cfg.consume_fuel(true);
+        wasm_cfg.epoch_interruption(true);
         let engine = Engine::new(&wasm_cfg)?;
+
+        // Start background epoch incrementer
+        let engine_clone = engine.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                engine_clone.increment_epoch();
+            }
+        });
+
         Ok(Self { engine, config })
     }
 
+    /// Execute WASM bytes synchronously (blocking). Prefer `execute_with_timeout`
+    /// for async contexts to avoid hanging the executor.
     pub fn execute(&self, wasm_bytes: &[u8]) -> Result<SandboxResult> {
         let start = Instant::now();
         let mut linker = Linker::new(&self.engine);
-        wasmtime_wasi::add_to_linker(&mut linker, |s| s)?;
+        preview1::add_to_linker_sync(&mut linker, |s: &mut SandboxState| &mut s.wasi)?;
+
+        let stdout_pipe = MemoryOutputPipe::new(1024 * 1024);
+        let stderr_pipe = MemoryOutputPipe::new(1024 * 1024);
 
         let wasi = WasiCtxBuilder::new()
-            .inherit_stdout()
-            .inherit_stderr()
+            .stdout(stdout_pipe.clone())
+            .stderr(stderr_pipe.clone())
+            .build_p1();
+
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(self.config.memory_limit_bytes)
             .build();
 
-        let mut store = Store::new(&self.engine, wasi);
+        let mut store = Store::new(&self.engine, SandboxState { wasi, limits });
+        store.limiter(|state| &mut state.limits);
         store.set_fuel(self.config.cpu_fuel_limit)?;
+        store.set_epoch_deadline(1); // Trap after 1 epoch tick if not finished
 
-        let module = Module::from_binary(&self.engine, wasm_bytes)?;
-        linker.module(&mut store, "", &module)?;
+        let module = Module::from_binary(&self.engine, wasm_bytes)
+            .context("failed to compile WASM module from provided bytes")?;
+        linker.module(&mut store, "", &module)
+            .context("failed to link WASM module")?;
 
         let func = linker
-            .get_default(&mut store, "")?
-            .typed::<(), ()>(&store)?;
+            .get_default(&mut store, "")
+            .context("no default export in WASM module")?
+            .typed::<(), ()>(&store)
+            .context("default export has unexpected signature (expected () -> ())")?;
 
         let res = func.call(&mut store, ());
-        let fuel_consumed = store.get_fuel().ok().map(|f| self.config.cpu_fuel_limit - f);
-        
+        let _fuel_consumed = store.get_fuel().ok().map(|f| self.config.cpu_fuel_limit - f);
+        let _elapsed_ms = start.elapsed().as_millis() as u64;
+
         let exit_code = match res {
             Ok(_) => 0,
-            Err(e) => {
-                if let Some(trap) = e.downcast_ref::<Trap>() {
-                    match trap {
-                        Trap::OutOfFuel => 137,
-                        _ => 1,
-                    }
-                } else {
-                    1
-                }
-            }
+            Err(_) => 1,
         };
+
+        let stdout = String::from_utf8_lossy(&stdout_pipe.contents()).into_owned();
+        let stderr = String::from_utf8_lossy(&stderr_pipe.contents()).into_owned();
 
         Ok(SandboxResult {
             exit_code,
-            stdout: String::new(),
-            stderr: String::new(),
-            elapsed_ms: start.elapsed().as_millis() as u64,
-            fuel_consumed,
+            stdout,
+            stderr,
         })
+    }
+
+    /// Execute WASM bytes with a wall-clock timeout guard. The blocking WASM
+    /// execution runs on the tokio blocking thread pool so it cannot stall the
+    /// async reactor, and `tokio::time::timeout` enforces the deadline.
+    pub async fn execute_with_timeout(self: &Arc<Self>, wasm_bytes: &[u8]) -> Result<SandboxResult> {
+        let timeout = tokio::time::Duration::from_secs(self.config.timeout_secs);
+        let bytes = wasm_bytes.to_vec();
+        let this = Arc::clone(self);
+
+        let result = tokio::time::timeout(timeout, tokio::task::spawn_blocking(move || {
+            this.execute(&bytes)
+        }))
+        .await;
+
+        match result {
+            Ok(Ok(inner)) => inner,
+            Ok(Err(join_err)) => Err(anyhow::anyhow!(
+                "sandbox execution task panicked: {join_err}"
+            )),
+            Err(_elapsed) => Err(anyhow::anyhow!(
+                "sandbox execution timed out after {}s",
+                self.config.timeout_secs
+            )),
+        }
     }
 }

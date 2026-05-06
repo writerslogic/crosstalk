@@ -1,6 +1,6 @@
 use crate::types::artifact::Artifact;
-use crate::types::conversation::{ConversationState, TaskCategory, TurnOutcome};
-use std::collections::HashMap;
+use crate::types::conversation::{ConversationState, Turn, TurnOutcome, TaskCategory};
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Debug, Clone)]
 pub struct RefinementRound {
@@ -9,9 +9,10 @@ pub struct RefinementRound {
     pub critique: String,
     pub proposed_resolution: String,
     pub accepted: bool,
+    pub source_turn: Option<Turn>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolutionStrategy {
     Voting,
     WeightedAverage,
@@ -19,125 +20,11 @@ pub enum ResolutionStrategy {
     Mediation,
 }
 
-pub struct ConsensusEngine;
-
-impl ConsensusEngine {
-    pub fn init() {}
-}
-
-/// Computes a "Self-Certainty" score for an agent's turn.
-pub struct CertaintyAnalyzer;
-
-impl CertaintyAnalyzer {
-    pub fn compute(content: &str, volatility: f64) -> f64 {
-        let hedging_terms = [
-            "maybe", "perhaps", "i think", "possibly", "could be", "unsure", "not sure", "might",
-        ];
-        let strong_terms = [
-            "certainly",
-            "definitely",
-            "correct",
-            "fix",
-            "optimal",
-            "verified",
-            "must",
-        ];
-
-        let content_lower = content.to_lowercase();
-
-        let hedging_count = hedging_terms
-            .iter()
-            .filter(|&&t| content_lower.contains(t))
-            .count();
-        let hedging_penalty = (hedging_count.min(4) as f64) * 0.1;
-
-        let strong_bonus: f64 = strong_terms
-            .iter()
-            .filter(|&&t| content_lower.contains(t))
-            .count() as f64
-            * 0.05;
-
-        let adj_volatility = volatility.clamp(0.0, 1.0);
-        let score = 0.7 - hedging_penalty + strong_bonus - adj_volatility * 0.2;
-        score.clamp(0.1, 1.0)
-    }
-}
-
-/// Solves for Nash Equilibrium in game-theoretical payoffs.
+// Formal proofs for NashSolver: verus/consensus.rs
+// Proved: psne_selection_is_deterministic, search_terminates, optimal_is_psne_if_exists.
 pub struct NashSolver;
 
 impl NashSolver {
-    /// Multi-round refinement: agents critique each other until equilibrium or max_rounds.
-    #[must_use]
-    pub fn run_refinement_rounds(
-        &self,
-        proposals: &[(&str, &str)],
-        max_rounds: usize,
-    ) -> Vec<RefinementRound> {
-        let mut rounds = Vec::new();
-        if proposals.is_empty() || max_rounds == 0 { return rounds; }
-
-        for (agent_id, proposal) in proposals {
-            rounds.push(RefinementRound {
-                round_index: 0,
-                agent_id: agent_id.to_string(),
-                critique: String::new(),
-                proposed_resolution: proposal.to_string(),
-                accepted: false,
-            });
-        }
-
-        let mut prev_resolutions: Vec<String> = proposals.iter().map(|(_, p)| p.to_string()).collect();
-        for round in 1..max_rounds {
-            let all_same = prev_resolutions.windows(2).all(|w| w[0] == w[1]);
-            if all_same { break; }
-
-            let mut current_resolutions = Vec::new();
-            for (i, (agent_id, proposal)) in proposals.iter().enumerate() {
-                let others: Vec<&str> = prev_resolutions.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, p)| p.as_str()).collect();
-                current_resolutions.push(proposal.to_string());
-                let critique = if others.is_empty() { String::new() } else { format!("Disputes: {}", others.join("; ")) };
-                rounds.push(RefinementRound {
-                    round_index: round as u32,
-                    agent_id: agent_id.to_string(),
-                    critique,
-                    proposed_resolution: proposal.to_string(),
-                    accepted: false,
-                });
-            }
-            if current_resolutions.windows(2).all(|w| w[0] == w[1]) { break; }
-            prev_resolutions = current_resolutions;
-        }
-        rounds
-    }
-
-    /// Resolve disagreements using the given strategy.
-    #[must_use]
-    pub fn resolve(proposals: &[(&str, f64, &str)], strategy: ResolutionStrategy) -> String {
-        if proposals.is_empty() { return String::new(); }
-        match strategy {
-            ResolutionStrategy::Voting => {
-                let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-                for (_, _, text) in proposals { *counts.entry(text).or_insert(0) += 1; }
-                counts.into_iter().max_by(|(t1, c1), (t2, c2)| c1.cmp(c2).then_with(|| t1.cmp(t2))).map(|(t, _)| t.to_string()).unwrap_or_default()
-            }
-            ResolutionStrategy::WeightedAverage => {
-                let mut weights: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
-                for (_, w, text) in proposals { *weights.entry(text).or_insert(0.0) += w; }
-                weights.into_iter().max_by(|(_, a), (_, b)| a.total_cmp(b)).map(|(t, _)| t.to_string()).unwrap_or_default()
-            }
-            ResolutionStrategy::ExpertDeference => proposals.iter().max_by(|(_, a, _), (_, b, _)| a.total_cmp(b)).map(|(_, _, t)| t.to_string()).unwrap_or_default(),
-            ResolutionStrategy::Mediation => {
-                let all_words: Vec<std::collections::HashSet<&str>> = proposals.iter().map(|(_, _, t)| t.split_whitespace().collect()).collect();
-                proposals.iter().max_by_key(|(_, _, t)| {
-                    let words: std::collections::HashSet<&str> = t.split_whitespace().collect();
-                    all_words.iter().map(|other| words.intersection(other).count()).sum::<usize>()
-                }).map(|(_, _, t)| t.to_string()).unwrap_or_default()
-            }
-        }
-    }
-
-    /// Find the Pure Strategy Nash Equilibria (PSNE) for an N-player game.
     pub fn find_nash_equilibrium(matrix: &[Vec<Vec<f64>>]) -> Option<usize> {
         let n = matrix.len();
         if n == 0 { return None; }
@@ -145,309 +32,346 @@ impl NashSolver {
         let mut psne_indices = Vec::new();
         for s in 0..strategies {
             let mut is_nash = true;
-            for i in 0..n {
-                let current_payoff = matrix[i][s][s];
-                for alt_s in 0..strategies {
-                    if alt_s != s && matrix[i][alt_s][s] > current_payoff + 1e-5 {
-                        is_nash = false;
-                        break;
-                    }
+            for player in matrix.iter().take(n) {
+                let current_payoff = player[s][s];
+                if (0..strategies).any(|alt_s| alt_s != s && player[alt_s][s] > current_payoff + 1e-5) {
+                    is_nash = false;
+                    break;
                 }
-                if !is_nash { break; }
             }
             if is_nash { psne_indices.push(s); }
         }
-        // Pareto Efficiency: maximize total welfare among Nash Equilibria
         psne_indices.into_iter().max_by(|&a, &b| {
-            let welfare_a: f64 = (0..n).map(|i| matrix[i][a][a]).sum();
-            let welfare_b: f64 = (0..n).map(|i| matrix[i][b][b]).sum();
-            welfare_a.total_cmp(&welfare_b)
+            let wa: f64 = matrix.iter().map(|m| m[a][a]).sum();
+            let wb: f64 = matrix.iter().map(|m| m[b][b]).sum();
+            wa.total_cmp(&wb)
         })
     }
 
-    /// Resolves the optimal artifact proposal using Game Theoretical consensus.
     pub fn resolve_optimal_proposal(proposals: &[(&str, &Artifact, TurnOutcome)], current: &Artifact) -> usize {
         let matrix = PayoffCalculator::compute_payoff_matrix(proposals, current);
-        Self::find_nash_equilibrium(&matrix).unwrap_or_else(|| {
-            // Fallback to Social Welfare Maximization
-            let n = proposals.len();
-            (0..n).max_by(|&a, &b| {
-                let welfare_a: f64 = (0..n).map(|i| matrix[i][a][a]).sum();
-                let welfare_b: f64 = (0..n).map(|i| matrix[i][b][b]).sum();
-                welfare_a.total_cmp(&welfare_b)
+        let n = matrix.len();
+        if n == 0 { return 0; }
+
+        let mut n_matrix = vec![vec![vec![0.0; proposals.len()]; proposals.len()]; proposals.len()];
+        for (i, row) in matrix.iter().enumerate().take(n) {
+            for s in 0..proposals.len() {
+                for entry in n_matrix[i][s].iter_mut().take(proposals.len()) {
+                    *entry = row[s];
+                }
+            }
+        }
+
+        Self::find_nash_equilibrium(&n_matrix).unwrap_or_else(|| {
+            (0..proposals.len()).max_by(|&a, &b| {
+                let wa: f64 = matrix.iter().map(|row| row[a]).sum();
+                let wb: f64 = matrix.iter().map(|row| row[b]).sum();
+                wa.total_cmp(&wb)
             }).unwrap_or(0)
         })
     }
 
-    /// Legacy 2x2 solver for backward compatibility and testing.
+    pub fn run_refinement_rounds(&self, proposals: &[(&str, &str)], max_rounds: usize) -> Vec<RefinementRound> {
+        if proposals.is_empty() || max_rounds == 0 {
+            return vec![];
+        }
+        let mut rounds = Vec::new();
+        for round_idx in 0..max_rounds {
+            let mut all_same = true;
+            let first = proposals[0].1;
+            for &(agent_id, proposed) in proposals {
+                if proposed != first {
+                    all_same = false;
+                }
+                rounds.push(RefinementRound {
+                    round_index: round_idx as u32,
+                    agent_id: agent_id.to_string(),
+                    critique: String::new(),
+                    proposed_resolution: proposed.to_string(),
+                    accepted: true,
+                    source_turn: None,
+                });
+            }
+            if all_same {
+                break;
+            }
+        }
+        rounds
+    }
+
+    pub fn resolve(proposals: &[(&str, f64, &str)], strategy: ResolutionStrategy) -> String {
+        if proposals.is_empty() {
+            return String::new();
+        }
+        match strategy {
+            ResolutionStrategy::Voting => {
+                let mut counts: HashMap<&str, usize> = HashMap::new();
+                for &(_, _, text) in proposals {
+                    *counts.entry(text).or_insert(0) += 1;
+                }
+                counts.into_iter().max_by_key(|&(_, c)| c).map(|(t, _)| t.to_string()).unwrap_or_default()
+            }
+            ResolutionStrategy::WeightedAverage | ResolutionStrategy::ExpertDeference => {
+                proposals.iter().max_by(|a, b| a.1.total_cmp(&b.1)).map(|p| p.2.to_string()).unwrap_or_default()
+            }
+            ResolutionStrategy::Mediation => {
+                let mut word_counts: HashMap<&str, usize> = HashMap::new();
+                for &(_, _, text) in proposals {
+                    for word in text.split_whitespace() {
+                        *word_counts.entry(word).or_insert(0) += 1;
+                    }
+                }
+                let threshold = proposals.len() / 2;
+                let mut common: Vec<&str> = word_counts.into_iter()
+                    .filter(|&(_, c)| c > threshold)
+                    .map(|(w, _)| w)
+                    .collect();
+                common.sort();
+                common.join(" ")
+            }
+        }
+    }
+
+    /// Returns ALL pure-strategy Nash equilibrium indices over proposals.
+    /// Used to detect when multiple proposals tie at equilibrium so they can be synthesized.
+    pub fn find_all_equilibria(proposals: &[(&str, &Artifact, TurnOutcome)], current: &Artifact) -> Vec<usize> {
+        let matrix = PayoffCalculator::compute_payoff_matrix(proposals, current);
+        let n = proposals.len();
+        if n == 0 {
+            return vec![];
+        }
+
+        let mut n_matrix = vec![vec![vec![0.0; n]; n]; n];
+        for (i, row) in matrix.iter().enumerate().take(n) {
+            for s in 0..n {
+                for entry in n_matrix[i][s].iter_mut().take(n) {
+                    *entry = row[s];
+                }
+            }
+        }
+
+        let mut equilibria = Vec::new();
+        for s in 0..n {
+            let mut is_nash = true;
+            for player in n_matrix.iter().take(n) {
+                let current_payoff = player[s][s];
+                if (0..n).any(|alt_s| alt_s != s && player[alt_s][s] > current_payoff + 1e-5) {
+                    is_nash = false;
+                    break;
+                }
+            }
+            if is_nash {
+                equilibria.push(s);
+            }
+        }
+        if equilibria.is_empty() {
+            let fallback = (0..n)
+                .max_by(|&a, &b| {
+                    let wa: f64 = matrix.iter().map(|row| row[a]).sum();
+                    let wb: f64 = matrix.iter().map(|row| row[b]).sum();
+                    wa.total_cmp(&wb)
+                })
+                .unwrap_or(0);
+            equilibria.push(fallback);
+        }
+        equilibria
+    }
+
+    /// Resolves proposals to a content string.
+    /// When multiple Nash equilibria survive, synthesizes them rather than picking one winner.
+    pub fn resolve_with_synthesis(proposals: &[(&str, &Artifact, TurnOutcome)], current: &Artifact) -> String {
+        if proposals.is_empty() {
+            return String::new();
+        }
+        let equilibria = Self::find_all_equilibria(proposals, current);
+        if equilibria.len() == 1 {
+            return proposals[equilibria[0]].1.content.clone();
+        }
+        let surviving: Vec<(String, String)> = equilibria
+            .iter()
+            .map(|&idx| (proposals[idx].0.to_string(), proposals[idx].1.content.clone()))
+            .collect();
+        crate::engines::reasoning::SynthesisEngine::synthesize_proposals(&surviving)
+    }
+
     pub fn solve_2x2_pure(matrix: &[[(f64, f64); 2]; 2]) -> Vec<(usize, usize)> {
         let mut equilibria = vec![];
         for r in 0..2 {
             for c in 0..2 {
-                let (p1_payoff, p2_payoff) = matrix[r][c];
-                if p1_payoff >= matrix[1 - r][c].0 && p2_payoff >= matrix[r][1 - c].1 {
+                if matrix[r][c].0 >= matrix[1-r][c].0 && matrix[r][c].1 >= matrix[r][1-c].1 {
                     equilibria.push((r, c));
                 }
             }
         }
         equilibria
     }
+
+    /// Returns a normalized Nash score per agent in `proposals`, in the same order.
+    /// Score is derived from each agent's column-sum payoff relative to the total.
+    pub fn compute_nash_scores(proposals: &[(&str, &Artifact, TurnOutcome)]) -> Vec<(String, f64)> {
+        if proposals.is_empty() {
+            return vec![];
+        }
+        let matrix = PayoffCalculator::compute_payoff_matrix(proposals, proposals[0].1);
+        let n = proposals.len();
+        let col_sums: Vec<f64> = (0..n).map(|col| matrix.iter().map(|row| row[col]).sum()).collect();
+        let total: f64 = col_sums.iter().sum();
+        proposals.iter().zip(col_sums.iter()).map(|((agent_id, _, _), &col_sum)| {
+            let score = if total > 0.0 { col_sum / total } else { 1.0 / n as f64 };
+            (agent_id.to_string(), score.clamp(0.0, 1.0))
+        }).collect()
+    }
 }
 
-/// Kalman Filter for convergence estimation.
-///
-/// Tracks the completion probability `p_c` as a latent state, updating it
-/// with noisy measurements from each turn. Stores the last innovation
-/// (measurement residual) for diagnostics and exposes a `is_converged`
-/// predicate once posterior variance drops below a caller-supplied threshold.
 pub struct KalmanConvergence {
-    /// Posterior estimate of completion probability.
     pub p_c: f64,
-    /// Posterior error covariance (uncertainty in `p_c`).
     pub variance: f64,
-    /// Last measurement residual (measurement − prior prediction).
     pub innovation: f64,
+    process_noise: f64,
+    prev_innovation: f64,
+    oscillation_count: u32,
+    trend_count: u32,
 }
 
 impl KalmanConvergence {
-    const PROCESS_NOISE: f64 = 0.002; // Low drift assumption
-
+    const BASE_PROCESS_NOISE: f64 = 0.002;
     pub fn new(initial_p: f64) -> Self {
         Self {
             p_c: initial_p.clamp(0.0, 1.0),
             variance: 0.2,
             innovation: 0.0,
+            process_noise: Self::BASE_PROCESS_NOISE,
+            prev_innovation: 0.0,
+            oscillation_count: 0,
+            trend_count: 0,
         }
     }
+    pub fn update(&mut self, measurement: f64) -> f64 {
+        self.update_adaptive(measurement, 1.0)
+    }
 
-    /// Adaptive Update: adjust measurement noise R based on turn certainty.
-    /// Certainty 2208 [0, 1]. R = R_base / (Certainty + 03b5)
+    pub fn is_converged(&self, threshold: f64) -> bool {
+        // Require low variance AND no recent oscillation
+        self.variance < threshold && self.oscillation_count < 2
+    }
+
+    pub fn confidence_interval(&self) -> (f64, f64) {
+        let margin = 1.96 * self.variance.sqrt();
+        let lo = (self.p_c - margin).clamp(0.0, 1.0);
+        let hi = (self.p_c + margin).clamp(0.0, 1.0);
+        (lo, hi)
+    }
+
     pub fn update_adaptive(&mut self, measurement: f64, certainty: f64) -> f64 {
-        self.variance += Self::PROCESS_NOISE;
+        // Detect oscillation: innovation sign flips indicate thrashing
+        let new_innovation = measurement - self.p_c;
+        if self.prev_innovation != 0.0 && new_innovation.signum() != self.prev_innovation.signum() {
+            self.oscillation_count = self.oscillation_count.saturating_add(1);
+            self.trend_count = 0;
+            // Increase process noise when oscillating — system is less predictable
+            self.process_noise = (self.process_noise * 1.5).min(0.05);
+        } else {
+            self.trend_count = self.trend_count.saturating_add(1);
+            self.oscillation_count = self.oscillation_count.saturating_sub(1);
+            // Decrease toward base when trending steadily
+            if self.trend_count > 3 {
+                self.process_noise = (self.process_noise * 0.8).max(Self::BASE_PROCESS_NOISE);
+            }
+        }
+        self.prev_innovation = new_innovation;
 
-        // Adaptive Measurement Noise: lower certainty = higher noise = lower Kalman Gain
-        let r_base = 0.1;
-        let r_adaptive = r_base / (certainty.max(0.01));
-
-        let innovation_covariance = self.variance + r_adaptive;
-        let kalman_gain = self.variance / innovation_covariance;
-
-        self.innovation = measurement - self.p_c;
-        self.p_c += kalman_gain * self.innovation;
-        self.variance *= 1.0 - kalman_gain;
-        self.variance = self.variance.max(1e-10);
-
+        self.variance += self.process_noise;
+        let r_adaptive = 0.1 / (certainty.max(0.01));
+        let gain = self.variance / (self.variance + r_adaptive);
+        self.innovation = new_innovation;
+        self.p_c += gain * self.innovation;
+        self.variance *= 1.0 - gain;
         self.p_c.clamp(0.0, 1.0)
     }
+}
 
+pub struct CertaintyAnalyzer;
+impl CertaintyAnalyzer {
+    pub fn compute(content: &str, volatility: f64) -> f64 {
+        let lower = content.to_lowercase();
+        let word_count = content.split_whitespace().count().max(1) as f64;
 
-    pub fn check_stalling(&self, history: &[f64]) -> bool {
-        if history.len() < 3 { return false; }
-        let mean_velocity = history.windows(2).map(|w| w[1] - w[0]).sum::<f64>() / (history.len() - 1) as f64;
-        mean_velocity.abs() < 0.01
-    }
+        // Signal 1: Hedging language (reduces certainty)
+        const HEDGES: &[&str] = &[
+            "maybe", "perhaps", "might", "could be", "not sure", "i think",
+            "possibly", "unclear", "hard to say", "it depends", "arguably",
+            "i'm not certain", "one possibility",
+        ];
+        let hedge_count = HEDGES.iter().filter(|h| lower.contains(*h)).count() as f64;
+        let hedge_penalty = (hedge_count * 0.12).min(0.4);
 
+        // Signal 2: Assertive language (increases certainty)
+        const ASSERTIVE: &[&str] = &[
+            "verified", "confirmed", "optimal", "correct", "proven",
+            "tests pass", "all tests", "successfully", "no issues",
+            "the solution is", "this fixes", "this resolves",
+            "implemented", "works", "complete", "done",
+        ];
+        let assert_count = ASSERTIVE.iter().filter(|a| lower.contains(*a)).count() as f64;
+        let assert_boost = (assert_count * 0.11).min(0.35);
 
-    /// Returns `true` once the posterior variance falls below `threshold`,
-    /// indicating the estimate has stabilised.
-    #[must_use]
-    pub fn is_converged(&self, threshold: f64) -> bool {
-        self.variance < threshold
-    }
+        // Signal 3: Code presence (concrete output = higher certainty)
+        let code_blocks = content.matches("```").count() / 2;
+        let code_boost = (code_blocks as f64 * 0.05).min(0.15);
 
-    /// 95 % confidence interval around the current `p_c` estimate.
-    /// Interval is clamped to [0, 1].
-    #[must_use]
-    pub fn confidence_interval(&self) -> (f64, f64) {
-        let half_width = 1.96 * self.variance.sqrt();
-        (
-            (self.p_c - half_width).max(0.0),
-            (self.p_c + half_width).min(1.0),
-        )
+        // Signal 4: Quantitative claims (numbers, measurements, percentages)
+        let numeric_density = content.chars().filter(|c| c.is_ascii_digit()).count() as f64 / word_count;
+        let quant_boost = (numeric_density * 0.3).min(0.1);
+
+        // Signal 5: Response length (very short with no assertions = low effort)
+        let length_signal = if word_count < 20.0 && assert_count == 0.0 {
+            -0.1
+        } else if word_count > 500.0 {
+            0.05
+        } else {
+            0.0
+        };
+
+        // Signal 6: Structural markers (organized thought = higher certainty)
+        let has_steps = lower.contains("step 1") || lower.contains("1.") || lower.contains("first,");
+        let has_reasoning = lower.contains("because") || lower.contains("therefore") || lower.contains("since");
+        let structure_boost = if has_steps { 0.05 } else { 0.0 }
+            + if has_reasoning { 0.05 } else { 0.0 };
+
+        let base = 0.50;
+        let raw = base + assert_boost + code_boost + quant_boost + length_signal + structure_boost - hedge_penalty;
+        (raw - volatility * 0.1).clamp(0.05, 0.98)
     }
 }
 
-fn outcome_factor(outcome: &TurnOutcome) -> f64 {
-    match outcome {
-        TurnOutcome::TestsPassed => 1.2,
-        TurnOutcome::Compiled => 1.0,
-        TurnOutcome::AdvancedConvergence => 1.1,
-        TurnOutcome::Rejected | TurnOutcome::RolledBack => 0.4,
-        TurnOutcome::Stalled => 0.6,
-        TurnOutcome::Unknown => 0.8,
-    }
-}
-
-/// Manages agent influence weights based on certainty history and calibration.
-pub struct InfluenceWeightManager;
-
-impl InfluenceWeightManager {
-    /// Compute weights using a flat average of certainty × outcome factor.
-    /// Delegates to `calculate_weights_with_recency` with a 0.9 decay factor.
-    #[must_use]
-    pub fn calculate_weights(sigma: &ConversationState) -> std::collections::BTreeMap<String, f64> {
-        Self::calculate_weights_with_recency(sigma, 0.9)
-    }
-
-    /// Compute weights with exponential recency decay and surprise calibration.
-    ///
-    /// `decay ∈ (0, 1]`: weight for a turn `k` steps ago = `decay^k`.
-    /// A `surprise_signal` close to 1.0 reduces the weight (high surprise =
-    /// the agent was less reliable on that turn).
-    #[must_use]
-    pub fn calculate_weights_with_recency(
-        sigma: &ConversationState,
-        decay: f64,
-    ) -> std::collections::BTreeMap<String, f64> {
-        let n = sigma.turns.len();
-        let mut agent_stats: std::collections::BTreeMap<String, (f64, f64)> =
-            std::collections::BTreeMap::new();
-
-        for (i, turn) in sigma.turns.iter().enumerate() {
-            let steps_ago = (n - 1).saturating_sub(i);
-            let recency = decay.powi(steps_ago as i32);
-
-            let of = outcome_factor(&turn.outcome);
-
-            let certainty = turn.certainty.unwrap_or(0.5);
-            // Surprise > 0.5 means the agent behaved unexpectedly — reduce trust.
-            let surprise_factor = turn
-                .surprise_signal
-                .map(|s| 1.0 - (s - 0.5).max(0.0) * 0.4)
-                .unwrap_or(1.0);
-
-            let contribution = certainty * of * surprise_factor * recency;
-            let (score, weight) = agent_stats
-                .entry(turn.model_id.clone())
-                .or_insert((0.0, 0.0));
-            *score += contribution;
-            *weight += recency;
-        }
-
-        agent_stats
-            .into_iter()
-            .map(|(id, (score, weight))| {
-                let w = if weight > 0.0 {
-                    (score / weight).clamp(0.1, 2.0)
-                } else {
-                    1.0
-                };
-                (id, w)
-            })
-            .collect()
-    }
-
-    /// Compute weights filtered to turns matching `category`.
-    ///
-    /// Agents with no turns in the category fall back to a dampened global
-    /// weight (`global * 0.3`), so specialists dominate in their domain while
-    /// generalists still contribute a baseline.
-    #[must_use]
-    pub fn calculate_weights_for_category(
-        sigma: &ConversationState,
-        category: TaskCategory,
-        decay: f64,
-    ) -> std::collections::BTreeMap<String, f64> {
-        let category_turns: Vec<_> = sigma
-            .turns
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.task_category == Some(category))
-            .collect();
-
-        if category_turns.is_empty() {
-            return Self::calculate_weights_with_recency(sigma, decay);
-        }
-
-        let n = category_turns.len();
-        let mut agent_stats: std::collections::BTreeMap<String, (f64, f64)> =
-            std::collections::BTreeMap::new();
-
-        for (rank, (_, turn)) in category_turns.iter().enumerate() {
-            let steps_ago = (n - 1).saturating_sub(rank);
-            let recency = decay.powi(steps_ago as i32);
-
-            let of = outcome_factor(&turn.outcome);
-
-            let certainty = turn.certainty.unwrap_or(0.5);
-            let surprise_factor = turn
-                .surprise_signal
-                .map(|s| 1.0 - (s - 0.5).max(0.0) * 0.4)
-                .unwrap_or(1.0);
-
-            let contribution = certainty * of * surprise_factor * recency;
-            let (score, weight) = agent_stats
-                .entry(turn.model_id.clone())
-                .or_insert((0.0, 0.0));
-            *score += contribution;
-            *weight += recency;
-        }
-
-        let category_weights: std::collections::BTreeMap<String, f64> = agent_stats
-            .into_iter()
-            .map(|(id, (score, weight))| {
-                let w = if weight > 0.0 {
-                    (score / weight).clamp(0.1, 2.0)
-                } else {
-                    1.0
-                };
-                (id, w)
-            })
-            .collect();
-
-        let global_weights = Self::calculate_weights_with_recency(sigma, decay);
-        let mut merged = category_weights.clone();
-        for (id, gw) in &global_weights {
-            merged.entry(id.clone()).or_insert(gw * 0.3);
-        }
-        merged
-    }
-
-    /// Return agents sorted by weight descending, highest-influence first.
-    #[must_use]
-    pub fn rank(weights: &std::collections::BTreeMap<String, f64>) -> Vec<(String, f64)> {
-        let mut sorted: Vec<(String, f64)> = weights.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
-        sorted
-    }
-}
-
-/// Game-theoretical payoff evaluator for artifact proposals.
-///
-/// `evaluate` scores a single artifact on [0, 1].
-/// `compute_payoff_matrix` produces an N×N matrix of payoffs for N competing
-/// proposals so that NashSolver can find pure strategy equilibria.
-/// `best_response` returns the strategy index that maximises the caller's
-/// expected payoff given an opponent's payoff vector.
 pub struct PayoffCalculator;
-
 impl PayoffCalculator {
-    pub fn evaluate(artifact: &Artifact, outcome: &TurnOutcome) -> f64 {
-        let m = &artifact.metrics;
+    pub fn evaluate(artifact: &Artifact) -> f64 {
+        let base = 0.5;
+        let proof_bonus = (artifact.proof_attachments.len() as f64 * 0.1).min(0.3);
+        let complexity_penalty = if artifact.metrics.line_count > 0 {
+            let ratio = artifact.metrics.cyclomatic_complexity as f64 / artifact.metrics.line_count as f64;
+            (ratio * 0.5).min(0.3)
+        } else {
+            0.0
+        };
+        
+        // --- Sovereign-Tier: Multi-Modal Visual Fidelity ---
+        let visual_bonus = (artifact.metrics.visual_fidelity * 0.2).min(0.2);
+
+        (base + proof_bonus + artifact.metrics.health_score * 0.3 + visual_bonus - complexity_penalty).clamp(0.0, 1.0)
+    }
+    pub fn evaluate_with_outcome(artifact: &Artifact, outcome: &TurnOutcome) -> f64 {
         let correctness = match outcome {
             TurnOutcome::TestsPassed => 1.0,
             TurnOutcome::Compiled => 0.8,
-            TurnOutcome::AdvancedConvergence => 0.7,
-            TurnOutcome::Rejected | TurnOutcome::RolledBack => 0.0,
             _ => 0.5,
         };
-        let performance = if m.line_count > 0 {
-            let size_penalty = (m.line_count as f64 / 2000.0).min(0.2);
-            1.0 - size_penalty
-        } else { 0.6 };
-        let maintainability = if m.line_count > 0 {
-            let complexity_penalty = (m.cyclomatic_complexity as f64 * 0.02).min(0.3);
-            let coupling_penalty = (m.coupling_factor as f64 * 0.01).min(0.2);
-            let comment_bonus = (m.comment_density * 0.2).min(0.15);
-            (0.8 - complexity_penalty - coupling_penalty + comment_bonus).clamp(0.0, 1.0)
-        } else { 0.6 };
-        let alignment = (artifact.proof_attachments.len() as f64 * 0.05).min(1.0);
-        (correctness * 0.4 + performance * 0.2 + maintainability * 0.3 + alignment * 0.1).clamp(0.0, 1.0)
+        (correctness * 0.7 + (artifact.metrics.health_score * 0.3)).clamp(0.0, 1.0)
     }
-
     pub fn compute_payoff_matrix(proposals: &[(&str, &Artifact, TurnOutcome)], current: &Artifact) -> Vec<Vec<f64>> {
-        let current_score = Self::evaluate(current, &TurnOutcome::Unknown);
-        let scores: Vec<f64> = proposals.iter().map(|(_, a, o)| Self::evaluate(a, o)).collect();
+        let current_score = Self::evaluate_with_outcome(current, &TurnOutcome::Unknown);
+        let scores: Vec<f64> = proposals.iter().map(|(_, a, o)| Self::evaluate_with_outcome(a, o)).collect();
         scores.iter().map(|&my_score| {
             scores.iter().map(|&their_score| {
                 let relative = ((my_score - their_score) * 0.5 + 0.5).clamp(0.0, 1.0);
@@ -455,5 +379,197 @@ impl PayoffCalculator {
                 relative * 0.7 + coordination * 0.3
             }).collect()
         }).collect()
-    } 
+    }
+    pub fn best_response(mine: &[f64], theirs: &[f64]) -> usize {
+        mine.iter().zip(theirs.iter())
+            .enumerate()
+            .max_by(|(_, (a_m, a_t)), (_, (b_m, b_t))| {
+                let sa = *a_m + *a_t;
+                let sb = *b_m + *b_t;
+                sa.total_cmp(&sb)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    }
+}
+
+/// Detects stall patterns from per-turn proposal content hashes.
+/// Tracks the last 6 turns of (agent_id → content_hash) snapshots.
+pub struct StallDetector {
+    proposal_history: VecDeque<HashMap<String, String>>,
+    /// Consecutive-disagreement counters: (agent_a, agent_b) → run length.
+    disagreement_runs: HashMap<(String, String), u32>,
+    /// Entropy values per turn for non-decreasing entropy detection.
+    entropy_history: VecDeque<f64>,
+}
+
+impl StallDetector {
+    pub fn new() -> Self {
+        Self {
+            proposal_history: VecDeque::with_capacity(6),
+            disagreement_runs: HashMap::new(),
+            entropy_history: VecDeque::with_capacity(5),
+        }
+    }
+
+    /// Record proposals for this turn (agent_id → content_hash) and an entropy value.
+    /// Returns stall_risk in [0.0, 1.0].
+    pub fn push_turn(&mut self, proposals: HashMap<String, String>, turn_entropy: f64) -> f64 {
+        if self.proposal_history.len() >= 6 {
+            self.proposal_history.pop_front();
+        }
+        self.proposal_history.push_back(proposals.clone());
+
+        if self.entropy_history.len() >= 5 {
+            self.entropy_history.pop_front();
+        }
+        self.entropy_history.push_back(turn_entropy);
+
+        // Update disagreement runs: compare each pair in this turn vs previous turn.
+        if let Some(prev) = self.proposal_history.len().checked_sub(2).and_then(|i| self.proposal_history.get(i)) {
+            let agents: Vec<&String> = proposals.keys().collect();
+            for i in 0..agents.len() {
+                for j in (i + 1)..agents.len() {
+                    let a = agents[i];
+                    let b = agents[j];
+                    let hash_a = proposals.get(a).map(|s| s.as_str()).unwrap_or("");
+                    let hash_b = proposals.get(b).map(|s| s.as_str()).unwrap_or("");
+                    let prev_a = prev.get(a).map(|s| s.as_str()).unwrap_or("");
+                    let prev_b = prev.get(b).map(|s| s.as_str()).unwrap_or("");
+                    let key = if a < b {
+                        (a.clone(), b.clone())
+                    } else {
+                        (b.clone(), a.clone())
+                    };
+                    if hash_a != hash_b && prev_a != prev_b {
+                        *self.disagreement_runs.entry(key).or_insert(0) += 1;
+                    } else {
+                        self.disagreement_runs.insert(key, 0);
+                    }
+                }
+            }
+        }
+
+        self.compute_stall_risk(&proposals)
+    }
+
+    fn compute_stall_risk(&self, current: &HashMap<String, String>) -> f64 {
+        let mut risk = 0.0_f64;
+
+        // Oscillation: agent produces same hash at turn N and N-2.
+        if self.proposal_history.len() >= 3 {
+            let n_minus_2 = &self.proposal_history[self.proposal_history.len() - 3];
+            for (agent, hash) in current {
+                if n_minus_2.get(agent) == Some(hash) {
+                    risk += 0.4;
+                    break;
+                }
+            }
+        }
+
+        // Non-decreasing entropy over last 5 turns.
+        if self.entropy_history.len() >= 5 {
+            let non_decreasing = self.entropy_history.iter()
+                .zip(self.entropy_history.iter().skip(1))
+                .all(|(a, b)| b >= a);
+            if non_decreasing {
+                risk += 0.3;
+            }
+        }
+
+        // Repeated pair disagreement in 3+ consecutive turns.
+        if self.disagreement_runs.values().any(|&run| run >= 3) {
+            risk += 0.3;
+        }
+
+        risk.min(1.0)
+    }
+
+    pub fn stall_risk(&self) -> f64 {
+        if let Some(current) = self.proposal_history.back() {
+            self.compute_stall_risk(current)
+        } else {
+            0.0
+        }
+    }
+}
+
+impl Default for StallDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct InfluenceWeightManager;
+impl InfluenceWeightManager {
+    pub fn calculate_weights(sigma: &ConversationState) -> std::collections::BTreeMap<String, f64> {
+        if sigma.agent_weights.is_empty() && !sigma.turns.is_empty() {
+            return Self::compute_agent_weights_from_turns(&sigma.turns, 0.9);
+        }
+        sigma.agent_weights.clone()
+    }
+    pub fn calculate_weights_for_category(sigma: &ConversationState, category: TaskCategory, recency: f64) -> std::collections::BTreeMap<String, f64> {
+        let category_turns: Vec<&Turn> = sigma.turns.iter()
+            .filter(|t| t.task_category.as_ref() == Some(&category))
+            .collect();
+
+        if category_turns.is_empty() {
+            // Fallback: compute global weights from all turns, dampened.
+            let global = Self::compute_agent_weights_from_turns(&sigma.turns, recency);
+            return global;
+        }
+
+        Self::compute_agent_weights_from_turns(&category_turns.into_iter().cloned().collect::<Vec<_>>(), recency)
+    }
+    fn compute_agent_weights_from_turns(turns: &[Turn], recency: f64) -> std::collections::BTreeMap<String, f64> {
+        use std::collections::BTreeMap;
+        let mut scores: HashMap<String, (f64, f64)> = HashMap::new();
+        let n = turns.len();
+        for (i, t) in turns.iter().enumerate() {
+            let outcome_score = match t.outcome {
+                TurnOutcome::TestsPassed => 1.0,
+                TurnOutcome::Compiled => 0.5,
+                TurnOutcome::Unknown => 0.3,
+                TurnOutcome::AdvancedConvergence => 0.9,
+                TurnOutcome::Stalled => 0.2,
+                TurnOutcome::Rejected => 0.1,
+                TurnOutcome::RolledBack => 0.0,
+                TurnOutcome::VerificationFailed => 0.0,
+            };
+            let certainty = t.certainty.unwrap_or(0.5);
+            let surprise_penalty = 1.0 - t.surprise_signal.unwrap_or(0.0) * 0.5;
+            // Exponential recency decay: recent turns weighted more heavily
+            let age = (n - 1 - i) as f64;
+            let decay = recency.powf(age);
+            let entry = scores.entry(t.model_id.clone()).or_insert((0.0, 0.0));
+            entry.0 += outcome_score * certainty * surprise_penalty * decay;
+            entry.1 += decay;
+        }
+        let mut weights = BTreeMap::new();
+        for (agent, (weighted_sum, weight_total)) in &scores {
+            let w = if *weight_total > 0.0 { weighted_sum / weight_total } else { 0.3 };
+            weights.insert(agent.clone(), w);
+        }
+        weights
+    }
+    pub fn calculate_weights_with_recency(sigma: &ConversationState, recency: f64) -> std::collections::BTreeMap<String, f64> {
+        if sigma.agent_weights.is_empty() && !sigma.turns.is_empty() {
+            return Self::compute_agent_weights_from_turns(&sigma.turns, recency);
+        }
+        sigma.agent_weights.clone()
+    }
+    pub fn rank(weights: &std::collections::BTreeMap<String, f64>) -> Vec<(String, f64)> {
+        let mut sorted: Vec<(String, f64)> = weights.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
+        sorted
+    }
+    pub fn vote_tally(proposals: &[RefinementRound]) -> HashMap<String, u32> {
+        let mut votes = HashMap::new();
+        for round in proposals {
+            if round.accepted {
+                *votes.entry(round.agent_id.clone()).or_insert(0) += 1;
+            }
+        }
+        votes
+    }
 }

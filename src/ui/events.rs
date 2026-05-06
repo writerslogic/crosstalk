@@ -1,6 +1,7 @@
 use crate::types::events::{ControlSignal, StreamEvent};
 use crate::ui::app::{App, AppMode};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use std::io::Write;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -11,9 +12,55 @@ pub enum Action {
     Shutdown,
 }
 
+fn log_event(ev: &StreamEvent) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/crosstalk.log") {
+        let ts = chrono::Local::now().format("%H:%M:%S%.3f");
+        match ev {
+            StreamEvent::TokenReceived { agent_id, token } => {
+                let trimmed = token.trim();
+                if !trimmed.is_empty() {
+                    crate::log_warn!(writeln!(f, "{ts} [{agent_id}] {trimmed}"), "failed to write log event");
+                }
+            }
+            StreamEvent::TurnComplete(turn) => {
+                crate::log_warn!(writeln!(
+                    f, "{ts} [TURN] i_{} by {} outcome={:?} cert={:.2} diffs={}",
+                    turn.index, turn.model_id, turn.outcome,
+                    turn.certainty.unwrap_or(0.0), turn.diffs.len()
+                ), "failed to write log event");
+            }
+            StreamEvent::ConvergenceUpdated { p, certainty, agent_weights } => {
+                let weights_str: String = agent_weights.iter()
+                    .map(|(a, w)| format!("{a}={w:.2}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                crate::log_warn!(writeln!(f, "{ts} [CONV] p={p:.3} cert={certainty:.3} weights=[{weights_str}]"), "failed to write log event");
+            }
+            StreamEvent::ArtifactsUpdated(list) => {
+                crate::log_warn!(writeln!(f, "{ts} [ARTIFACTS] {} artifact(s) updated", list.len()), "failed to write log event");
+            }
+            StreamEvent::EntropyUpdated(entries) => {
+                crate::log_warn!(writeln!(f, "{ts} [ENTROPY] {} entries", entries.len()), "failed to write log event");
+            }
+            StreamEvent::GodViewUpdated { frame, avg_certainty, avg_surprise, agent_count } => {
+                crate::log_warn!(writeln!(
+                    f, "{ts} [GODVIEW] frame={frame} cert={avg_certainty:.2} surprise={avg_surprise:.2} agents={agent_count}"
+                ), "failed to write log event");
+            }
+            StreamEvent::CheckpointWritten(idx) => {
+                crate::log_warn!(writeln!(f, "{ts} [CKPT] i_{idx}"), "failed to write log event");
+            }
+            StreamEvent::Error(msg) => {
+                crate::log_warn!(writeln!(f, "{ts} [ERROR] {msg}"), "failed to write log event");
+            }
+        }
+    }
+}
+
 /// Drain all pending stream events into the App.
 pub fn drain_stream_events(app: &mut App, stream_rx: &mut mpsc::Receiver<StreamEvent>) {
     while let Ok(ev) = stream_rx.try_recv() {
+        log_event(&ev);
         match ev {
             StreamEvent::TokenReceived { agent_id, token } => app.push_token(&agent_id, &token),
             StreamEvent::TurnComplete(turn) => app.commit_turn(&turn),
@@ -24,13 +71,44 @@ pub fn drain_stream_events(app: &mut App, stream_rx: &mut mpsc::Receiver<StreamE
             } => {
                 app.set_convergence(p, certainty);
                 app.agent_weights = agent_weights.into_iter().collect();
+                let trend = if p > 0.8 {
+                    "nearly converged"
+                } else if p > 0.5 {
+                    "making progress"
+                } else if p > 0.2 {
+                    "exploring"
+                } else {
+                    "early stage"
+                };
+                app.push_event(format!(
+                    "Convergence {:.0}%, certainty {:.0}% — {}",
+                    p * 100.0, certainty * 100.0, trend
+                ));
             }
-            StreamEvent::ArtifactsUpdated(list) => app.artifacts = list,
+            StreamEvent::ArtifactsUpdated(list) => {
+                let changed: Vec<&str> = list.iter()
+                    .filter(|a| a.diff_count > 0)
+                    .map(|a| a.name.as_str())
+                    .collect();
+                if !changed.is_empty() {
+                    app.push_event(format!(
+                        "[artifacts] {} modified: {}",
+                        changed.len(),
+                        changed.join(", ")
+                    ));
+                }
+                app.artifacts = list;
+            }
             StreamEvent::EntropyUpdated(entries) => {
                 app.entropy_scores = entries.into_iter().map(|e| crate::ui::app::EntropyRow {
                     artifact: e.artifact_name,
                     agents: e.scores,
                 }).collect();
+            }
+            StreamEvent::GodViewUpdated { frame, avg_certainty, avg_surprise, .. } => {
+                app.godview_frame = frame;
+                app.godview_certainty = avg_certainty;
+                app.godview_surprise = avg_surprise;
             }
             StreamEvent::CheckpointWritten(idx) => {
                 app.push_event(format!("Checkpoint i_{idx}"));
@@ -42,12 +120,11 @@ pub fn drain_stream_events(app: &mut App, stream_rx: &mut mpsc::Receiver<StreamE
 
 /// Poll for a keyboard event (non-blocking, up to `timeout`).
 pub fn poll_key(timeout: Duration) -> Option<event::KeyEvent> {
-    if event::poll(timeout).ok()? {
-        if let Event::Key(key) = event::read().ok()? {
-            if key.kind == KeyEventKind::Press {
-                return Some(key);
-            }
-        }
+    if event::poll(timeout).ok()?
+        && let Event::Key(key) = event::read().ok()?
+        && key.kind == KeyEventKind::Press
+    {
+        return Some(key);
     }
     None
 }

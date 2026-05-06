@@ -102,9 +102,37 @@ impl InvariantChecker {
                 ));
             }
         }
+
         Ok(())
     }
+
+    /// Suggestion: Recursive Formal Verification (Verus-in-the-Loop)
+    pub async fn verify_artifact(artifact: &crate::types::artifact::Artifact) -> Result<Result<(), String>> {
+        if !artifact.content.contains("verus!") {
+            return Ok(Ok(())); // No formal specs to verify
+        }
+
+        let temp_dir = std::env::temp_dir().join("crosstalk-verus");
+        tokio::fs::create_dir_all(&temp_dir).await?;
+        let temp_file = temp_dir.join(format!("verify_{}.rs", artifact.name.replace('/', "_")));
+        tokio::fs::write(&temp_file, &artifact.content).await?;
+
+        let output = tokio::process::Command::new("verus")
+            .arg(&temp_file)
+            .output()
+            .await
+            .context("Failed to execute verus binary for artifact verification")?;
+
+        if output.status.success() {
+            Ok(Ok(()))
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Ok(Err(format!("{}\n{}", stdout, stderr)))
+        }
+    }
 }
+
 
 #[derive(Debug, Clone)]
 pub struct AuditAlert {
@@ -131,13 +159,16 @@ impl ContinuousAuditor {
                     Ok(expected) if expected == sigma.state_hash => {
                         last_hash = sigma.state_hash;
                     }
-                    Ok(_expected) => {
-                        let _ = alert_tx.send(AuditAlert {
+                    Ok(expected_hash) => {
+                        if alert_tx.send(AuditAlert {
                             iteration_index: sigma.iteration_index,
-                            expected_hash: _expected,
+                            expected_hash,
                             actual_hash: sigma.state_hash,
                             timestamp: ConversationState::now(),
-                        });
+                        }).is_err() {
+                            tracing::warn!(turn = sigma.iteration_index, "audit alert channel closed");
+                            break;
+                        }
                         // Do NOT update last_hash; preserve last valid anchor
                     }
                     Err(_) => {}

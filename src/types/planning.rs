@@ -28,6 +28,8 @@ pub struct GoalNode {
     /// Explicit prerequisite goal IDs (for DAG scheduling beyond the tree structure).
     #[serde(default)]
     pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub difficulty_score: Option<f64>,
 }
 
 #[derive(Debug, Clone)]

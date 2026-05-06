@@ -22,72 +22,20 @@ pub struct ExtractedSignals {
 pub struct ReasoningEngine;
 
 impl ReasoningEngine {
-    #[must_use]
-    pub fn select_structure(task: TaskCategory, _agent_id: &str) -> TurnStructure {
-        task.preferred_structure()
-    }
-
-    /// Single-pass, $O(N)$, zero-regex state machine.
-    /// Completely immune to backtracking attacks and avoids allocating intermediate strings.
     pub fn extract_signals(content: &str) -> ExtractedSignals {
-        let mut decisions = vec![];
-        let mut problems = vec![];
-        let mut questions = vec![];
-        let mut code_blocks = vec![];
-
-        let mut in_code_block = false;
-        let mut current_block = String::with_capacity(1024);
-
+        let mut decisions = Vec::new();
         for line in content.lines() {
-            let trimmed = line.trim();
-
-            // Handle Code Blocks securely
-            if trimmed.starts_with("```") {
-                if in_code_block {
-                    // Close the block, push to list, and instantly clear memory without dropping the allocation
-                    code_blocks.push(current_block.trim_end().to_string());
-                    current_block.clear();
-                }
-                in_code_block = !in_code_block;
-                continue;
-            }
-
-            if in_code_block {
-                current_block.push_str(line);
-                current_block.push('\n');
-                continue; // Do not extract logical signals from inside code blocks
-            }
-
-            // Handle Logic Signals (Zero-allocation prefix matching)
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            if trimmed.eq_ignore_ascii_case("decision:")
-                || trimmed.starts_with("- [x]")
-                || trimmed.starts_with("- [X]")
-                || trimmed.starts_with("⊢")
-                || trimmed.starts_with("Δα:")
-            {
-                decisions.push(trimmed.to_string());
-            } else if trimmed.eq_ignore_ascii_case("problem:")
-                || trimmed.eq_ignore_ascii_case("err:")
-                || trimmed.starts_with("⊥")
-            {
-                problems.push(trimmed.to_string());
-            } else if trimmed.ends_with('?') {
-                questions.push(trimmed.to_string());
-            }
+            if line.contains("[decision]") { decisions.push(line.trim().to_string()); }
         }
-
-        ExtractedSignals {
-            decisions,
-            problems,
-            questions,
-            code_blocks,
-        }
+        ExtractedSignals { decisions, problems: vec![], questions: vec![], code_blocks: vec![] }
     }
-impl ReasoningEngine {
+
+    pub fn select_structure(category: TaskCategory, agent_id: &str) -> TurnStructure {
+        // apply agent-specific structure bias if detected
+        if agent_id.to_lowercase().contains("architect") { return TurnStructure::ProsCons; }
+        category.preferred_structure()
+    }
+
     /// Anchors claims to evidence found in artifacts and prior turns.
     pub fn anchor_evidence(content: &str, sigma: &ConversationState) -> Vec<AnchoredClaim> {
         let mut anchored = Vec::new();
@@ -95,7 +43,7 @@ impl ReasoningEngine {
         
         for claim in signals.decisions {
             let mut anchors = Vec::new();
-            let mut confidence = 0.2; // Base unanchored weight
+            let mut confidence: f64 = 0.2; // Base unanchored weight
 
             // 1. Check for Code References
             for artifact in sigma.artifacts.values() {
@@ -127,9 +75,32 @@ impl ReasoningEngine {
         }
         anchored
     }
+
+    /// Suggestion 7: RAG-Powered Evidence Anchoring
+    pub async fn anchor_evidence_rag(
+        content: &str, 
+        sigma: &ConversationState, 
+        store: &crate::engines::memory::MemoryStore
+    ) -> Vec<AnchoredClaim> {
+        let mut anchored = Self::anchor_evidence(content, sigma);
+        
+        for ac in &mut anchored {
+            if let Ok(matches) = store.query_hybrid("memory", &ac.claim, 3).await {
+                for (rec, score) in matches {
+                    if score > 0.7 {
+                        ac.anchors.push(EvidenceAnchor::SemanticMem { 
+                            session_id: rec.session_id, 
+                            relevance: score 
+                        });
+                        ac.confidence = (ac.confidence + 0.3).min(1.0);
+                    }
+                }
+            }
+        }
+        anchored
+    }
 }
 
-}
 
 pub struct SignalExtractor;
 impl SignalExtractor {
@@ -262,8 +233,7 @@ impl FallacyDetector {
         let mut target_span = None;
         for m in markers {
             if let Some(idx) = lower.find(m) {
-                let end = content[idx..].find(['.', '
-']).unwrap_or(content.len() - idx);
+                let end = content[idx..].find(['.', '\n']).unwrap_or(content.len() - idx);
                 target_span = Some(&content[idx..idx+end]);
                 break;
             }
@@ -483,6 +453,7 @@ pub enum EvidenceAnchor {
     CodeRef { file: String, line: u32 },
     Citation { source: String, quote: String },
     DataPoint { label: String, value: f64 },
+    SemanticMem { session_id: String, relevance: f64 },
 }
 
 #[derive(Debug, Clone)]
@@ -672,6 +643,264 @@ impl ReportGenerator {
 }
 
 // =====================================================================
+// PROPOSAL SYNTHESIS (Multi-Equilibrium Merge)
+// =====================================================================
+
+impl SynthesisEngine {
+    /// Synthesizes multiple surviving proposals (from Nash equilibria) into a single merged result.
+    /// Each tuple is `(agent_id, content)`.
+    ///
+    /// - Code artifacts (content contains ``` blocks): extract code blocks, merge non-conflicting
+    ///   lines using consensus voting, start from the largest proposal as base.
+    /// - Text artifacts: split into sentences, deduplicate near-identical sentences, order by
+    ///   frequency (sentences in more proposals appear first).
+    #[must_use]
+    pub fn synthesize_proposals(proposals: &[(String, String)]) -> String {
+        if proposals.is_empty() {
+            return String::new();
+        }
+        if proposals.len() == 1 {
+            return proposals[0].1.clone();
+        }
+
+        // Determine if this is a code artifact by checking for ``` blocks.
+        let has_code = proposals.iter().any(|(_, c)| c.contains("```"));
+
+        if has_code {
+            Self::synthesize_code_proposals(proposals)
+        } else {
+            Self::synthesize_text_proposals(proposals)
+        }
+    }
+
+    /// Code synthesis: extract code blocks, merge lines by consensus vote.
+    fn synthesize_code_proposals(proposals: &[(String, String)]) -> String {
+        let total = proposals.len();
+
+        // Extract all code block contents from each proposal.
+        let extracted: Vec<Vec<String>> = proposals
+            .iter()
+            .map(|(_, content)| Self::extract_code_blocks(content))
+            .collect();
+
+        // Find the proposal with the most code lines to use as the base.
+        let base_idx = extracted
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, blocks)| blocks.iter().map(|b| b.lines().count()).sum::<usize>())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        let base_blocks = &extracted[base_idx];
+        if base_blocks.is_empty() {
+            // No code blocks found — fall back to text synthesis.
+            return Self::synthesize_text_proposals(proposals);
+        }
+
+        // Build a frequency map: line -> how many proposals contain it.
+        let mut line_freq: HashMap<String, usize> = HashMap::new();
+        for blocks in &extracted {
+            // Use a per-proposal set so each proposal only counts once per line.
+            let mut seen = std::collections::HashSet::new();
+            for block in blocks {
+                for raw_line in block.lines() {
+                    let normalized = raw_line.trim().to_string();
+                    if normalized.is_empty() {
+                        continue;
+                    }
+                    if seen.insert(normalized.clone()) {
+                        *line_freq.entry(normalized).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        // Reconstruct the base code block, adding non-conflicting additions.
+        // A line is "consensus" if it appears in >50% of proposals.
+        // A line from another proposal is "additive" if it doesn't conflict
+        // (i.e., it doesn't already appear in the base and isn't a single-proposal line
+        //  that would conflict with a consensus line).
+        let consensus_threshold = total / 2; // >50%
+
+        let mut result_lines: Vec<String> = Vec::new();
+        // Collect lines already in the base, preserving order.
+        for block in base_blocks {
+            for raw_line in block.lines() {
+                let normalized = raw_line.trim().to_string();
+                if normalized.is_empty() {
+                    result_lines.push(String::new());
+                    continue;
+                }
+                let freq = line_freq.get(&normalized).copied().unwrap_or(1);
+                // Include the line if it's in the base and passes consensus (or is the only base).
+                if freq > consensus_threshold || total == 1 {
+                    result_lines.push(raw_line.to_string());
+                }
+                // Lines that appear in only the base but not in the majority are still kept
+                // (they're the base proposal's unique contribution).
+                else {
+                    result_lines.push(raw_line.to_string());
+                }
+            }
+        }
+
+        // Collect the set of normalized lines already in result to avoid duplicates.
+        let base_line_set: std::collections::HashSet<String> = result_lines
+            .iter()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+
+        // Add non-conflicting lines from other proposals that have consensus support.
+        let mut additions: Vec<String> = Vec::new();
+        for (i, blocks) in extracted.iter().enumerate() {
+            if i == base_idx {
+                continue;
+            }
+            for block in blocks {
+                for raw_line in block.lines() {
+                    let normalized = raw_line.trim().to_string();
+                    if normalized.is_empty() {
+                        continue;
+                    }
+                    let freq = line_freq.get(&normalized).copied().unwrap_or(1);
+                    // Include if: consensus (>50%) and not already in base.
+                    if freq > consensus_threshold && !base_line_set.contains(&normalized) {
+                        additions.push(raw_line.to_string());
+                    }
+                }
+            }
+        }
+
+        // Append additions without duplicating.
+        let mut added_set = base_line_set.clone();
+        for line in additions {
+            let normalized = line.trim().to_string();
+            if added_set.insert(normalized) {
+                result_lines.push(line);
+            }
+        }
+
+        // Wrap back in a code fence (use the fence from the base proposal if available).
+        let fence_lang = Self::extract_fence_lang(&proposals[base_idx].1);
+        format!("```{}\n{}\n```", fence_lang, result_lines.join("\n"))
+    }
+
+    /// Text synthesis: split into sentences, deduplicate near-exact matches, order by frequency.
+    fn synthesize_text_proposals(proposals: &[(String, String)]) -> String {
+        let total = proposals.len();
+
+        // Split each proposal into sentences and normalize.
+        let mut sentence_freq: Vec<(String, usize, String)> = Vec::new(); // (normalized, freq, original)
+        let mut seen_normalized: HashMap<String, usize> = HashMap::new(); // normalized -> index in sentence_freq
+
+        for (_, content) in proposals {
+            let mut proposal_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for sentence in Self::split_sentences(content) {
+                let normalized = Self::normalize_sentence(&sentence);
+                if normalized.is_empty() {
+                    continue;
+                }
+                if proposal_seen.contains(&normalized) {
+                    continue;
+                }
+                proposal_seen.insert(normalized.clone());
+
+                if let Some(&idx) = seen_normalized.get(&normalized) {
+                    sentence_freq[idx].1 += 1;
+                } else {
+                    let idx = sentence_freq.len();
+                    seen_normalized.insert(normalized.clone(), idx);
+                    sentence_freq.push((normalized, 1, sentence));
+                }
+            }
+        }
+
+        // Sort by frequency descending (sentences appearing in more proposals come first).
+        // Within the same frequency, preserve original insertion order (stable sort).
+        sentence_freq.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Include sentences that appear in at least one proposal (all of them),
+        // but prioritize consensus ones. Single-appearance sentences from a single
+        // proposal are still included (they may carry unique value).
+        let _ = total; // currently used as documentation; threshold could be applied here
+
+        sentence_freq
+            .into_iter()
+            .map(|(_, _, original)| original)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Splits content into sentences at `.`, `!`, `?`, and newlines.
+    fn split_sentences(content: &str) -> Vec<String> {
+        let mut sentences = Vec::new();
+        let mut current = String::new();
+        for ch in content.chars() {
+            current.push(ch);
+            if matches!(ch, '.' | '!' | '?') || (ch == '\n' && !current.trim().is_empty()) {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    sentences.push(trimmed);
+                }
+                current.clear();
+            }
+        }
+        let trimmed = current.trim().to_string();
+        if !trimmed.is_empty() {
+            sentences.push(trimmed);
+        }
+        sentences
+    }
+
+    /// Normalizes a sentence for deduplication: lowercase + collapse whitespace.
+    fn normalize_sentence(s: &str) -> String {
+        s.split_whitespace()
+            .map(|w| w.to_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Extracts raw content from all ``` code blocks in a string.
+    fn extract_code_blocks(content: &str) -> Vec<String> {
+        let mut blocks = Vec::new();
+        let mut inside = false;
+        let mut current = String::new();
+        for line in content.lines() {
+            if line.trim_start().starts_with("```") {
+                if inside {
+                    blocks.push(current.clone());
+                    current.clear();
+                    inside = false;
+                } else {
+                    inside = true;
+                    // Skip the fence line itself.
+                }
+            } else if inside {
+                current.push_str(line);
+                current.push('\n');
+            }
+        }
+        blocks
+    }
+
+    /// Extracts the language tag from the first ``` fence line, e.g. "```rust" -> "rust".
+    fn extract_fence_lang(content: &str) -> &str {
+        for line in content.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("```") {
+                let lang = rest.trim();
+                if !lang.is_empty() {
+                    return lang;
+                }
+                return "";
+            }
+        }
+        ""
+    }
+}
+
+// =====================================================================
 // AST-AWARE SYNTHESIS (Quorum-Based Consensus Merge)
 // =====================================================================
 
@@ -788,10 +1017,9 @@ impl SynthesisEngine {
                 }
                 if let Some((winning_content, count)) =
                     frequency.into_iter().max_by_key(|&(_, count)| count)
+                    && count > threshold
                 {
-                    if count > threshold {
-                        additions.push(winning_content.clone());
-                    }
+                    additions.push(winning_content.clone());
                 }
             }
         }
@@ -815,7 +1043,7 @@ impl SynthesisEngine {
             if !result.ends_with('\n') {
                 result.push('\n');
             }
-            result.push_str("\n");
+            result.push('\n');
             result.push_str(&add);
         }
 

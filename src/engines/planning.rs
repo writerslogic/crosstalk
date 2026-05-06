@@ -6,7 +6,7 @@ use petgraph::graph::DiGraph;
 use sha2::{Digest, Sha256};
 use sled::Db;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct PlanningEngine;
 
@@ -91,74 +91,92 @@ impl PartialOrd for PrunableGoal {
 pub struct ContextPruner;
 
 impl ContextPruner {
+    /// Compresses the token window while maintaining the integrity of the Goal Tree.
+    /// Retains: (1) path-to-root for active goal, (2) last N turns, (3) pinned context.
     #[must_use]
-    pub fn prune(sigma: &ConversationState, _active_goal_id: &str, max_turns: usize) -> Vec<Turn> {
-        let now = ConversationState::now();
-        let mut goals = Vec::new();
+    pub fn prune_sovereign(
+        sigma: &ConversationState,
+        active_goal_id: &str,
+        max_recent_turns: usize,
+    ) -> Vec<Turn> {
+        let mut turns_to_keep = HashSet::new();
 
-        // 1. Flatten the tree into a vector in O(N) time
+        // 1. Path-to-Root: Find all ancestors of the active goal
+        let mut path_indices = Vec::new();
         if let Some(ref root) = sigma.goal_tree.root {
-            Self::flatten_goals(root, 0, now, &mut goals);
+            let mut current_path = Vec::new();
+            if Self::find_path_to_goal(root, active_goal_id, &mut current_path) {
+                for node in current_path {
+                    if let Some(idx) = node.assigned_turn {
+                        path_indices.push(idx);
+                    }
+                }
+            }
+        }
+        for idx in path_indices {
+            turns_to_keep.insert(idx);
         }
 
-        // 2. O(N log N) Fast Sorting (Replacing the clunky BinaryHeap)
-        // Sorts descending so the most critical are at the front.
-        goals.sort_unstable_by(|a, b| b.criticality.cmp(&a.criticality));
-
-        // 3. Extract the critical turn indices (Maximum of 5)
-        // Because n=5, a simple Vec `.contains()` fits entirely in the L1 CPU Cache
-        // and is mathematically faster than hashing elements into a HashSet.
-        let critical_turn_indices: Vec<u32> = goals
-            .into_iter()
-            .filter_map(|g| g.assigned_turn)
-            .take(5)
-            .collect();
-
+        // 2. Last N turns
         let total_turns = sigma.turns.len();
+        for i in 0..total_turns {
+            if total_turns - i <= max_recent_turns {
+                turns_to_keep.insert(i as u32);
+            }
+        }
 
-        // 4. Stream and filter in a single pass
+        // 2b. Prioritize goals by criticality using PrunableGoal heap
+        if let Some(ref root) = sigma.goal_tree.root {
+            let mut goals = std::collections::BinaryHeap::new();
+            Self::collect_prunable_goals(root, &mut goals);
+            for goal in goals.into_sorted_vec() {
+                if let Some(idx) = goal.assigned_turn {
+                    turns_to_keep.insert(idx);
+                }
+            }
+        }
+
+        // 3. Pinned context (heuristic: high certainty or explicit flag)
+        for turn in &sigma.turns {
+            if turn.certainty.unwrap_or(0.0) > 0.95 {
+                turns_to_keep.insert(turn.index);
+            }
+        }
+
         sigma
             .turns
             .iter()
-            .enumerate()
-            .filter(|(idx, _)| {
-                let is_recent = total_turns.saturating_sub(*idx) <= max_turns;
-                let is_critical = critical_turn_indices.contains(&(*idx as u32));
-                is_recent || is_critical
-            })
-            .map(|(_, turn)| turn.clone())
+            .filter(|t| turns_to_keep.contains(&t.index))
+            .cloned()
             .collect()
     }
 
-    /// Recursively flattens the tree into a Vec while calculating criticality.
-    fn flatten_goals(node: &GoalNode, depth: u32, now: u64, list: &mut Vec<PrunableGoal>) {
-        list.push(PrunableGoal {
-            criticality: Self::calculate_criticality(node, depth, now),
-            assigned_turn: node.assigned_turn, // Copied out to prevent future tree-searching
+    fn collect_prunable_goals(node: &GoalNode, heap: &mut std::collections::BinaryHeap<PrunableGoal>) {
+        heap.push(PrunableGoal {
+            criticality: node.children.len() as u32 + 1,
+            assigned_turn: node.assigned_turn,
         });
-
         for child in &node.children {
-            Self::flatten_goals(child, depth + 1, now, list);
+            Self::collect_prunable_goals(child, heap);
         }
     }
 
-    /// Evaluates structural dependency depth against time-decay urgency.
-    fn calculate_criticality(node: &GoalNode, depth: u32, now: u64) -> u32 {
-        let depth_factor = depth * 100;
-
-        let urgency_factor = match node.deadline {
-            Some(d) => {
-                if d <= now {
-                    5000 // Overdue is highest priority
-                } else {
-                    let diff = d - now;
-                    (86400 / diff.max(1)).min(4000) as u32
-                }
+    fn find_path_to_goal<'a>(
+        node: &'a GoalNode,
+        target_id: &str,
+        path: &mut Vec<&'a GoalNode>,
+    ) -> bool {
+        path.push(node);
+        if node.id == target_id {
+            return true;
+        }
+        for child in &node.children {
+            if Self::find_path_to_goal(child, target_id, path) {
+                return true;
             }
-            None => 0,
-        };
-
-        depth_factor + urgency_factor
+        }
+        path.pop();
+        false
     }
 }
 
@@ -181,6 +199,7 @@ impl DifficultyEstimator {
                 TurnOutcome::Unknown => 0.5,
                 TurnOutcome::Compiled => 0.3,
                 TurnOutcome::TestsPassed | TurnOutcome::AdvancedConvergence => 0.1,
+                TurnOutcome::VerificationFailed => 0.8,
             };
         }
         (score / turns.len() as f64).clamp(0.0, 1.0)
@@ -443,6 +462,18 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("Manifest for '{author}' not found"))?;
         Ok(serde_json::from_slice(&bytes)?)
     }
+
+    pub fn hibernate(&self, session_name: &str, state: &ConversationState) -> Result<String> {
+        let timestamp = ConversationState::now();
+        let key = format!("hibernate:{}:{}", session_name, timestamp);
+        self.save(&key, state)?;
+        Ok(key)
+    }
+
+    pub fn resume(&self, hibernate_key: &str) -> Result<ConversationState> {
+        self.load(hibernate_key)
+    }
+
 }
 
 pub struct BranchRegistry {
@@ -491,6 +522,38 @@ impl BranchRegistry {
             Some(v) => Ok(serde_json::from_slice(&v)
                 .with_context(|| format!("corrupt children blob for parent {parent_id}"))?),
             None => Ok(Vec::new()),
+        }
+    }
+}
+
+pub struct SubSwarmGenerator;
+
+impl SubSwarmGenerator {
+    #[must_use]
+    pub fn identify_sub_swarms(sigma: &ConversationState) -> Vec<crate::engines::swarm::SubTask> {
+        let mut sub_tasks = Vec::new();
+        if let Some(root) = &sigma.goal_tree.root {
+            Self::traverse_for_sub_swarms(root, &mut sub_tasks);
+        }
+        sub_tasks
+    }
+
+    fn traverse_for_sub_swarms(node: &GoalNode, out: &mut Vec<crate::engines::swarm::SubTask>) {
+        // --- Suggestion 5 Refinement: Concrete Difficulty Heuristics ---
+        let title_words = node.title.split_whitespace().count();
+        let child_count = node.children.len();
+        let heuristic_difficulty = (title_words as f64 * 0.1 + child_count as f64 * 0.2).min(1.0);
+
+        if (node.difficulty_score.unwrap_or(0.0) > 0.8 || heuristic_difficulty > 0.7) && node.status != GoalStatus::Complete {
+            out.push(crate::engines::swarm::SubTask {
+                id: node.id.clone(),
+                description: node.title.clone(),
+                dependencies: node.dependencies.clone(),
+                estimated_turns: (heuristic_difficulty * 10.0).max(3.0) as u32,
+            });
+        }
+        for child in &node.children {
+            Self::traverse_for_sub_swarms(child, out);
         }
     }
 }

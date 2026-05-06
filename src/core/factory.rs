@@ -1,149 +1,95 @@
 use crate::core::agent_trait::{AgentWrapper, PromptAgent};
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use rig::client::CompletionClient;
-use rig::providers::{anthropic, gemini, openai};
-use std::env;
-use zeroize::Zeroizing;
-
-fn require_env(key: &str) -> Result<Zeroizing<String>> {
-    env::var(key)
-        .map(Zeroizing::new)
-        .map_err(|_| anyhow!("Missing required environment variable: {}", key))
-}
 
 pub struct ModelFactory;
 
+fn require_env(key: &str) -> Result<String> {
+    let val = std::env::var(key).map_err(|_| anyhow::anyhow!("Missing {key}"))?;
+    if val.trim().is_empty() {
+        return Err(anyhow::anyhow!("{key} is set but empty"));
+    }
+    Ok(val)
+}
+
 impl ModelFactory {
     pub fn create_agent(model_id: &str) -> Result<Box<dyn PromptAgent>> {
-        let model_id_lower = model_id.to_lowercase();
-
-        // Robust Model Mapping
-        let actual_model_id = if !model_id.contains('/') && model_id_lower.contains("opus-4.6") {
-            "claude-3-opus-20240229"
-        } else if !model_id.contains('/') && model_id_lower.contains("sonnet-latest") {
-            "claude-3-5-sonnet-20241022"
+        let actual_model_id = if model_id.contains(':') {
+            model_id.rsplit(':').next().unwrap()
         } else {
             model_id
         };
 
-        if actual_model_id.starts_with("gemini") {
-            let client = gemini::Client::new(&*require_env("GEMINI_API_KEY")?)?;
+        if actual_model_id.is_empty() {
+            return Err(anyhow::anyhow!("Empty model ID"));
+        }
+
+        let model_id_lower = model_id.to_lowercase();
+
+        if model_id.contains('/') || model_id_lower.starts_with("openrouter:") {
+            return Self::create_openrouter_agent(model_id, actual_model_id);
+        }
+
+        if model_id_lower.contains("sonnet") || model_id_lower.contains("claude") || model_id_lower.contains("opus") || model_id_lower.contains("haiku") {
+            let api_key = require_env("ANTHROPIC_API_KEY")?;
+            let client = rig::providers::anthropic::Client::new(&api_key)?;
             let agent = client.agent(actual_model_id).build();
             Ok(Box::new(AgentWrapper::<
-                gemini::CompletionModel,
-                gemini::streaming::StreamingCompletionResponse,
+                rig::providers::anthropic::completion::CompletionModel,
+                rig::providers::anthropic::streaming::StreamingCompletionResponse,
                 _,
             >::new(model_id.to_string(), agent)))
-        } else if actual_model_id.starts_with("claude") {
-            let client = anthropic::Client::new(&*require_env("ANTHROPIC_API_KEY")?)?;
+        } else if model_id_lower.starts_with("gpt") || model_id_lower.starts_with("o1") || model_id_lower.starts_with("o3") || model_id_lower.starts_with("o4") || model_id_lower.starts_with("chat") {
+            let api_key = require_env("OPENAI_API_KEY")?;
+            let client = rig::providers::openai::Client::new(&api_key)?;
             let agent = client.agent(actual_model_id).build();
             Ok(Box::new(AgentWrapper::<
-                anthropic::completion::CompletionModel,
-                anthropic::streaming::StreamingCompletionResponse,
+                rig::providers::openai::responses_api::ResponsesCompletionModel,
+                rig::providers::openai::responses_api::streaming::StreamingCompletionResponse,
                 _,
             >::new(model_id.to_string(), agent)))
         } else {
-            let (key, base_url): (&str, Option<&str>) = if actual_model_id.starts_with("gpt")
-                || actual_model_id.starts_with("chatgpt")
-                || actual_model_id.starts_with("o1")
-                || actual_model_id.starts_with("o3")
-                || actual_model_id.starts_with("o4")
-            {
-                ("OPENAI_API_KEY", None)
-            } else if actual_model_id.starts_with("deepseek") {
-                ("DEEPSEEK_API_KEY", Some("https://api.deepseek.com/v1"))
-            } else if actual_model_id.starts_with("mistral") {
-                ("MISTRAL_API_KEY", Some("https://api.mistral.ai/v1"))
-            } else if actual_model_id.contains("groq") {
-                ("GROQ_API_KEY", Some("https://api.groq.com/openai/v1"))
-            } else if actual_model_id.contains("perplexity") {
-                ("PERPLEXITY_API_KEY", Some("https://api.perplexity.ai"))
-            } else if actual_model_id.starts_with("sambanova") {
-                ("SAMBANOVA_API_KEY", Some("https://api.sambanova.ai/v1"))
-            } else if actual_model_id.starts_with("hyperbolic") {
-                ("HYPERBOLIC_API_KEY", Some("https://api.hyperbolic.xyz/v1"))
-            } else if actual_model_id.starts_with("moonshot") {
-                ("MOONSHOT_API_KEY", Some("https://api.moonshot.cn/v1"))
-            } else if actual_model_id.starts_with("ai21") {
-                ("AI21_API_KEY", Some("https://api.ai21.com/studio/v1"))
-            } else if actual_model_id.starts_with("cohere")
-                || actual_model_id.starts_with("command")
-            {
-                ("COHERE_API_KEY", Some("https://api.cohere.ai/v1"))
-            } else {
-                ("OPENROUTER_API_KEY", Some("https://openrouter.ai/api/v1"))
-            };
-
-            let api_key = require_env(key)?;
-
-            // Explicitly use OpenAI Completions extension to avoid 404s on /responses
-            use rig::providers::openai::OpenAICompletionsExt;
-            let builder = rig::client::Client::<OpenAICompletionsExt>::builder().api_key(&*api_key);
-            let client = if let Some(url) = base_url {
-                builder.base_url(url).build()
-            } else {
-                builder.build()
-            }?;
-
-            let agent = client.agent(actual_model_id).build();
-
-            Ok(Box::new(AgentWrapper::<
-                openai::completion::CompletionModel,
-                openai::streaming::StreamingCompletionResponse,
-                _,
-            >::new(model_id.to_string(), agent)))
+            Self::create_openrouter_agent(model_id, actual_model_id)
         }
     }
-    pub fn check_env(requested_models: &[String]) -> Result<()> {
-        let all_keys = [
-            ("OpenAI", "OPENAI_API_KEY"),
-            ("Anthropic", "ANTHROPIC_API_KEY"),
-            ("Gemini", "GEMINI_API_KEY"),
-            ("DeepSeek", "DEEPSEEK_API_KEY"),
-            ("Mistral", "MISTRAL_API_KEY"),
-            ("Groq", "GROQ_API_KEY"),
-            ("Perplexity", "PERPLEXITY_API_KEY"),
-            ("Cohere", "COHERE_API_KEY"),
-            ("Moonshot", "MOONSHOT_API_KEY"),
-            ("Hyperbolic", "HYPERBOLIC_API_KEY"),
-            ("SambaNova", "SAMBANOVA_API_KEY"),
-            ("AI21", "AI21_API_KEY"),
-            ("OpenRouter", "OPENROUTER_API_KEY"),
-        ];
-        println!("\n[System] --- Swarm Capacity Report ---");
-        for (name, key) in all_keys {
-            if env::var(key).is_ok() {
-                println!("  [✓] {} Provider: ACTIVE", name);
-            }
-        }
-        println!("[System] ------------------------------\n");
-        for m in requested_models {
-            let m_lower = m.to_lowercase();
-            let mut found = false;
-            if m_lower.starts_with("gpt")
-                || m_lower.starts_with("chatgpt")
-                || m_lower.starts_with("o1")
-                || m_lower.starts_with("o3")
-                || m_lower.starts_with("o4")
-            {
-                if env::var("OPENAI_API_KEY").is_ok() {
-                    found = true;
-                }
+
+    fn create_openrouter_agent(model_id: &str, actual_model_id: &str) -> Result<Box<dyn PromptAgent>> {
+        let api_key = require_env("OPENROUTER_API_KEY")
+            .or_else(|_| require_env("LLM_API_KEY"))
+            .map_err(|_| anyhow::anyhow!("Missing OPENROUTER_API_KEY or LLM_API_KEY for model {}", model_id))?;
+        let base_url = std::env::var("OPENROUTER_BASE_URL")
+            .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_string());
+        let model_name = actual_model_id.trim_start_matches("openrouter:");
+        let client = rig::providers::openai::CompletionsClient::builder()
+            .api_key(&api_key)
+            .base_url(&base_url)
+            .build()?;
+        let agent = client.agent(model_name).build();
+        Ok(Box::new(AgentWrapper::<
+            rig::providers::openai::completion::CompletionModel,
+            rig::providers::openai::completion::streaming::StreamingCompletionResponse,
+            _,
+        >::new(model_id.to_string(), agent)))
+    }
+
+    pub fn check_env(model_ids: &[String]) -> Result<()> {
+        for model_id in model_ids {
+            let model_lower = model_id.to_lowercase();
+            let key = if model_lower.contains('/') || model_lower.starts_with("openrouter:") {
+                "OPENROUTER_API_KEY"
+            } else if model_lower.contains("claude") || model_lower.contains("sonnet") || model_lower.contains("opus") || model_lower.contains("haiku") {
+                "ANTHROPIC_API_KEY"
+            } else if model_lower.starts_with("gpt") || model_lower.starts_with("o1") || model_lower.starts_with("o3") || model_lower.starts_with("o4") || model_lower.starts_with("chat") {
+                "OPENAI_API_KEY"
             } else {
-                for (name, key) in all_keys {
-                    if m_lower.contains(&name.to_lowercase()) && env::var(key).is_ok() {
-                        found = true;
-                        break;
-                    }
-                }
-            }
-            if !found && env::var("OPENROUTER_API_KEY").is_err() {
-                return Err(anyhow!(
-                    "Model {} is unrecognized and no OPENROUTER_API_KEY was found.",
-                    m
-                ));
-            }
+                "OPENROUTER_API_KEY"
+            };
+            std::env::var(key)
+                .or_else(|_| std::env::var("LLM_API_KEY"))
+                .map_err(|_| anyhow::anyhow!("Missing {} (or LLM_API_KEY) for model {}", key, model_id))?;
         }
         Ok(())
     }
 }
+
+

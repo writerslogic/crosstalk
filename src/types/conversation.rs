@@ -19,6 +19,8 @@ pub enum TurnOutcome {
     RolledBack,
     /// The turn was rejected by the consensus engine.
     Rejected,
+    /// The artifact failed formal verification (Verus).
+    VerificationFailed,
     /// No meaningful progress was made.
     Stalled,
     /// Outcome has not been evaluated yet.
@@ -51,6 +53,7 @@ pub enum TaskCategory {
     Refactoring,
     Research,
     Testing,
+    General,
 }
 
 impl TaskCategory {
@@ -58,6 +61,7 @@ impl TaskCategory {
         match self {
             TaskCategory::Research => TurnStructure::Symbolic,
             TaskCategory::CodeGeneration => TurnStructure::CodeFirst,
+            TaskCategory::General => TurnStructure::FreeForm,
             _ => TurnStructure::StepByStep,
         }
     }
@@ -68,6 +72,7 @@ impl TaskCategory {
             TaskCategory::Research => 2200,
             TaskCategory::CodeGeneration => 2000,
             TaskCategory::Refactoring => 1800,
+            TaskCategory::General => 1000,
             TaskCategory::Debugging | TaskCategory::Testing => 1500,
         }
     }
@@ -92,6 +97,12 @@ pub struct Turn {
     pub signature: Vec<u8>,
     #[serde(default)]
     pub surprise_signal: Option<f64>,
+    #[serde(default)]
+    pub consistency_score: Option<f64>,
+    /// Per-agent diff quality score at the time this turn was committed. Stored
+    /// here for observability; the live score lives in IntelligenceEngine.
+    #[serde(default)]
+    pub diff_quality_score: Option<f64>,
 }
 
 fn default_outcome() -> TurnOutcome {
@@ -99,7 +110,7 @@ fn default_outcome() -> TurnOutcome {
 }
 
 /// Full mutable state of a running session, persisted to Sled on every checkpoint.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ConversationState {
     pub session_id: String,
     pub iteration_index: u32,
@@ -117,6 +128,8 @@ pub struct ConversationState {
     pub goal_tree: GoalTree,
     #[serde(default)]
     pub node_consensus: BTreeMap<String, f64>,
+    #[serde(default)]
+    pub last_verification: Vec<(String, String, bool)>,
 }
 
 impl ConversationState {
@@ -132,7 +145,28 @@ impl ConversationState {
             budget: BudgetLedger::default(),
             goal_tree: GoalTree::default(),
             node_consensus: BTreeMap::new(),
+            last_verification: Vec::new(),
         }
+    }
+
+    pub fn ingest_file(&mut self, name: String, language: String, content: String) {
+        use crate::types::artifact::Artifact;
+        use crate::engines::validation::AstValidator;
+        let skeleton = AstValidator::generate_skeleton(&content, &language);
+        let artifact = Artifact {
+            name: name.clone(),
+            language,
+            content,
+            version: 0,
+            history: vec![],
+            ast_versions: std::collections::BTreeMap::new(),
+            proof_attachments: vec![],
+            metrics: crate::engines::quality::ArtifactMetrics::default(),
+            skeleton,
+        };
+        let all_names: Vec<String> = self.artifacts.keys().cloned().collect();
+        let metrics = crate::engines::quality::QualityEngine::analyze_artifact(&artifact, &all_names);
+        self.artifacts.insert(name, std::sync::Arc::new(Artifact { metrics, ..artifact }));
     }
 
     pub fn now() -> u64 {

@@ -45,11 +45,15 @@ impl AnalyticsEngine {
 
         // Δα magnitude trend from artifact diff sizes
         let delta_trend = Self::compute_delta_trend(sigma);
+        let semantic_delta = SemanticConvergenceDetector::calculate_semantic_delta(sigma);
 
         let mut blockers = vec![];
         // Stuck goal: high iterations, low convergence
         if sigma.completion_probability < 0.5 && n > 10 {
             blockers.push("StuckGoal: low convergence velocity after 10+ turns".to_string());
+        }
+        if semantic_delta > 0.4 && n > 5 {
+             blockers.push(format!("SemanticDivergence: delta={:.2} exceeds threshold", semantic_delta));
         }
         // Capability mismatch: one agent dominates failures
         let failure_agents = Self::dominant_failure_agent(sigma);
@@ -266,44 +270,70 @@ impl StrategyRecommender {
 pub struct MetaLearningEngine;
 
 impl MetaLearningEngine {
+    /// Computes multi-session insights, specifically tracking the Intelligence Growth Rate.
+    /// Growth is defined by sessions becoming faster (fewer turns) and cheaper (fewer tokens) over time.
     #[must_use]
     pub fn compute_insight(sessions: &[&ConversationState]) -> MetaLearningInsight {
         let session_count = sessions.len();
-        if session_count == 0 {
-            return MetaLearningInsight {
-                session_count: 0,
-                avg_turns_to_convergence: 0.0,
-                quality_growth_rate: 0.0,
-                best_model: None,
-            };
-        }
-
-        let avg_turns =
-            sessions.iter().map(|s| s.turns.len() as f64).sum::<f64>() / session_count as f64;
-
-        let quality_scores: Vec<f64> = sessions.iter().map(|s| s.completion_probability).collect();
-        let x: Vec<f64> = (0..quality_scores.len()).map(|i| i as f64).collect();
-        let growth = AnalyticsEngine::linear_regression_slope(&x, &quality_scores);
-
+        // Best model identification (works with any number of sessions)
         let mut model_wins: HashMap<String, u32> = HashMap::new();
         for s in sessions {
             for t in &s.turns {
-                if matches!(t.outcome, TurnOutcome::TestsPassed) {
+                if t.outcome == TurnOutcome::TestsPassed {
                     *model_wins.entry(t.model_id.clone()).or_insert(0) += 1;
                 }
             }
         }
-        let best_model = model_wins
-            .into_iter()
-            .max_by_key(|(_, v)| *v)
-            .map(|(k, _)| k);
+        let best_model = model_wins.into_iter().max_by_key(|(_, v)| *v).map(|(k, _)| k);
+
+        if session_count < 2 {
+            return MetaLearningInsight {
+                session_count,
+                avg_turns_to_convergence: sessions.first().map(|s| s.turns.len() as f64).unwrap_or(0.0),
+                quality_growth_rate: 0.0,
+                best_model,
+            };
+        }
+
+        // 1. Turns trend (Velocity of learning)
+        let turns_y: Vec<f64> = sessions.iter().map(|s| s.turns.len() as f64).collect();
+        let x: Vec<f64> = (0..session_count).map(|i| i as f64).collect();
+        let turns_slope = AnalyticsEngine::linear_regression_slope(&x, &turns_y);
+
+        // 2. Quality growth
+        let quality_y: Vec<f64> = sessions.iter().map(|s| s.completion_probability).collect();
+        let quality_growth = AnalyticsEngine::linear_regression_slope(&x, &quality_y);
 
         MetaLearningInsight {
             session_count,
-            avg_turns_to_convergence: avg_turns,
-            quality_growth_rate: growth,
+            avg_turns_to_convergence: turns_y.iter().sum::<f64>() / session_count as f64,
+            quality_growth_rate: quality_growth - (turns_slope * 0.1), // Penalize slow convergence
             best_model,
         }
+    }
+}
+
+pub struct SemanticConvergenceDetector;
+
+impl SemanticConvergenceDetector {
+    #[must_use]
+    pub fn calculate_semantic_delta(sigma: &ConversationState) -> f64 {
+        if sigma.turns.len() < 2 {
+            return 1.0;
+        }
+        let current_turn = &sigma.turns[sigma.turns.len() - 1];
+        let prev_turn = &sigma.turns[sigma.turns.len() - 2];
+
+        let current_vec = crate::engines::memory::embed_text(&current_turn.content);
+        let prev_vec = crate::engines::memory::embed_text(&prev_turn.content);
+
+        let sim = crate::engines::memory::cosine_sim(&current_vec, &prev_vec);
+        (1.0 - f64::from(sim)).clamp(0.0, 1.0)
+    }
+
+    #[must_use]
+    pub fn is_converged(sigma: &ConversationState, threshold: f64) -> bool {
+        Self::calculate_semantic_delta(sigma) < threshold
     }
 }
 

@@ -52,6 +52,7 @@ pub struct PromptTemplate {
     pub template_text: String,
     pub task_category: TaskCategory,
     pub variables: Vec<String>,
+    pub tags: Vec<String>,
     pub performance_history: Vec<(String, f64)>,
 }
 
@@ -73,7 +74,7 @@ impl PromptTemplate {
     }
 
     pub fn is_corrective(&self) -> bool {
-        self.id.contains("corrective")
+        self.id.contains("corrective") || self.tags.contains(&"corrective".to_string())
     }
 
     pub fn category(&self) -> TaskCategory {
@@ -134,6 +135,16 @@ impl PromptTemplate {
     pub fn mean_performance(&self) -> f64 {
         if self.performance_history.is_empty() {
             return 0.5;
+        }
+        self.performance_history.iter().map(|(_, q)| q).sum::<f64>()
+            / self.performance_history.len() as f64
+    }
+
+    /// Mean quality across all recorded performance observations (0.0 if none).
+    #[must_use]
+    pub fn mean_quality(&self) -> f64 {
+        if self.performance_history.is_empty() {
+            return 0.0;
         }
         self.performance_history.iter().map(|(_, q)| q).sum::<f64>()
             / self.performance_history.len() as f64

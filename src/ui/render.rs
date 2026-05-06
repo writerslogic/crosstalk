@@ -84,8 +84,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .split(rows[1]);
 
     let ghost_style = focus_border(app, FocusedPane::GhostStream);
+    let ghost_area = center[0];
+    let inner_height = ghost_area.height.saturating_sub(2) as usize; // subtract borders
+    let scroll_y = if app.ghost_auto_scroll {
+        app.ghost_scroll.saturating_sub(inner_height)
+    } else {
+        app.ghost_scroll
+    };
     let ghost = Paragraph::new(app.streaming_buffer.as_str())
-        .scroll((app.ghost_scroll as u16, 0))
+        .scroll((scroll_y as u16, 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -93,7 +100,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 .border_style(ghost_style),
         )
         .wrap(Wrap { trim: false });
-    frame.render_widget(ghost, center[0]);
+    frame.render_widget(ghost, ghost_area);
 
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -206,8 +213,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
     } else {
         "---fps".to_string()
     };
+    let godview_str = format!(
+        "ξ:{:.0}% σ:{:.0}%",
+        app.godview_certainty * 100.0,
+        app.godview_surprise * 100.0
+    );
     let status = Paragraph::new(format!(
-        " [Tab] Focus | [Ctrl+I] Inject | [j/k] Scroll | [g/G] Top/Bottom | [q] Quit | {fps_str} "
+        " [Tab] Focus | [Ctrl+I] Inject | [j/k] Scroll | [g/G] Top/Bottom | [q] Quit | {godview_str} | {fps_str} "
     ));
     frame.render_widget(status, rows[4]);
 

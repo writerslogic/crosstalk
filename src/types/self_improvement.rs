@@ -37,29 +37,6 @@ impl ImprovementHypothesis {
     }
 }
 
-// ── PromptTemplate ────────────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct PromptTemplate {
-    pub id: String,
-    pub version: u32,
-    pub content: String,
-    pub task_types: Vec<String>,
-    /// `(session_id, quality_score)` pairs, most-recent last.
-    pub performance_history: Vec<(String, f64)>,
-}
-
-impl PromptTemplate {
-    #[must_use]
-    pub fn mean_quality(&self) -> f64 {
-        if self.performance_history.is_empty() {
-            return 0.0;
-        }
-        let sum: f64 = self.performance_history.iter().map(|(_, q)| q).sum();
-        sum / self.performance_history.len() as f64
-    }
-}
-
 // ── StrategyEntry ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

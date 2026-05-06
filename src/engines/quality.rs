@@ -24,6 +24,8 @@ pub struct ArtifactMetrics {
     pub comment_density: f64,
     pub line_count: u32,
     pub health_score: f64,
+    #[serde(default)]
+    pub visual_fidelity: f64,
 }
 
 pub struct QualityEngine;
@@ -62,21 +64,20 @@ impl QualityEngine {
             comment_density,
             line_count: total_lines,
             health_score,
+            visual_fidelity: 0.0,
         }
     }
 
     fn compute_ast_metrics(content: &str, module_lookup: &[String]) -> (u32, u32) {
-        if content.len() > 10_000_000 {
-            return (1, 0);
-        }
-        let mut complexity = 1u32;
-        let mut dependencies = HashSet::new();
+        let lookup_set: HashSet<&str> = module_lookup.iter().map(|s| s.as_str()).collect();
 
         let tree = PARSER.with(|p| p.borrow_mut().parse(content, None));
         let Some(t) = tree else { return (1, 0) };
 
         let mut cursor = t.walk();
         let mut going_down = true;
+        let mut complexity: u32 = 1;
+        let mut dependencies: HashSet<&str> = HashSet::new();
 
         loop {
             if going_down {
@@ -100,7 +101,7 @@ impl QualityEngine {
                     && let Ok(text) = std::str::from_utf8(slice)
                 {
                     for token in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
-                        if module_lookup.contains(&token.to_string()) {
+                        if lookup_set.contains(token) {
                             dependencies.insert(token);
                         }
                     }
@@ -253,7 +254,8 @@ impl RegressionDetector {
             0.0
         };
 
-        health_drop > 0.05 || complexity_pct_increase > 0.20
+        let comment_drop = old.comment_density - new.comment_density;
+        health_drop > 0.05 || complexity_pct_increase > 0.20 || comment_drop > 0.15
     }
 }
 
@@ -914,5 +916,45 @@ impl DeadCodeDetector {
             dead_items,
             dead_code_ratio,
         }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct RegressionReport {
+    pub drift_score: f64,
+    pub outcome_mismatches: Vec<u32>,
+    pub significant_health_drops: Vec<String>,
+}
+
+impl RegressionDetector {
+    #[must_use]
+    pub fn detect(gold: &crate::types::conversation::ConversationState, actual: &crate::types::conversation::ConversationState) -> RegressionReport {
+        let mut report = RegressionReport::default();
+        let mut total_drift = 0.0;
+        
+        // 1. Compare turns outcome and certainty
+        for (g, a) in gold.turns.iter().zip(actual.turns.iter()) {
+            if g.outcome != a.outcome {
+                report.outcome_mismatches.push(g.index);
+                total_drift += 0.2;
+            }
+            if let (Some(gc), Some(ac)) = (g.certainty, a.certainty) {
+                total_drift += (gc - ac).abs() * 0.1;
+            }
+        }
+
+        // 2. Compare final artifact health
+        for (name, gold_art) in &gold.artifacts {
+            if let Some(actual_art) = actual.artifacts.get(name) {
+                let drop = gold_art.metrics.health_score - actual_art.metrics.health_score;
+                if drop > 0.1 {
+                    report.significant_health_drops.push(name.clone());
+                    total_drift += drop;
+                }
+            }
+        }
+
+        report.drift_score = total_drift.min(1.0);
+        report
     }
 }

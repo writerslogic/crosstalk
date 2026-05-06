@@ -1,309 +1,12 @@
 use crate::types::consensus::MergeVote;
 use crate::types::conversation::Turn;
-use anyhow::{Result, anyhow};
-use crossbeam::deque::{Injector, Steal, Worker};
+use anyhow::Result;
 use dashmap::DashMap;
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::future::Future;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU32, Ordering as AtomicOrdering},
-};
-use std::time::Duration;
-use tokio::sync::{Notify, broadcast, mpsc};
-use tokio::task::JoinSet;
-
-/// Zero-copy identifier to prevent heap allocations on map lookups.
-pub type NodeId = Arc<str>;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum NodeStatus {
-    Spawning,
-    Running,
-    WaitingMerge,
-    Complete,
-    Failed,
-    Idle,
-}
-
-/// A simulated network interface for Raft peer-to-peer communication.
-/// In production, this is typically backed by gRPC (Tonic).
-pub trait RaftNetwork: Send + Sync + 'static {
-    fn request_vote(
-        &self,
-        term: u64,
-        candidate_id: NodeId,
-    ) -> impl Future<Output = Result<bool>> + Send;
-}
-
-pub struct SwarmController {
-    pub nodes: Arc<DashMap<NodeId, NodeStatus>>,
-    pub state_tx: broadcast::Sender<Turn>,
-    pub work_notify: Arc<Notify>,
-    pub task_queue: Arc<Injector<SubTask>>,
-    task_spawner: std::sync::Mutex<Option<mpsc::Sender<tokio::task::JoinHandle<()>>>>,
-    supervisor_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-}
-
-impl SwarmController {
-    #[must_use]
-    pub fn new() -> Self {
-        let (state_tx, _) = broadcast::channel(1000);
-        let (task_spawner, mut task_rx) = mpsc::channel(100);
-
-        // SUPERVISOR (Reaper)
-        let supervisor_handle = tokio::spawn(async move {
-            let mut join_set = JoinSet::new();
-            loop {
-                tokio::select! {
-                    Some(handle) = task_rx.recv() => {
-                        join_set.spawn(async move {
-                            let _ = handle.await;
-                        });
-                    }
-                    Some(_res) = join_set.join_next() => {}
-                    else => break, // Channel closed
-                }
-            }
-        });
-
-        Self {
-            nodes: Arc::new(DashMap::new()),
-            state_tx,
-            work_notify: Arc::new(Notify::new()),
-            task_queue: Arc::new(Injector::new()),
-            task_spawner: std::sync::Mutex::new(Some(task_spawner)),
-            supervisor_handle: std::sync::Mutex::new(Some(supervisor_handle)),
-        }
-    }
-
-    pub async fn shutdown(&self) {
-        {
-            let mut guard = match self.task_spawner.lock() {
-                Ok(g) => g,
-                Err(e) => e.into_inner(),
-            };
-            guard.take();
-        }
-        let handle = {
-            let mut guard = match self.supervisor_handle.lock() {
-                Ok(g) => g,
-                Err(e) => e.into_inner(),
-            };
-            guard.take()
-        };
-        if let Some(h) = handle {
-            let _ = h.await;
-        }
-    }
-
-    /// Spawns a node with a fully implemented, event-driven worker loop and work-stealing support.
-    pub async fn spawn_node(&self, node_id: impl Into<NodeId>) -> Result<()> {
-        let id: NodeId = node_id.into();
-        self.nodes.insert(Arc::clone(&id), NodeStatus::Spawning);
-
-        let nodes_ref = Arc::clone(&self.nodes);
-        let id_clone = Arc::clone(&id);
-        let injector = Arc::clone(&self.task_queue);
-
-        // Subscribe to the global turn broadcaster before spawning
-        let mut turn_rx = self.state_tx.subscribe();
-        let notify_ref = Arc::clone(&self.work_notify);
-
-        let worker_handle = tokio::spawn(async move {
-            nodes_ref.insert(id_clone.clone(), NodeStatus::Running);
-            let local_queue = Worker::new_fifo();
-
-            // WORKER LOOP: Actively listen for global turns, local notifications, and steal tasks
-            loop {
-                // Attempt to pull a task from global injector or steal from peers (simplified)
-                let task = local_queue.pop().or_else(|| {
-                    match injector.steal_batch_and_pop(&local_queue) {
-                        Steal::Success(t) => Some(t),
-                        _ => None,
-                    }
-                });
-
-                if let Some(sub_task) = task {
-                    nodes_ref.insert(id_clone.clone(), NodeStatus::Running);
-                    // Process the sub-task
-                    tokio::time::sleep(Duration::from_millis(
-                        100 * sub_task.estimated_turns as u64,
-                    ))
-                    .await;
-                    nodes_ref.insert(id_clone.clone(), NodeStatus::WaitingMerge);
-                    continue;
-                }
-
-                nodes_ref.insert(id_clone.clone(), NodeStatus::Idle);
-
-                tokio::select! {
-                    result = turn_rx.recv() => {
-                        match result {
-                            Ok(turn) => {
-                                // σ-Syncing: apply the global turn delta to local view
-                                // In production, this would update the node's local Sled tree
-                                nodes_ref.insert(id_clone.clone(), NodeStatus::WaitingMerge);
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-
-                    _ = notify_ref.notified() => {}
-
-                    else => break,
-                }
-            }
-
-            nodes_ref.insert(id_clone, NodeStatus::Complete);
-        });
-
-        let sender = {
-            let guard = match self.task_spawner.lock() {
-                Ok(g) => g,
-                Err(e) => e.into_inner(),
-            };
-            guard
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| anyhow!("Critical: Swarm Supervisor shut down"))?
-        };
-        sender
-            .send(worker_handle)
-            .await
-            .map_err(|_| anyhow!("Critical: Swarm Supervisor died"))
-    }
-
-    pub fn submit_tasks(&self, tasks: Vec<SubTask>) {
-        for task in tasks {
-            self.task_queue.push(task);
-        }
-        self.work_notify.notify_waiters();
-    }
-
-    pub fn broadcast_turn(&self, turn: Turn) -> Result<usize> {
-        match self.state_tx.send(turn) {
-            Ok(n) => Ok(n),
-            Err(_) => Ok(0),
-        }
-    }
-}
-
-impl Default for SwarmController {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RaftState {
-    Follower,
-    Candidate,
-    Leader,
-}
-
-pub struct LeaderElection {
-    pub node_id: NodeId,
-    pub term: u64,
-    pub state: RaftState,
-    pub votes: usize,
-}
-
-impl LeaderElection {
-    #[must_use]
-    pub fn new(node_id: impl Into<NodeId>) -> Self {
-        Self {
-            node_id: node_id.into(),
-            term: 0,
-            state: RaftState::Follower,
-            votes: 0,
-        }
-    }
-
-    /// Evaluates the Raft Election utilizing Scatter-Gather RPCs and Quorum Short-Circuiting.
-    pub async fn run_election_cycle<N: RaftNetwork>(
-        &mut self,
-        peers: &[Arc<N>],
-        mut heartbeat_rx: mpsc::Receiver<()>,
-    ) -> bool {
-        let timeout_ms = rand::rng().random_range(150..300);
-        let election_timer = tokio::time::sleep(Duration::from_millis(timeout_ms));
-
-        tokio::select! {
-            // Preempted by a valid leader
-            Some(_) = heartbeat_rx.recv() => {
-                self.state = RaftState::Follower;
-                false
-            }
-
-            // Timeout triggers election
-            _ = election_timer => {
-                if self.state == RaftState::Follower || self.state == RaftState::Candidate {
-                    self.term += 1;
-                    self.state = RaftState::Candidate;
-                    self.votes = 1; // Vote for self
-
-                    let total_nodes = peers.len() + 1;
-                    let quorum = (total_nodes >> 1) + 1; // Bitwise div 2 + 1
-
-                    // Scatter: Fire all RPCs concurrently
-                    let mut rpc_tasks = JoinSet::new();
-                    for peer in peers {
-                        let peer = Arc::clone(peer);
-                        let candidate_id = Arc::clone(&self.node_id);
-                        let term = self.term;
-
-                        rpc_tasks.spawn(async move {
-                            // Strict timeout on external RPCs to prevent network stalling
-                            match tokio::time::timeout(
-                                Duration::from_millis(50),
-                                peer.request_vote(term, candidate_id)
-                            ).await {
-                                Ok(Ok(vote_granted)) => vote_granted,
-                                _ => false, // Network failure/timeout counts as rejected vote
-                            }
-                        });
-                    }
-
-                    // Gather: Await responses as they complete
-                    while let Some(res) = rpc_tasks.join_next().await {
-                        if let Ok(true) = res {
-                            self.votes += 1;
-
-                            // QUORUM SHORT-CIRCUIT:
-                            // If we hit quorum early, abort pending RPCs to save bandwidth.
-                            if self.votes >= quorum {
-                                rpc_tasks.abort_all();
-                                self.state = RaftState::Leader;
-                                return true;
-                            }
-                        }
-                    }
-                }
-
-                // Election failed
-                self.state = RaftState::Follower;
-                false
-            }
-        }
-    }
-}
-
-pub struct GlobalMergeGate;
-
-impl GlobalMergeGate {
-    #[must_use]
-    pub fn has_quorum(votes: &[MergeVote], total_nodes: usize) -> bool {
-        if votes.is_empty() || total_nodes == 0 {
-            return false;
-        }
-        let approvals = votes.iter().filter(|v| v.approve).count();
-        approvals > (total_nodes >> 1)
-    }
-}
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubTask {
@@ -313,128 +16,215 @@ pub struct SubTask {
     pub estimated_turns: u32,
 }
 
-pub struct TaskDecomposer;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeStatus {
+    Idle,
+    Processing,
+    WaitingMerge,
+    Merging,
+    Error,
+    Running,
+    Complete,
+    Failed,
+}
 
-impl TaskDecomposer {
-    /// Split `description` into up to `n_tracks` parallel sub-tasks.
-    /// Sentences are grouped evenly; the first track has no dependencies,
-    /// subsequent tracks declare the prior track as a dependency.
-    #[must_use]
-    pub fn decompose(description: &str, n_tracks: usize) -> Vec<SubTask> {
-        if n_tracks == 0 || description.is_empty() {
-            return vec![];
+pub struct SwarmController {
+    pub nodes: Arc<DashMap<String, NodeStatus>>,
+    pub node_tx: DashMap<String, mpsc::UnboundedSender<String>>,
+    pub spawn_count: AtomicU32,
+}
+
+impl SwarmController {
+    pub fn new() -> Self {
+        Self {
+            nodes: Arc::new(DashMap::new()),
+            node_tx: DashMap::new(),
+            spawn_count: AtomicU32::new(0),
         }
-        let sentences: Vec<&str> = description
-            .split(['.', '\n'])
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
+    }
 
-        let n = n_tracks.min(sentences.len()).max(1);
-        let chunk = sentences.len().div_ceil(n);
+    pub fn spawn_node(&self, id: &str, mut turn_rx: tokio::sync::broadcast::Receiver<Turn>) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        self.node_tx.insert(id.to_string(), tx);
+        self.nodes.insert(id.to_string(), NodeStatus::Idle);
 
-        sentences
-            .chunks(chunk)
-            .enumerate()
-            .map(|(i, chunk)| SubTask {
-                id: format!("task-{i}"),
-                description: chunk.join(". "),
-                dependencies: if i == 0 {
-                    vec![]
-                } else {
-                    vec![format!("task-{}", i - 1)]
-                },
-                estimated_turns: chunk.len() as u32,
-            })
-            .collect()
+        let id_clone = id.to_string();
+        let nodes_ref = Arc::clone(&self.nodes);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(_task) = rx.recv() => {
+                        nodes_ref.insert(id_clone.clone(), NodeStatus::Processing);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        nodes_ref.insert(id_clone.clone(), NodeStatus::Idle);
+                    }
+                    result = turn_rx.recv() => {
+                        match result {
+                            Ok(_) => {
+                                nodes_ref.entry(id_clone.clone()).and_modify(|s| {
+                                    if let NodeStatus::Idle = s { *s = NodeStatus::Processing; }
+                                });
+                                nodes_ref.insert(id_clone.clone(), NodeStatus::WaitingMerge);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+        });
+        self.spawn_count.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    pub async fn shutdown(&self) {
+        for node in self.node_tx.iter() {
+            if node.value().send("SHUTDOWN".to_string()).is_err() {
+                tracing::warn!(node = %node.key(), "shutdown signal failed: receiver dropped");
+            }
+        }
+    }
+
+    pub fn broadcast_turn(&self, turn: Turn) -> Result<()> {
+        for node in self.node_tx.iter() {
+            if node.value().send(format!("SYNC_TURN:{}", turn.index)).is_err() {
+                tracing::warn!(node = %node.key(), turn = turn.index, "sync broadcast failed");
+            }
+        }
+        Ok(())
     }
 }
+
+impl Default for SwarmController {
+    fn default() -> Self { Self::new() }
+}
+
+pub struct TaskDecomposer;
+impl TaskDecomposer {
+    pub fn decompose(description: &str, n_tracks: usize) -> Vec<SubTask> {
+        if n_tracks == 0 {
+            return vec![];
+        }
+        let lines: Vec<&str> = description.lines().filter(|l| !l.trim().is_empty()).collect();
+        if lines.is_empty() {
+            return vec![];
+        }
+        let chunk_size = (lines.len() as f64 / n_tracks as f64).ceil() as usize;
+        lines.chunks(chunk_size.max(1)).enumerate().map(|(i, chunk)| {
+            SubTask {
+                id: format!("task-{}", i),
+                description: chunk.join("\n"),
+                dependencies: if i > 0 { vec![format!("task-{}", i-1)] } else { vec![] },
+                estimated_turns: chunk.len() as u32,
+            }
+        }).collect()
+    }
+}
+
+pub struct LeaderElection {
+    pub node_id: Arc<str>,
+    pub current_term: u64,
+}
+
+impl LeaderElection {
+    pub fn new(node_id: &str) -> Self {
+        Self {
+            node_id: Arc::from(node_id),
+            current_term: 0,
+        }
+    }
+
+    pub fn elect_leader(nodes: &[String]) -> String {
+        nodes.iter().min().cloned().unwrap_or_default()
+    }
+
+    pub async fn run_election_cycle<N: RaftNetwork + Send + Sync>(
+        &mut self,
+        peers: &[Arc<N>],
+        mut heartbeat_rx: mpsc::Receiver<()>,
+    ) -> bool {
+        self.current_term += 1;
+        let term = self.current_term;
+        let candidate_id = Arc::clone(&self.node_id);
+
+        // Check for preempting heartbeat first
+        if heartbeat_rx.try_recv().is_ok() {
+            return false;
+        }
+
+        if peers.is_empty() {
+            // No peers; only win if no heartbeat preempted
+            return true;
+        }
+
+        let mut grants = 1u32; // vote for self
+        let total = peers.len() as u32 + 1;
+
+        for peer in peers {
+            if let Ok(true) = peer.request_vote(term, Arc::clone(&candidate_id)).await {
+                grants += 1;
+            }
+        }
+
+        grants > total / 2
+    }
+}
+
+#[allow(async_fn_in_trait)]
+pub trait RaftNetwork {
+    async fn request_vote(
+        &self,
+        term: u64,
+        candidate_id: Arc<str>,
+    ) -> Result<bool>;
+}
+
+// ── AgentAssigner ────────────────────────────────────────────────────────────
 
 pub struct AgentAssigner;
 
 impl AgentAssigner {
-    /// Greedy assignment: each sub-task goes to the agent with the highest
-    /// capability score. Returns a map of `task_id → agent_id`.
-    #[must_use]
-    pub fn assign(
-        tasks: &[SubTask],
-        capabilities: &HashMap<String, f64>,
-    ) -> HashMap<String, String> {
+    pub fn assign(tasks: &[SubTask], capabilities: &HashMap<String, f64>) -> HashMap<String, String> {
         if capabilities.is_empty() {
             return HashMap::new();
         }
-        let best_agent = capabilities
-            .iter()
+        let best_agent = capabilities.iter()
             .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(id, _)| id.clone())
+            .map(|(k, _)| k.clone())
             .unwrap_or_default();
-
-        tasks
-            .iter()
-            .map(|t| (t.id.clone(), best_agent.clone()))
-            .collect()
+        tasks.iter().map(|t| (t.id.clone(), best_agent.clone())).collect()
     }
+}
 
-    /// Per-task assignment using per-task capability scores keyed by task id.
-    #[must_use]
-    pub fn assign_per_task(
-        tasks: &[SubTask],
-        per_task_caps: &HashMap<String, HashMap<String, f64>>,
-    ) -> HashMap<String, String> {
-        tasks
-            .iter()
-            .map(|t| {
-                let agent = per_task_caps
-                    .get(&t.id)
-                    .and_then(|caps| {
-                        caps.iter()
-                            .max_by(|a, b| a.1.total_cmp(b.1))
-                            .map(|(id, _)| id.clone())
-                    })
-                    .unwrap_or_default();
-                (t.id.clone(), agent)
-            })
-            .collect()
-    }
+// ── ConflictDetector ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictSeverity {
+    Minor,
+    Major,
 }
 
 #[derive(Debug, Clone)]
 pub struct Conflict {
-    pub task_a: String,
-    pub task_b: String,
     pub artifact: String,
     pub severity: ConflictSeverity,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConflictSeverity {
-    /// Edits to non-overlapping regions; auto-resolvable.
-    Minor,
-    /// Edits to the same region; requires arbitration.
-    Major,
+    pub proposed_by: String,
+    pub committed_by: String,
 }
 
 pub struct ConflictDetector;
 
 impl ConflictDetector {
-    /// Detect conflicts between `proposed` diffs and the `committed` baseline.
-    /// A conflict is raised when two diffs touch the same artifact name.
-    #[must_use]
     pub fn check(proposed: &[(&str, &str)], committed: &[(&str, &str)]) -> Vec<Conflict> {
-        let mut committed_map: HashMap<&str, Vec<&str>> = HashMap::new();
-        for (artifact, agent) in committed {
-            committed_map.entry(artifact).or_default().push(agent);
-        }
-
         let mut conflicts = Vec::new();
-        for (artifact, proposer) in proposed {
-            if let Some(committers) = committed_map.get(artifact) {
-                for committer in committers {
+        for &(p_art, p_agent) in proposed {
+            for &(c_art, c_agent) in committed {
+                if p_art == c_art {
                     conflicts.push(Conflict {
-                        task_a: proposer.to_string(),
-                        task_b: committer.to_string(),
-                        artifact: artifact.to_string(),
+                        artifact: p_art.to_string(),
                         severity: ConflictSeverity::Major,
+                        proposed_by: p_agent.to_string(),
+                        committed_by: c_agent.to_string(),
                     });
                 }
             }
@@ -443,83 +233,95 @@ impl ConflictDetector {
     }
 }
 
-#[derive(Debug, Clone)]
+// ── ProgressMonitor ──────────────────────────────────────────────────────────
+
 pub struct ProgressReport {
-    pub running: usize,
-    pub waiting_merge: usize,
-    pub complete: usize,
-    pub failed: usize,
     pub completion_ratio: f64,
+    pub complete: usize,
+    pub running: usize,
+    pub failed: usize,
+    pub waiting_merge: usize,
 }
 
 pub struct ProgressMonitor;
 
 impl ProgressMonitor {
-    #[must_use]
-    pub fn check(nodes: &DashMap<NodeId, NodeStatus>) -> ProgressReport {
-        let mut running = 0usize;
-        let mut waiting_merge = 0usize;
-        let mut complete = 0usize;
-        let mut failed = 0usize;
-
+    pub fn check<K: std::hash::Hash + Eq>(nodes: &DashMap<K, NodeStatus>) -> ProgressReport {
+        let total = nodes.len();
+        if total == 0 {
+            return ProgressReport {
+                completion_ratio: 0.0,
+                complete: 0,
+                running: 0,
+                failed: 0,
+                waiting_merge: 0,
+            };
+        }
+        let mut complete = 0;
+        let mut running = 0;
+        let mut failed = 0;
+        let mut waiting_merge = 0;
         for entry in nodes.iter() {
-            match entry.value() {
-                NodeStatus::Idle => {}
-                NodeStatus::Running | NodeStatus::Spawning => running += 1,
-                NodeStatus::WaitingMerge => waiting_merge += 1,
+            match *entry.value() {
                 NodeStatus::Complete => complete += 1,
-                NodeStatus::Failed => failed += 1,
+                NodeStatus::Running | NodeStatus::Processing => running += 1,
+                NodeStatus::Failed | NodeStatus::Error => failed += 1,
+                NodeStatus::WaitingMerge | NodeStatus::Merging => waiting_merge += 1,
+                NodeStatus::Idle => {}
             }
         }
-
-        let total = running + waiting_merge + complete + failed;
-        let completion_ratio = if total == 0 {
-            0.0
-        } else {
-            complete as f64 / total as f64
-        };
-
         ProgressReport {
-            running,
-            waiting_merge,
+            completion_ratio: complete as f64 / total as f64,
             complete,
+            running,
             failed,
-            completion_ratio,
+            waiting_merge,
         }
     }
 }
 
-#[derive(Debug, Default)]
+// ── SwarmTelemetry ───────────────────────────────────────────────────────────
+
 pub struct SwarmTelemetry {
-    pub spawn_count: AtomicU32,
-    pub merge_count: AtomicU32,
-    pub conflict_count: AtomicU32,
+    spawns: AtomicU32,
+    merges: AtomicU32,
+    conflicts: AtomicU32,
 }
 
 impl SwarmTelemetry {
-    #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            spawns: AtomicU32::new(0),
+            merges: AtomicU32::new(0),
+            conflicts: AtomicU32::new(0),
+        }
     }
-
-    pub fn record_spawn(&self) {
-        self.spawn_count.fetch_add(1, AtomicOrdering::Relaxed);
-    }
-
-    pub fn record_merge(&self) {
-        self.merge_count.fetch_add(1, AtomicOrdering::Relaxed);
-    }
-
-    pub fn record_conflict(&self) {
-        self.conflict_count.fetch_add(1, AtomicOrdering::Relaxed);
-    }
-
-    #[must_use]
+    pub fn record_spawn(&self) { self.spawns.fetch_add(1, AtomicOrdering::Relaxed); }
+    pub fn record_merge(&self) { self.merges.fetch_add(1, AtomicOrdering::Relaxed); }
+    pub fn record_conflict(&self) { self.conflicts.fetch_add(1, AtomicOrdering::Relaxed); }
     pub fn snapshot(&self) -> (u32, u32, u32) {
         (
-            self.spawn_count.load(AtomicOrdering::Relaxed),
-            self.merge_count.load(AtomicOrdering::Relaxed),
-            self.conflict_count.load(AtomicOrdering::Relaxed),
+            self.spawns.load(AtomicOrdering::Relaxed),
+            self.merges.load(AtomicOrdering::Relaxed),
+            self.conflicts.load(AtomicOrdering::Relaxed),
         )
+    }
+}
+
+impl Default for SwarmTelemetry {
+    fn default() -> Self { Self::new() }
+}
+
+// ── GlobalMergeGate ──────────────────────────────────────────────────────────
+
+pub struct GlobalMergeGate;
+
+impl GlobalMergeGate {
+    pub fn has_quorum(votes: &[MergeVote], total_nodes: usize) -> bool {
+        if votes.is_empty() || total_nodes == 0 {
+            return false;
+        }
+        let approvals = votes.iter().filter(|v| v.approve).count();
+        approvals > total_nodes / 2
     }
 }

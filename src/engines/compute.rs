@@ -49,17 +49,19 @@ impl ResourceMonitorActor {
                     disks.iter().map(|d| d.available_space()).sum::<u64>() / 1024 / 1024 / 1024;
                 let alert = if cpu_load > 90.0 {
                     Some("CPU Critical".to_string())
-                } else if rss_mb > 16_000 {
+                } else if rss_mb > 56_000 {
                     Some("Memory Critical".to_string())
                 } else {
                     None
                 };
-                let _ = tx.send(ResourceEvent {
+                if tx.send(ResourceEvent {
                     rss_mb,
                     cpu_load,
                     disk_free_gb,
                     alert,
-                });
+                }).is_err() {
+                    break;
+                }
             }
         });
         Self { handle }
@@ -121,7 +123,7 @@ impl ComputeManager {
             disk_free_gb,
             alert,
         };
-        let _ = self.resource_tx.send(event.clone());
+        crate::log_warn!(self.resource_tx.send(event.clone()), "Failed to broadcast resource event");
         event
     }
 

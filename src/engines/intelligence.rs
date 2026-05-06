@@ -1,5 +1,6 @@
 use crate::types::conversation::{ConversationState, TaskCategory, Turn, TurnOutcome};
 use crate::types::intelligence::{ModelProfile, PromptTemplate, RegressionAlert};
+use crate::types::self_improvement::CalibrationRecord;
 use anyhow::{Context, Result, anyhow};
 use sled;
 use dashmap::DashMap;
@@ -48,7 +49,7 @@ impl CheckpointService {
                             if fs::write(&temp_path, &content).await.is_ok()
                                 && fs::rename(&temp_path, &path).await.is_err()
                             {
-                                let _ = fs::remove_file(&temp_path).await;
+                                crate::log_warn!(fs::remove_file(&temp_path).await, "Failed to remove temp file during checkpoint");
                             }
                         }
                     }
@@ -84,11 +85,16 @@ impl CheckpointService {
 pub struct IntelligenceEngine {
     pub profiles: Arc<DashMap<String, ModelProfile>>,
     pub templates: Arc<RwLock<Vec<PromptTemplate>>>,
+    pub calibration: Arc<RwLock<Vec<CalibrationRecord>>>,
     pub storage_path: Option<String>,
     pub latency_predictor: LatencyPredictor,
     pub failures: Arc<FailurePatternStore>,
     pub learner: StrategyLearner,
     checkpoint: CheckpointService,
+    /// Per-agent diff quality score (default 1.0 for unknown agents).
+    /// Clean diffs raise it; regressive or conflicted diffs lower it.
+    /// Used by routing to downweight agents with poor diff history.
+    diff_quality: Arc<DashMap<String, f64>>,
 }
 
 impl Default for IntelligenceEngine {
@@ -111,11 +117,17 @@ impl IntelligenceEngine {
         Self {
             profiles: Arc::new(DashMap::new()),
             templates: Arc::new(RwLock::new(Vec::new())),
+            calibration: Arc::new(RwLock::new(Vec::new())),
             storage_path: None,
             latency_predictor: LatencyPredictor::new(),
-            failures: Arc::new(FailurePatternStore::new(".crosstalk/intel").unwrap()),
+            failures: {
+                let id = format!("{}-{:x}", std::process::id(), rand::random::<u64>());
+                Arc::new(FailurePatternStore::new(&format!("{}/crosstalk-intel-{}", std::env::temp_dir().display(), id))
+                    .unwrap_or_else(|_| FailurePatternStore::ephemeral()))
+            },
             learner: StrategyLearner::new(),
             checkpoint: CheckpointService::new(),
+            diff_quality: Arc::new(DashMap::new()),
         }
     }
 
@@ -124,11 +136,17 @@ impl IntelligenceEngine {
         let mut engine = Self {
             profiles: Arc::new(DashMap::new()),
             templates: Arc::new(RwLock::new(Vec::new())),
+            calibration: Arc::new(RwLock::new(Vec::new())),
             storage_path: Some(path.to_string()),
             latency_predictor: LatencyPredictor::new(),
-            failures: Arc::new(FailurePatternStore::new(".crosstalk/intel").unwrap()),
+            failures: {
+                let id = format!("{}-{:x}", std::process::id(), rand::random::<u64>());
+                Arc::new(FailurePatternStore::new(&format!("{}/crosstalk-intel-{}", std::env::temp_dir().display(), id))
+                    .unwrap_or_else(|_| FailurePatternStore::ephemeral()))
+            },
             learner: StrategyLearner::new(),
             checkpoint: CheckpointService::new(),
+            diff_quality: Arc::new(DashMap::new()),
         };
 
         engine.load_profiles().await?;
@@ -201,24 +219,72 @@ impl IntelligenceEngine {
     }
 
     pub fn update_profile_with_latency(&self, turn: &Turn, quality_score: f64, latency_ms: u64) {
-        // C-009: there is a TOCTOU window between update_profile (which drops the DashMap guard)
-        // and the get_mut below. Collapsing both into a single entry() closure would require
-        // LatencyPredictor to be callable without a separate record() step; deferred for now.
-        self.update_profile(turn, quality_score);
         self.latency_predictor.record(&turn.model_id, latency_ms);
-        if let Some(mut profile) = self.profiles.get_mut(&turn.model_id) {
-            profile
-                .latency_ms
-                .update(self.latency_predictor.predict_latency(&turn.model_id) as f64);
+        let predicted = self.latency_predictor.predict_latency(&turn.model_id) as f64;
+
+        let mut profile = self
+            .profiles
+            .entry(turn.model_id.clone())
+            .or_insert_with(|| ModelProfile {
+                model_id: turn.model_id.clone(),
+                task_scores: BTreeMap::new(),
+                total_turns: 0,
+                last_updated: ConversationState::now(),
+                latency_ms: Default::default(),
+            });
+
+        if let Some(cat) = turn.task_category {
+            profile.task_scores.entry(cat).or_default().update(quality_score);
         }
+        profile.total_turns += 1;
+        profile.last_updated = ConversationState::now();
+        profile.latency_ms.update(predicted);
+
+        drop(profile);
+        self.trigger_save();
     }
 
     fn trigger_save(&self) {
-        let _ = self.checkpoint.trigger();
+        if let Err(e) = self.checkpoint.trigger() {
+            tracing::warn!(error = %e, "checkpoint trigger failed");
+        }
     }
 
     pub fn save_all(&self) -> Result<()> {
         self.checkpoint.save_all()
+    }
+
+    /// Update the diff quality score for `agent_id` based on the outcome of its
+    /// most recent artifact change.
+    ///
+    /// - `clean`: diff applied without conflict or validation failure.
+    /// - `regressive`: `RegressionDetector::is_regressive` returned true for
+    ///   at least one artifact in this turn.
+    ///
+    /// If both `clean` and `regressive` are false the diff was conflicted or
+    /// failed to apply (e.g. patch rejected), which also penalises the score.
+    pub fn update_diff_quality(&self, agent_id: &str, clean: bool, regressive: bool) {
+        let mut score = self.diff_quality
+            .entry(agent_id.to_string())
+            .or_insert(1.0);
+        if regressive {
+            *score = (*score - 0.2).max(0.0);
+        } else if clean {
+            *score = (*score + 0.05).min(1.0);
+        } else {
+            // conflicted / failed diff
+            *score = (*score - 0.15).max(0.0);
+        }
+    }
+
+    /// Returns the diff quality score for `agent_id`, or 1.0 if no history
+    /// exists yet.
+    #[must_use]
+    pub fn diff_quality_score(&self, agent_id: &str) -> f64 {
+        self.diff_quality
+            .get(agent_id)
+            .map(|v| *v)
+            .unwrap_or(1.0)
     }
 
     pub fn detect_regression(
@@ -270,7 +336,8 @@ impl IntelligenceEngine {
         None
     }
 
-    /// O(N) Routing algorithm. Finds the absolute best model in a single pass without allocating arrays or sorting.
+    /// Thompson Sampling router. Samples from Beta(alpha, beta) per agent to balance
+    /// exploration (try underused agents) with exploitation (prefer proven performers).
     pub fn route_task_constrained(
         &self,
         category: TaskCategory,
@@ -288,7 +355,7 @@ impl IntelligenceEngine {
         }
 
         let mut best_candidate: Option<&String> = None;
-        let mut highest_score = -1.0;
+        let mut highest_sample = -1.0;
 
         for model_id in available_models {
             if blacklist.contains(model_id) {
@@ -306,10 +373,19 @@ impl IntelligenceEngine {
                     continue;
                 }
 
-                let score = profile.task_scores.get(&category).map_or(0.5, |ra| ra.mean);
+                let mean = profile.task_scores.get(&category).map_or(0.5, |ra| ra.mean);
+                let n = profile.task_scores.get(&category).map_or(1, |ra| ra.count);
 
-                if score > highest_score {
-                    highest_score = score;
+                // Beta distribution parameters from observed mean and sample count.
+                // More observations → tighter distribution (less exploration).
+                // Fewer observations → wider (more exploration of unknown agents).
+                let alpha = mean * n as f64 + 1.0;
+                let beta = (1.0 - mean) * n as f64 + 1.0;
+                let sample = Self::beta_sample(alpha, beta)
+                    * self.diff_quality_score(model_id);
+
+                if sample > highest_sample {
+                    highest_sample = sample;
                     best_candidate = Some(model_id);
                 }
             }
@@ -327,6 +403,22 @@ impl IntelligenceEngine {
                 );
                 Err(format!("No models satisfy constraints. {}", diag))
             }
+        }
+    }
+
+    /// Sample from Beta(alpha, beta) using the Joehnk method.
+    fn beta_sample(alpha: f64, beta: f64) -> f64 {
+        let mut rng = rand::rng();
+        let u1: f64 = rand::Rng::random_range(&mut rng, 0.001..1.0);
+        let u2: f64 = rand::Rng::random_range(&mut rng, 0.001..1.0);
+        let x = u1.powf(1.0 / alpha);
+        let y = u2.powf(1.0 / beta);
+        let sum = x + y;
+        if sum <= 1.0 {
+            x / sum
+        } else {
+            // Rejection: fall back to mean estimate
+            alpha / (alpha + beta)
         }
     }
 
@@ -383,7 +475,8 @@ impl IntelligenceEngine {
                     .task_scores
                     .get(&category)
                     .map(|ra| ra.mean)
-                    .unwrap_or(0.5);
+                    .unwrap_or(0.5)
+                    * self.diff_quality_score(model_id);
                 if score > best_score {
                     best_score = score;
                     best_model = model_id.clone();
@@ -393,24 +486,22 @@ impl IntelligenceEngine {
         best_model
     }
 
-    #[must_use]
-    
     pub async fn evolve_prompts(&self, category: TaskCategory) -> Result<()> {
         let mut templates = self.templates.write().await;
         let mut top_performers: Vec<_> = templates.iter()
             .filter(|t| t.category() == category)
             .collect();
-            
+
         top_performers.sort_by(|a, b| b.mean_performance().total_cmp(&a.mean_performance()));
-        
-        if let Some(best) = top_performers.first() {
-            if best.mean_performance() > 0.8 {
-                let mutation = crate::types::intelligence::MutationStrategy::Append(
-                    "Be precise and follow all project invariants strictly.".to_string()
-                );
-                let new_version = best.mutate(mutation);
-                templates.push(new_version);
-            }
+
+        if let Some(best) = top_performers.first()
+            && best.mean_performance() > 0.8
+        {
+            let mutation = crate::types::intelligence::MutationStrategy::Append(
+                "Be precise and follow all project invariants strictly.".to_string()
+            );
+            let new_version = best.mutate(mutation);
+            templates.push(new_version);
         }
         Ok(())
     }
@@ -423,10 +514,26 @@ impl IntelligenceEngine {
 pub struct QualityScorer;
 
 impl QualityScorer {
+    /// Semantic quality scoring using embedding-based cosine similarity.
+    ///
+    /// Replaces shallow keyword heuristics ("evidence", backtick counting) with
+    /// cosine similarity between the turn content embedding and the task
+    /// description embedding.  When `task_description` is empty the content is
+    /// compared to itself (similarity 1.0), yielding a neutral bonus so that
+    /// outcome and certainty weights remain dominant.
+    ///
+    /// When `observer` is `Some((obs, agent_id))` the final score is multiplied
+    /// by the agent's Beta-posterior calibration score to downweight agents
+    /// whose claimed certainty is poorly calibrated against verified outcomes.
     #[must_use]
-    pub fn score(turn: &Turn) -> f64 {
+    pub fn score_with_context(
+        turn: &Turn,
+        task_description: &str,
+        observer: Option<(&crate::engines::metacognition::MetacognitiveObserver, &str)>,
+    ) -> f64 {
         let mut score = 0.5;
 
+        // Outcome weighting (unchanged from original).
         score += match turn.outcome {
             TurnOutcome::TestsPassed => 0.4,
             TurnOutcome::Compiled => 0.2,
@@ -435,25 +542,98 @@ impl QualityScorer {
             TurnOutcome::Stalled => -0.2,
             TurnOutcome::RolledBack => -0.4,
             TurnOutcome::Rejected => -0.4,
+            TurnOutcome::VerificationFailed => -0.4,
         };
 
-        if turn.content.matches("```").count() >= 2 {
-            score += 0.05;
-        }
+        // Semantic relevance: embedding cosine similarity replaces keyword heuristics.
+        // embed_text falls back to local_embed_text when the ort-embeddings feature
+        // is absent, so this never makes external API calls.
+        let content_emb = crate::engines::memory::embed_text(&turn.content);
+        let task_emb = if task_description.is_empty() {
+            content_emb.clone()
+        } else {
+            crate::engines::memory::embed_text(task_description)
+        };
+        // cosine_sim returns a value in [-1, 1]; map to [0, 0.1] additive bonus.
+        let relevance = crate::engines::memory::cosine_sim(&content_emb, &task_emb) as f64;
+        score += ((relevance + 1.0) / 2.0) * 0.1;
 
-        let lower = turn.content.to_lowercase();
-        let has_evidence = lower
-            .split(|c: char| !c.is_alphabetic())
-            .any(|w| w == "evidence" || w == "proof");
-        if has_evidence {
-            score += 0.05;
-        }
-
+        // Certainty weighting (unchanged from original).
         if let Some(certainty) = turn.certainty {
             score += certainty * 0.1;
         }
 
-        score.clamp(0.0, 1.0)
+        score = score.clamp(0.0, 1.0);
+
+        // Consistency score (unchanged from original).
+        if let Some(cs) = turn.consistency_score {
+            score *= 0.7 + 0.3 * cs;
+        }
+
+        let score = score.clamp(0.0, 1.0);
+
+        // Calibration multiplier: downweight agents whose high-certainty claims
+        // are not borne out by verified outcomes.
+        if let Some((obs, agent_id)) = observer {
+            (score * obs.calibration_score(agent_id)).clamp(0.0, 1.0)
+        } else {
+            score
+        }
+    }
+
+    /// Backward-compatible entry point used by all existing call sites.
+    /// Delegates to `score_with_context` with no task description and no observer.
+    #[must_use]
+    pub fn score(turn: &Turn) -> f64 {
+        Self::score_with_context(turn, "", None)
+    }
+}
+
+pub struct ConsistencyScorer;
+
+impl ConsistencyScorer {
+    const STOPWORDS: &'static [&'static str] = &[
+        "fn", "let", "mut", "pub", "use", "mod", "impl", "self", "true", "false",
+        "else", "enum", "struct", "trait", "type", "where", "match", "loop", "while",
+        "for", "return", "async", "await", "move", "ref", "const", "static",
+    ];
+
+    #[must_use]
+    pub fn score(explanation: &str, diff_text: &str) -> f64 {
+        if explanation.is_empty() || diff_text.is_empty() {
+            return 0.5;
+        }
+
+        let diff_terms = Self::extract_terms(diff_text);
+        let expl_terms = Self::extract_terms(explanation);
+
+        if diff_terms.is_empty() || expl_terms.is_empty() {
+            return 0.5;
+        }
+
+        let intersection = diff_terms.iter().filter(|t| expl_terms.contains(*t)).count();
+        let union = {
+            let mut all: std::collections::HashSet<&str> =
+                diff_terms.iter().map(|s| s.as_str()).collect();
+            for t in &expl_terms {
+                all.insert(t.as_str());
+            }
+            all.len()
+        };
+
+        if union == 0 {
+            return 0.5;
+        }
+
+        (intersection as f64 / union as f64).clamp(0.0, 1.0)
+    }
+
+    fn extract_terms(text: &str) -> std::collections::HashSet<String> {
+        text.split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|tok| tok.len() > 4)
+            .map(|tok| tok.to_lowercase())
+            .filter(|tok| !Self::STOPWORDS.contains(&tok.as_str()))
+            .collect()
     }
 }
 
@@ -465,25 +645,27 @@ impl ConvergenceMonitor {
             return crate::types::intelligence::IterationDecision::Continue;
         }
 
-        let recent_p: Vec<f64> = sigma
-            .turns
-            .iter()
-            .rev()
-            .take(3)
-            .map(|_| sigma.completion_probability)
-            .collect();
-        let velocity = recent_p[0] - recent_p[recent_p.len() - 1];
-
-        if sigma.completion_probability > 0.98 {
-            return crate::types::intelligence::IterationDecision::StopEarly;
-        }
+        let p_history: Vec<f64> = sigma.turns.iter().map(|_| sigma.completion_probability).collect();
+        let last_p = *p_history.last().unwrap_or(&0.0);
         
-        if velocity > 0.15 {
-            return crate::types::intelligence::IterationDecision::Extend;
-        }
+        if last_p > 0.98 { return crate::types::intelligence::IterationDecision::StopEarly; }
 
-        if velocity < 0.01 && sigma.turns.len() > 10 {
-            return crate::types::intelligence::IterationDecision::StopEarly;
+        let window = 3;
+        if p_history.len() >= window {
+            let recent = &p_history[p_history.len()-window..];
+            let velocity = recent[window-1] - recent[0];
+            let acceleration = if p_history.len() > window {
+                let prev_recent = &p_history[p_history.len()-window-1..p_history.len()-1];
+                let prev_velocity = prev_recent[window-1] - prev_recent[0];
+                velocity - prev_velocity
+            } else { 0.0 };
+
+            if velocity < 0.005 && sigma.turns.len() > 10 {
+                return crate::types::intelligence::IterationDecision::StopEarly;
+            }
+            if acceleration > 0.1 {
+                return crate::types::intelligence::IterationDecision::Extend;
+            }
         }
 
         crate::types::intelligence::IterationDecision::Continue
@@ -967,6 +1149,11 @@ impl FailurePatternStore {
         Ok(Self { db: Arc::new(db) })
     }
 
+    pub fn ephemeral() -> Self {
+        let db = sled::Config::new().temporary(true).open().expect("in-memory sled");
+        Self { db: Arc::new(db) }
+    }
+
     pub fn record_failure(&self, pattern: crate::types::intelligence::FailurePattern) -> Result<()> {
         let key = format!("failure:{}", pattern.pattern_id);
         let encoded = serde_json::to_vec(&pattern)?;
@@ -976,13 +1163,11 @@ impl FailurePatternStore {
 
     pub fn find_matches(&self, context_emb: &[f32], threshold: f32) -> Vec<crate::types::intelligence::FailurePattern> {
         let mut matches = Vec::new();
-        for entry in self.db.scan_prefix("failure:") {
-            if let Ok((_, v)) = entry {
-                if let Ok(p) = serde_json::from_slice::<crate::types::intelligence::FailurePattern>(&v) {
-                    let sim = self.cosine_similarity(context_emb, &p.context_signature);
-                    if sim > threshold {
-                        matches.push(p);
-                    }
+        for (_, v) in self.db.scan_prefix("failure:").flatten() {
+            if let Ok(p) = serde_json::from_slice::<crate::types::intelligence::FailurePattern>(&v) {
+                let sim = self.cosine_similarity(context_emb, &p.context_signature);
+                if sim > threshold {
+                    matches.push(p);
                 }
             }
         }
@@ -1032,4 +1217,8 @@ impl StrategyLearner {
             .max_by(|a, b| a.avg_quality.total_cmp(&b.avg_quality))
             .map(|s| s.agent_sequence.clone())
     }
+}
+
+impl Default for StrategyLearner {
+    fn default() -> Self { Self::new() }
 }

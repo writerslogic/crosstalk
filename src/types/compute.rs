@@ -78,7 +78,6 @@ impl BudgetLedger {
     }
 
     #[must_use]
-    
     pub fn predict_final_cost(&self, total_expected_turns: u32) -> f64 {
         let burn = self.burn_rate();
         burn * f64::from(total_expected_turns)

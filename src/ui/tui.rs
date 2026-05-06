@@ -24,6 +24,7 @@ pub enum UIMode {
     Insert,
     Rewind,
     Playback,
+    Intercept,
 }
 
 pub struct CrosstalkUI {
@@ -35,6 +36,7 @@ pub struct CrosstalkUI {
     input_buffer: String,
     active_pane: FocusedPane,
     playback_index: u32,
+    selection_index: usize,
 }
 
 impl CrosstalkUI {
@@ -54,6 +56,7 @@ impl CrosstalkUI {
             input_buffer: String::new(),
             active_pane: FocusedPane::GhostStream,
             playback_index: 0,
+            selection_index: 0,
         })
     }
 
@@ -95,19 +98,23 @@ impl CrosstalkUI {
                 match self.mode {
                     UIMode::Normal => match key.code {
                         KeyCode::Char('q') => {
-                            let _ = self.control_tx.send(ControlSignal::Shutdown).await;
+                            crate::log_warn!(self.control_tx.send(ControlSignal::Shutdown).await, "failed to send shutdown signal");
                             break;
                         }
                         KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             self.mode = UIMode::Insert;
-                            let _ = self.control_tx.send(ControlSignal::Pause).await;
+                            crate::log_warn!(self.control_tx.send(ControlSignal::Pause).await, "failed to send pause signal");
                         }
                         KeyCode::Char('p') => {
                             self.mode = UIMode::Playback;
                             self.playback_index = sigma.iteration_index;
                         }
+                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            self.mode = UIMode::Intercept;
+                            crate::log_warn!(self.control_tx.send(ControlSignal::Pause).await, "failed to send pause signal");
+                        }
                         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let _ = self.capture_to_svg(&sigma);
+                            crate::log_warn!(self.capture_to_svg(&sigma), "failed to capture SVG");
                         }
                         KeyCode::Tab => {
                             self.active_pane = match self.active_pane {
@@ -125,19 +132,23 @@ impl CrosstalkUI {
                         KeyCode::Left | KeyCode::Char(',') => {
                             if self.playback_index > 0 {
                                 self.playback_index -= 1;
-                                let _ = self
-                                    .control_tx
-                                    .send(ControlSignal::Rewind(self.playback_index))
-                                    .await;
+                                crate::log_warn!(
+                                    self.control_tx
+                                        .send(ControlSignal::Rewind(self.playback_index))
+                                        .await,
+                                    "failed to send rewind signal"
+                                );
                             }
                         }
                         KeyCode::Right | KeyCode::Char('.') => {
                             if self.playback_index < sigma.iteration_index {
                                 self.playback_index += 1;
-                                let _ = self
-                                    .control_tx
-                                    .send(ControlSignal::Rewind(self.playback_index))
-                                    .await;
+                                crate::log_warn!(
+                                    self.control_tx
+                                        .send(ControlSignal::Rewind(self.playback_index))
+                                        .await,
+                                    "failed to send rewind signal"
+                                );
                             }
                         }
                         _ => {}
@@ -145,8 +156,8 @@ impl CrosstalkUI {
                     UIMode::Insert => match key.code {
                         KeyCode::Enter => {
                             let content = std::mem::take(&mut self.input_buffer);
-                            let _ = self.control_tx.send(ControlSignal::Inject(content)).await;
-                            let _ = self.control_tx.send(ControlSignal::Resume).await;
+                            crate::log_warn!(self.control_tx.send(ControlSignal::Inject(content)).await, "failed to send inject signal");
+                            crate::log_warn!(self.control_tx.send(ControlSignal::Resume).await, "failed to send resume signal");
                             self.mode = UIMode::Normal;
                         }
                         KeyCode::Char(c) => {
@@ -157,15 +168,47 @@ impl CrosstalkUI {
                         }
                         KeyCode::Esc => {
                             self.mode = UIMode::Normal;
-                            let _ = self.control_tx.send(ControlSignal::Resume).await;
+                            crate::log_warn!(self.control_tx.send(ControlSignal::Resume).await, "failed to send resume signal");
+                            self.mode = UIMode::Normal;
                         }
                         _ => {}
                     },
                     UIMode::Rewind => {
                         if key.code == KeyCode::Esc {
                             self.mode = UIMode::Normal;
-                            let _ = self.control_tx.send(ControlSignal::Resume).await;
+                            crate::log_warn!(self.control_tx.send(ControlSignal::Resume).await, "failed to send resume signal");
                         }
+                    }
+                    UIMode::Intercept => match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                             self.selection_index = self.selection_index.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                             self.selection_index += 1;
+                        }
+                        KeyCode::Char('l') => {
+                             let names: Vec<_> = sigma.artifacts.keys().cloned().collect();
+                             if !names.is_empty() {
+                                let target = &names[self.selection_index % names.len()];
+                                crate::log_warn!(self.control_tx.send(ControlSignal::LockCode(target.clone())).await, "failed to send lock signal");
+                             }
+                        }
+                        KeyCode::Char('m') => {
+                            if !sigma.agent_weights.is_empty() {
+                                let idx = self.selection_index % sigma.agent_weights.len();
+                                if let Some((target, _)) = sigma.agent_weights.iter().nth(idx) {
+                                    crate::log_warn!(self.control_tx.send(ControlSignal::MuteAgent(target.clone())).await, "failed to send mute signal");
+                                }
+                            }
+                        }
+                        KeyCode::Char('d') => {
+                            crate::log_warn!(self.control_tx.send(ControlSignal::DampenSwarm(0.5)).await, "failed to send dampen signal");
+                        }
+                        KeyCode::Esc => {
+                            self.mode = UIMode::Normal;
+                            crate::log_warn!(self.control_tx.send(ControlSignal::Resume).await, "failed to send resume signal");
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -301,10 +344,11 @@ impl CrosstalkUI {
                 UIMode::Insert => format!(" [INSERT] > {}", input_buffer),
                 UIMode::Rewind => " [REWIND] Select checkpoint index... ".to_string(),
                 UIMode::Playback => format!(" [PLAYBACK] i_{} | Use < / > to seek, Esc to exit", playback_index),
+                UIMode::Intercept => " [STEER] [L] Lock Code | [M] Mute Agent | [D] Dampen Swarm ".to_string(),
             };
             let input_para = Paragraph::new(input_text)
                 .block(Block::default().title(" Neural Intercept ").borders(Borders::ALL).border_style(
-                    if matches!(mode, UIMode::Insert) { Style::default().fg(Color::Cyan) } else { Style::default() }
+                    if matches!(mode, UIMode::Insert | UIMode::Intercept) { Style::default().fg(Color::Cyan) } else { Style::default() }
                 ));
             f.render_widget(input_para, chunks[2]);
 

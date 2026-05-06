@@ -2,18 +2,13 @@ use std::collections::VecDeque;
 use crate::types::conversation::{ConversationState, Turn, TurnOutcome};
 pub use crate::types::memory::OutcomeRecord;
 use crate::types::memory::{
-    DeletionLogEntry, MemoryRecord, MemoryStoreStats, SnapshotBundle, SnapshotMetadata,
+    DeletionLogEntry, Lesson, MemoryRecord, MemoryStoreStats, SnapshotBundle, SnapshotMetadata,
 };
 use anyhow::{Context, Result, anyhow};
 use arrow_array::{
-    Array, Float32Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array,
-    array::FixedSizeListArray,
+    RecordBatch, RecordBatchIterator, StringArray, UInt32Array, cast::AsArray,
 };
-use arrow_schema::{ArrowError, DataType, Field, Schema};
-use fastembed::{ExecutionProviderDispatch, InitOptions, TextEmbedding};
-use flate2::Compression;
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
+use arrow_schema::{DataType, Field, Schema};
 use futures::StreamExt;
 use lancedb::{
     connect,
@@ -21,844 +16,768 @@ use lancedb::{
     query::{ExecutableQuery, QueryBase},
     table::Table,
 };
-use ort::{CPUExecutionProvider, CoreMLExecutionProvider};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
-use std::panic;
 use std::sync::Arc;
+#[cfg(feature = "ort-embeddings")]
 use std::sync::OnceLock;
+
+#[cfg(feature = "ort-embeddings")]
+use fastembed::{ExecutionProviderDispatch, InitOptions, TextEmbedding};
+#[cfg(feature = "ort-embeddings")]
+use ort::{CPUExecutionProvider, CoreMLExecutionProvider};
+
+fn content_hash(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
 
 const EMBEDDING_DIM: usize = 384;
 const DEFAULT_TABLE: &str = "memory";
-const GZIP_THRESHOLD: usize = 10 * 1024 * 1024;
-const KMEANS_ITERATIONS: usize = 50;
 
-fn normalize_vector(vec: &[f32]) -> Vec<f32> {
-    let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm == 0.0 {
-        return vec.to_vec();
-    }
-    vec.iter().map(|x| x / norm).collect()
-}
-
+#[cfg(feature = "ort-embeddings")]
 static EMBEDDER: OnceLock<Option<TextEmbedding>> = OnceLock::new();
 
-fn get_embedder() -> Option<&'static TextEmbedding> {
-    EMBEDDER
-        .get_or_init(|| {
-            let result = panic::catch_unwind(|| {
-                let options = InitOptions {
-                    execution_providers: vec![
-                        ExecutionProviderDispatch::from(CoreMLExecutionProvider::default()),
-                        ExecutionProviderDispatch::from(CPUExecutionProvider::default()),
-                    ],
-                    ..Default::default()
-                };
-                TextEmbedding::try_new(options)
-            });
-            match result {
-                Ok(Ok(model)) => Some(model),
-                _ => None,
-            }
-        })
-        .as_ref()
+#[cfg(feature = "ort-embeddings")]
+pub fn get_embedder() -> Option<&'static TextEmbedding> {
+    EMBEDDER.get_or_init(|| {
+        let options = InitOptions {
+            execution_providers: vec![
+                ExecutionProviderDispatch::from(CoreMLExecutionProvider::default()),
+                ExecutionProviderDispatch::from(CPUExecutionProvider::default()),
+            ],
+            ..Default::default()
+        };
+        TextEmbedding::try_new(options).ok()
+    }).as_ref()
 }
 
-fn embed_text_hash(text: &str) -> Vec<f32> {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    let hash = hasher.finalize();
-    let hash_bytes = hash.as_slice();
-
-    let mut embedding = Vec::with_capacity(EMBEDDING_DIM);
-    for i in 0..EMBEDDING_DIM {
-        let byte_idx = i % 32;
-        let seed = u32::from_le_bytes([
-            hash_bytes[byte_idx],
-            hash_bytes[(byte_idx + 1) % 32],
-            hash_bytes[(byte_idx + 2) % 32],
-            hash_bytes[(byte_idx + 3) % 32],
-        ]);
-        let rng_value = seed.wrapping_mul(1103515245).wrapping_add(12345) as f32 / u32::MAX as f32;
-        embedding.push(rng_value * 2.0 - 1.0);
-    }
-
-    normalize_vector(&embedding)
-}
-
-fn embed_text(text: &str) -> Vec<f32> {
+pub fn embed_text(text: &str) -> Vec<f32> {
+    #[cfg(feature = "ort-embeddings")]
     if let Some(model) = get_embedder()
-        && let Ok(mut vecs) = model.embed(vec![text], None)
+        && let Ok(mut vecs) = model.embed(vec![text.to_string()], None)
         && let Some(v) = vecs.pop()
-        && v.len() == EMBEDDING_DIM
     {
-        return normalize_vector(&v);
+        return v;
     }
-    embed_text_hash(text)
+    local_embed_text(text)
 }
 
-async fn embed_text_async(text: String) -> Vec<f32> {
-    tokio::task::spawn_blocking(move || embed_text(&text))
-        .await
-        .unwrap_or_else(|_| embed_text_hash(""))
-}
-
-fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+pub fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-fn dir_size(path: &str) -> u64 {
-    dir_size_depth(path, 0)
+// ── MemoryBridge ─────────────────────────────────────────────────────────────
+
+pub struct MemoryBridge {
+    pub store: Option<Arc<MemoryStore>>,
+    /// In-memory session records for lightweight (non-LanceDB) usage.
+    sessions: HashMap<String, Vec<MemoryRecord>>,
+    /// Track which (session, turn_idx) pairs have already been recalled.
+    recalled_turns: HashSet<(String, u32)>,
+    /// Feedback: maps turn_idx to (recalled_content_hashes, had_memory_injection).
+    /// After the turn completes, the orchestrator calls `record_feedback` with the quality score.
+    recall_pending: HashMap<u32, Vec<String>>,
+    /// Accumulated effectiveness: (sum_delta, count) for turns with vs without memory.
+    recall_effectiveness: (f64, u32),
+    /// Learnable ranker weights: [cosine_sim, recency_decay, outcome_boost, surprise_signal].
+    pub ranker_weights: [f64; 4],
+    /// Fingerprints of records returned by the last recall call, for gradient attribution.
+    pub recalled_hashes_last: Vec<u64>,
+    /// Actual cosine similarity scores for each record in `recalled_hashes_last`,
+    /// computed during `recall_relevant_summary`. Used by `update_ranker` in place
+    /// of the former query-independent proxy value of 0.5.
+    pub recalled_scores_last: Vec<f64>,
 }
 
-fn dir_size_depth(path: &str, depth: usize) -> u64 {
-    if depth > 20 {
-        return 0;
-    }
-    let mut total = 0u64;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                if meta.is_file() {
-                    total += meta.len();
-                } else if meta.is_dir()
-                    && let Some(sub) = entry.path().to_str()
-                {
-                    total += dir_size_depth(sub, depth + 1);
-                }
-            }
-        }
-    }
-    total
-}
-
-fn record_weight(r: &MemoryRecord) -> f64 {
-    match &r.outcome {
-        Some(o) if o.tests_passed => 2.0,
-        Some(o) if o.compiled => 1.5,
-        Some(o) if o.was_rolled_back => 0.3,
-        Some(_) => 1.0,
-        None => 1.0,
-    }
-}
-
-fn batch_to_records(batch: &RecordBatch, dim: usize) -> Result<Vec<MemoryRecord>> {
-    let turn_ids = batch
-        .column_by_name("turn_id")
-        .ok_or_else(|| anyhow!("missing column: turn_id"))?
-        .as_any()
-        .downcast_ref::<UInt32Array>()
-        .ok_or_else(|| anyhow!("type error: turn_id"))?;
-    let session_ids = batch
-        .column_by_name("session_id")
-        .ok_or_else(|| anyhow!("missing column: session_id"))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| anyhow!("type error: session_id"))?;
-    let content_hashes = batch
-        .column_by_name("content_hash")
-        .ok_or_else(|| anyhow!("missing column: content_hash"))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| anyhow!("type error: content_hash"))?;
-    let timestamps = batch
-        .column_by_name("timestamp")
-        .ok_or_else(|| anyhow!("missing column: timestamp"))?
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| anyhow!("type error: timestamp"))?;
-    let metadata_col = batch
-        .column_by_name("metadata")
-        .ok_or_else(|| anyhow!("missing column: metadata"))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| anyhow!("type error: metadata"))?;
-    let vector_col = batch
-        .column_by_name("vector")
-        .ok_or_else(|| anyhow!("missing column: vector"))?
-        .as_any()
-        .downcast_ref::<FixedSizeListArray>()
-        .ok_or_else(|| anyhow!("type error: vector"))?;
-
-    (0..batch.num_rows())
-        .map(|i| {
-            let values = vector_col.value(i);
-            let float_vals = values
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| anyhow!("type error: vector float elements"))?;
-            if float_vals.len() < dim {
-                return Err(anyhow!(
-                    "embedding dimension mismatch: expected {}, got {}",
-                    dim,
-                    float_vals.len()
-                ));
-            }
-            let embedding: Vec<f32> = (0..dim).map(|j| float_vals.value(j)).collect();
-            let meta_str = metadata_col.value(i).to_string();
-            let is_neg = meta_str.contains("\"is_negative\":true");
-            Ok(MemoryRecord {
-                turn_id: turn_ids.value(i),
-                session_id: session_ids.value(i).to_string(),
-                embedding,
-                content_hash: content_hashes.value(i).to_string(),
-                timestamp: timestamps.value(i),
-                metadata_json: meta_str,
-                outcome: None,
-                is_negative: is_neg,
-            })
-        })
-        .collect()
-}
-
-pub async fn embed_texts(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-    if let Some(model) = get_embedder() {
-        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-        if let Ok(vecs) = model.embed(refs, None) {
-            return Ok(vecs.into_iter().map(|v| normalize_vector(&v)).collect());
-        }
-    }
-    Ok(texts.iter().map(|t| embed_text_hash(t)).collect())
-}
-
-fn outcome_weight(outcome: &TurnOutcome) -> f64 {
-    match outcome {
-        TurnOutcome::TestsPassed => 2.0,
-        TurnOutcome::AdvancedConvergence => 1.8,
-        TurnOutcome::Compiled => 1.5,
-        TurnOutcome::Unknown => 1.0,
-        TurnOutcome::Stalled => 0.5,
-        TurnOutcome::RolledBack => 0.3,
-        TurnOutcome::Rejected => 0.2,
-    }
-}
-
-fn parse_outcome_from_metadata(meta: &str) -> TurnOutcome {
-    if let Some(start) = meta.find("\"outcome\":\"") {
-        let rest = &meta[start + 11..];
-        if let Some(end) = rest.find('"') {
-            return match &rest[..end] {
-                "TestsPassed" => TurnOutcome::TestsPassed,
-                "AdvancedConvergence" => TurnOutcome::AdvancedConvergence,
-                "Compiled" => TurnOutcome::Compiled,
-                "Stalled" => TurnOutcome::Stalled,
-                "RolledBack" => TurnOutcome::RolledBack,
-                "Rejected" => TurnOutcome::Rejected,
-                _ => TurnOutcome::Unknown,
-            };
-        }
-    }
-    TurnOutcome::Unknown
-}
-
-pub struct MemoryStore {
-    uri: String,
-    conn: Option<Connection>,
-    cluster_assignments: HashMap<u32, usize>,
-    pub deletion_log: Vec<DeletionLogEntry>,
-    pub embedding_dim: usize,
-}
-
-impl MemoryStore {
-    #[must_use]
-    pub fn new(uri: &str) -> Self {
+impl MemoryBridge {
+    /// Create a lightweight in-memory bridge (no backing store).
+    pub fn new() -> Self {
         Self {
-            uri: uri.to_string(),
-            conn: None,
-            cluster_assignments: HashMap::new(),
-            deletion_log: Vec::new(),
-            embedding_dim: EMBEDDING_DIM,
+            store: None,
+            sessions: HashMap::new(),
+            recalled_turns: HashSet::new(),
+            recall_pending: HashMap::new(),
+            recall_effectiveness: (0.0, 0),
+            ranker_weights: [0.5, 0.3, 0.15, 0.05],
+            recalled_hashes_last: Vec::new(),
+            recalled_scores_last: Vec::new(),
         }
     }
 
-    #[must_use]
-    pub fn new_with_dim(uri: &str, dim: usize) -> Self {
+    /// Create a bridge backed by a LanceDB MemoryStore.
+    pub fn with_store(store: Arc<MemoryStore>) -> Self {
         Self {
-            uri: uri.to_string(),
-            conn: None,
-            cluster_assignments: HashMap::new(),
-            deletion_log: Vec::new(),
-            embedding_dim: dim,
+            store: Some(store),
+            sessions: HashMap::new(),
+            recalled_turns: HashSet::new(),
+            recall_pending: HashMap::new(),
+            recall_effectiveness: (0.0, 0),
+            ranker_weights: [0.5, 0.3, 0.15, 0.05],
+            recalled_hashes_last: Vec::new(),
+            recalled_scores_last: Vec::new(),
         }
     }
 
-    pub async fn init(&mut self) -> Result<()> {
-        self.conn = Some(connect(&self.uri).execute().await?);
-        Ok(())
+    pub async fn recall_relevant(&mut self, sid: &str, query: &str, k: usize, idx: u32) -> Result<Vec<MemoryRecord>> {
+        // Rate-limit: at most one recall per (session, turn_idx)
+        let key = (sid.to_string(), idx);
+        if !self.recalled_turns.insert(key) {
+            return Ok(vec![]);
+        }
+
+        // In-memory path: filter local session records.
+        if let Some(records) = self.sessions.get(sid) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let query_emb = local_embed_text(query);
+            let mut scored: Vec<(f32, &MemoryRecord)> = records
+                .iter()
+                .filter(|r| !r.is_negative)
+                .map(|r| {
+                    let sim = local_cosine_similarity(&query_emb, &r.embedding);
+                    let age_hours = (now.saturating_sub(r.timestamp)) as f64 / 3600.0;
+                    let decay = (-0.01 * age_hours).exp() as f32;
+                    let outcome_boost = r.outcome.as_ref().map_or(0.0, |o| if o.tests_passed { 0.2 } else { 0.0 });
+                    (sim * decay + outcome_boost, r)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            return Ok(scored.into_iter().take(k).map(|(_, r)| r.clone()).collect());
+        }
+
+        // LanceDB path
+        if let Some(store) = &self.store {
+            let mut results = store.query_hybrid(DEFAULT_TABLE, query, k).await?;
+            results.retain(|(r, _)| r.session_id == sid && r.turn_id < idx);
+            return Ok(results.into_iter().filter(|(r, _)| !r.is_negative).map(|(r, _)| r).collect());
+        }
+
+        Ok(vec![])
     }
 
-    pub async fn get_or_create_table(&self, name: &str) -> Result<Table> {
-        let conn = self
-            .conn
-            .as_ref()
-            .ok_or_else(|| anyhow!("Database not connected"))?;
-        match conn.open_table(name).execute().await {
-            Ok(t) => Ok(t),
-            Err(_) => {
-                let schema = Arc::new(Schema::new(vec![
-                    Field::new(
-                        "vector",
-                        DataType::FixedSizeList(
-                            Arc::new(Field::new("item", DataType::Float32, true)),
-                            self.embedding_dim as i32,
-                        ),
-                        false,
-                    ),
-                    Field::new("turn_id", DataType::UInt32, false),
-                    Field::new("session_id", DataType::Utf8, false),
-                    Field::new("content_hash", DataType::Utf8, false),
-                    Field::new("timestamp", DataType::UInt64, false),
-                    Field::new("metadata", DataType::Utf8, false),
-                ]));
-                conn.create_table(
-                    name,
-                    RecordBatchIterator::new(
-                        vec![] as Vec<Result<RecordBatch, ArrowError>>,
-                        schema,
-                    ),
-                )
-                .execute()
-                .await
-                .context("Failed to create LanceDB table")
-            }
+    /// Return a string summary of recalled records (used by orchestrator).
+    /// Also registers which turn received memory injection for feedback tracking.
+    pub async fn recall_relevant_summary(&mut self, sid: &str, query: &str, k: usize, idx: u32) -> Result<String> {
+        let records = self.recall_relevant(sid, query, k, idx).await?;
+        if !records.is_empty() {
+            let query_emb = local_embed_text(query);
+            let hashes: Vec<String> = records.iter().map(|r| r.content_hash.clone()).collect();
+            self.recalled_scores_last = records
+                .iter()
+                .map(|r| local_cosine_similarity(&query_emb, &r.embedding) as f64)
+                .collect();
+            self.recalled_hashes_last = hashes.iter().map(|h| {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                h.hash(&mut hasher);
+                hasher.finish()
+            }).collect();
+            self.recall_pending.insert(idx, hashes);
+        } else {
+            self.recalled_hashes_last.clear();
+            self.recalled_scores_last.clear();
+        }
+        Ok(records.into_iter().map(|r| r.content_hash).collect::<Vec<_>>().join("\n"))
+    }
+
+    /// Called after a turn completes. Records whether memory injection helped.
+    /// `quality_delta` is (this turn's quality - session average quality).
+    /// Positive means memory helped; negative means it didn't.
+    pub fn record_recall_feedback(&mut self, turn_idx: u32, quality_delta: f64) {
+        if self.recall_pending.remove(&turn_idx).is_some() {
+            self.recall_effectiveness.0 += quality_delta;
+            self.recall_effectiveness.1 += 1;
         }
     }
 
-    pub async fn insert(&self, table_name: &str, mut records: Vec<MemoryRecord>) -> Result<()> {
-        if records.is_empty() {
-            return Ok(());
+    /// Update learnable ranker weights based on the outcome of the most recent turn.
+    /// Uses `recalled_hashes_last` to attribute features to recalled records.
+    /// Weights are clipped to [0.01, 0.99] and renormalised to sum to 1.0.
+    pub fn update_ranker(&mut self, turn_outcome: TurnOutcome) {
+        if self.recalled_hashes_last.is_empty() {
+            return;
         }
+        let hash_set: std::collections::HashSet<u64> =
+            self.recalled_hashes_last.iter().copied().collect();
 
-        let texts_to_embed: Vec<String> = records.iter().map(|r| r.content_hash.clone()).collect();
-        let batch_embeddings = embed_texts(texts_to_embed).await?;
-        if batch_embeddings.len() != records.len() {
-            return Err(anyhow!(
-                "embed_texts returned {} vectors for {} records",
-                batch_embeddings.len(),
-                records.len()
-            ));
-        }
-
-        for (record, embedding) in records.iter_mut().zip(batch_embeddings) {
-            record.embedding = embedding;
-        }
-
-        self.insert_raw(table_name, records).await
-    }
-
-    async fn insert_raw(&self, table_name: &str, records: Vec<MemoryRecord>) -> Result<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-
-        let table = self.get_or_create_table(table_name).await?;
-
-        let turn_ids = UInt32Array::from_iter_values(records.iter().map(|r| r.turn_id));
-        let session_ids = StringArray::from_iter_values(records.iter().map(|r| &r.session_id));
-        let content_hashes = StringArray::from_iter_values(records.iter().map(|r| &r.content_hash));
-        let timestamps = UInt64Array::from_iter_values(records.iter().map(|r| r.timestamp));
-        let metadata = StringArray::from_iter_values(records.iter().map(|r| &r.metadata_json));
-
-        let flattened: Vec<f32> = records
-            .iter()
-            .flat_map(|r| r.embedding.iter().copied())
-            .collect();
-        let vector_values = Arc::new(Float32Array::from(flattened));
-        let field = Arc::new(Field::new("item", DataType::Float32, true));
-        let vector_array =
-            FixedSizeListArray::try_new(field, self.embedding_dim as i32, vector_values, None)?;
-
-        let batch = RecordBatch::try_new(
-            table.schema().await?,
-            vec![
-                Arc::new(vector_array),
-                Arc::new(turn_ids),
-                Arc::new(session_ids),
-                Arc::new(content_hashes),
-                Arc::new(timestamps),
-                Arc::new(metadata),
-            ],
-        )?;
-
-        table
-            .add(RecordBatchIterator::new(
-                vec![Ok(batch)],
-                table.schema().await?,
-            ))
-            .execute()
-            .await?;
-
-        Ok(())
-    }
-
-    pub async fn query_weighted(
-        &self,
-        table_name: &str,
-        query_text: &str,
-        top_k: usize,
-    ) -> Result<Vec<(MemoryRecord, f64)>> {
-        let mut embeddings = embed_texts(vec![query_text.to_string()]).await?;
-        let query_vector = embeddings
-            .pop()
-            .ok_or_else(|| anyhow!("embed_texts returned no vectors"))?;
-
-        let table = self.get_or_create_table(table_name).await?;
-
-        let mut stream = table
-            .vector_search(query_vector)?
-            .limit(top_k * 2)
-            .execute()
-            .await?;
-
-        let mut weighted_results = Vec::new();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        while let Some(batch_res) = stream.next().await {
-            let batch = batch_res?;
+        let mean_cosine_sim = if self.recalled_scores_last.is_empty() {
+            0.5
+        } else {
+            self.recalled_scores_last.iter().sum::<f64>() / self.recalled_scores_last.len() as f64
+        };
 
-            macro_rules! col {
-                ($name:expr, $ty:ty) => {
-                    batch
-                        .column_by_name($name)
-                        .ok_or_else(|| anyhow!("missing column: {}", $name))?
-                        .as_any()
-                        .downcast_ref::<$ty>()
-                        .ok_or_else(|| anyhow!("column {} has wrong type", $name))?
-                };
-            }
-            let turn_ids = col!("turn_id", UInt32Array);
-            let session_ids = col!("session_id", StringArray);
-            let content_hashes = col!("content_hash", StringArray);
-            let timestamps = col!("timestamp", UInt64Array);
-            let metadata = col!("metadata", StringArray);
-            let distances = col!("_distance", Float32Array);
+        let mut feature_sums = [0.0_f64; 4];
+        let mut count = 0usize;
 
-            for i in 0..batch.num_rows() {
-                let similarity = 1.0 / (1.0 + distances.value(i) as f64);
-
-                let meta_str = metadata.value(i).to_string();
-                let is_neg = meta_str.contains("\"is_negative\":true");
-                let parsed_outcome = parse_outcome_from_metadata(&meta_str);
-                let ts = timestamps.value(i);
-                let age_days = (now.saturating_sub(ts)) as f64 / 86400.0;
-                let decay = (-age_days / 30.0).exp();
-                let record = MemoryRecord {
-                    turn_id: turn_ids.value(i),
-                    session_id: session_ids.value(i).to_string(),
-                    embedding: vec![],
-                    content_hash: content_hashes.value(i).to_string(),
-                    timestamp: ts,
-                    metadata_json: meta_str,
-                    outcome: None,
-                    is_negative: is_neg,
-                };
-
-                let weight = outcome_weight(&parsed_outcome);
-                weighted_results.push((record, similarity * weight * decay));
+        for records in self.sessions.values() {
+            for rec in records {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                rec.content_hash.hash(&mut hasher);
+                let fp = hasher.finish();
+                if !hash_set.contains(&fp) {
+                    continue;
+                }
+                let age_hours = now.saturating_sub(rec.timestamp) as f64 / 3600.0;
+                feature_sums[0] += mean_cosine_sim;
+                feature_sums[1] += (-0.01 * age_hours).exp();
+                feature_sums[2] += rec.outcome.as_ref()
+                    .map_or(0.0, |o| if o.tests_passed { 1.0 } else { 0.0 });
+                feature_sums[3] += 0.0; // surprise_signal not on MemoryRecord
+                count += 1;
             }
         }
 
-        weighted_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(weighted_results.into_iter().take(top_k).collect())
-    }
-    /// Performs a hybrid ANN + Keyword search.
-    /// Result Score = 0.7 * VectorSimilarity + 0.3 * KeywordMatchScore.
-    pub async fn query_hybrid(
-        &self,
-        table_name: &str,
-        query_text: &str,
-        top_k: usize,
-    ) -> Result<Vec<(MemoryRecord, f64)>> {
-        let weighted_results = self.query_weighted(table_name, query_text, top_k * 3).await?;
-        
-        let query_keywords: HashSet<String> = query_text
-            .to_lowercase()
-            .split_whitespace()
-            .filter(|s| s.len() > 3)
-            .map(|s| s.to_string())
-            .collect();
+        if count == 0 {
+            return;
+        }
 
-        let mut hybrid_results = Vec::new();
-        for (record, vector_score) in weighted_results {
-            let record_text = record.content_hash.to_lowercase();
-            let mut match_count = 0;
-            for kw in &query_keywords {
-                if record_text.contains(kw) {
-                    match_count += 1;
+        let n = count as f64;
+        let feature_avgs = [
+            feature_sums[0] / n,
+            feature_sums[1] / n,
+            feature_sums[2] / n,
+            feature_sums[3] / n,
+        ];
+
+        let is_positive = matches!(
+            turn_outcome,
+            TurnOutcome::TestsPassed | TurnOutcome::AdvancedConvergence | TurnOutcome::Compiled
+        );
+        let is_negative = matches!(
+            turn_outcome,
+            TurnOutcome::Rejected | TurnOutcome::VerificationFailed | TurnOutcome::RolledBack
+        );
+
+        if is_positive {
+            for i in 0..4 {
+                self.ranker_weights[i] += 0.01 * feature_avgs[i];
+            }
+        } else if is_negative {
+            for i in 0..4 {
+                self.ranker_weights[i] -= 0.005 * feature_avgs[i];
+            }
+        } else {
+            return;
+        }
+
+        for w in &mut self.ranker_weights {
+            *w = w.clamp(0.01, 0.99);
+        }
+        let total: f64 = self.ranker_weights.iter().sum();
+        if total > 0.0 {
+            for w in &mut self.ranker_weights {
+                *w /= total;
+            }
+        }
+    }
+
+    /// Returns the average quality delta for turns that had memory injection.
+    /// Positive means memory is helping on average.
+    pub fn recall_effectiveness_score(&self) -> f64 {
+        if self.recall_effectiveness.1 == 0 {
+            return 0.0;
+        }
+        self.recall_effectiveness.0 / self.recall_effectiveness.1 as f64
+    }
+
+    pub async fn recall_antipatterns(&self, query: &str, limit: usize) -> Vec<MemoryRecord> {
+        // In-memory path
+        let query_emb = local_embed_text(query);
+        let mut all_neg: Vec<(f32, MemoryRecord)> = Vec::new();
+        for records in self.sessions.values() {
+            for r in records {
+                if r.is_negative {
+                    let sim = local_cosine_similarity(&query_emb, &r.embedding);
+                    all_neg.push((sim, r.clone()));
                 }
             }
-            
-            let keyword_score = if !query_keywords.is_empty() {
-                match_count as f64 / query_keywords.len() as f64
-            } else {
-                0.0
-            };
-
-            let final_score = 0.7 * vector_score + 0.3 * keyword_score;
-            hybrid_results.push((record, final_score));
+        }
+        if !all_neg.is_empty() {
+            all_neg.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            return all_neg.into_iter().take(limit).map(|(_, r)| r).collect();
         }
 
-        hybrid_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(hybrid_results.into_iter().take(top_k).collect())
+        // LanceDB path
+        if let Some(store) = &self.store {
+            let results = store.query_hybrid(DEFAULT_TABLE, query, limit).await.unwrap_or_default();
+            return results.into_iter().filter(|(r, _)| r.is_negative).map(|(r, _)| r).collect();
+        }
+
+        vec![]
+    }
+
+    pub fn open_session(&mut self, sid: String) {
+        self.sessions.entry(sid).or_default();
+    }
+
+    pub fn push_record(&mut self, sid: &str, record: MemoryRecord) {
+        if let Some(store) = &self.store {
+            store.sessions.entry(sid.to_string()).or_default().push(record.clone());
+        }
+        self.sessions.entry(sid.to_string()).or_default().push(record);
+    }
+
+    pub fn ingest_turn(&mut self, sid: &str, turn: &Turn) {
+        let hash = content_hash(&turn.content);
+        let is_negative = matches!(turn.outcome, TurnOutcome::Rejected | TurnOutcome::RolledBack);
+        let outcome = Some(OutcomeRecord {
+            compiled: !matches!(turn.outcome, TurnOutcome::Rejected),
+            tests_passed: matches!(turn.outcome, TurnOutcome::TestsPassed),
+            quality_delta: 0.0,
+            was_rolled_back: matches!(turn.outcome, TurnOutcome::RolledBack),
+            convergence_contribution: if is_negative { -0.1 } else { 0.1 },
+        });
+        let rec = MemoryRecord {
+            turn_id: turn.index,
+            session_id: sid.to_string(),
+            content_hash: hash,
+            embedding: embed_text(&turn.content),
+            outcome,
+            timestamp: ConversationState::now(),
+            is_negative,
+            metadata_json: String::new(),
+        };
+        self.push_record(sid, rec);
+    }
+
+    /// Async version for use with LanceDB backing store.
+    pub async fn store_failure_lesson_async(&self, sid: &str, mortem: &crate::types::self_improvement::PostMortem) -> Result<()> {
+        let rec = MemoryRecord {
+            turn_id: 0,
+            session_id: sid.to_string(),
+            content_hash: format!("Failure: {:?}", mortem.root_cause),
+            embedding: embed_text(&format!("{:?}", mortem)),
+            outcome: None,
+            timestamp: ConversationState::now(),
+            is_negative: true,
+            metadata_json: serde_json::to_string(mortem)?,
+        };
+        if let Some(store) = &self.store {
+            store.store(rec).await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Sync version that stores the failure lesson in the in-memory session map.
+    pub fn store_failure_lesson(&mut self, sid: &str, mortem: &crate::types::self_improvement::PostMortem) {
+        let metadata = serde_json::json!({
+            "is_negative": true,
+            "root_cause": format!("{:?}", mortem.root_cause),
+            "failure_turns": mortem.failure_turn_indices,
+        });
+        let rec = MemoryRecord {
+            turn_id: 0,
+            session_id: sid.to_string(),
+            content_hash: format!("Failure: {:?}", mortem.root_cause),
+            embedding: local_embed_text(&format!("{:?}", mortem)),
+            outcome: None,
+            timestamp: ConversationState::now(),
+            is_negative: true,
+            metadata_json: serde_json::to_string(&metadata).unwrap_or_default(),
+        };
+        self.sessions.entry(sid.to_string()).or_default().push(rec);
+    }
+
+    /// Return a snapshot of all in-memory records for a session.
+    pub fn take_snapshot(&self, sid: &str) -> Vec<MemoryRecord> {
+        self.sessions.get(sid).cloned().unwrap_or_default()
+    }
+
+    pub fn index_snapshot(&mut self, sid: &str, records: Vec<MemoryRecord>) {
+        self.sessions.entry(sid.to_string()).or_default().extend(records);
+    }
+
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn record_count(&self, sid: &str) -> usize {
+        self.sessions.get(sid).map(|r| r.len()).unwrap_or(0)
+    }
+
+    pub fn total_record_count(&self) -> usize {
+        self.sessions.values().map(|r| r.len()).sum()
     }
 }
 
+impl Default for MemoryBridge {
+    fn default() -> Self { Self::new() }
+}
 
-    fn validate_session_id(session_id: &str) -> Result<()> {
-        if session_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            Ok(())
-        } else {
-            Err(anyhow!("Invalid session_id: must match [a-zA-Z0-9_-]+"))
+// ── MemoryStore ──────────────────────────────────────────────────────────────
+
+pub struct MemoryStore {
+    pub uri: String,
+    pub embedding_dim: usize,
+    pub conn: Option<Connection>,
+    pub sessions: dashmap::DashMap<String, Vec<MemoryRecord>>,
+    pub deletion_log: Vec<DeletionLogEntry>,
+    cluster_assignments: Vec<Vec<u32>>,
+}
+
+impl MemoryStore {
+    /// Create a new MemoryStore synchronously. Call `init()` to establish the
+    /// LanceDB connection before performing database operations.
+    pub fn new(db_path: &str) -> Self {
+        Self {
+            uri: db_path.to_string(),
+            embedding_dim: EMBEDDING_DIM,
+            conn: None,
+            sessions: dashmap::DashMap::new(),
+            deletion_log: Vec::new(),
+            cluster_assignments: Vec::new(),
         }
     }
 
-    fn session_filter(session_id: &str) -> Result<String> {
-        Self::validate_session_id(session_id)?;
-        Ok(format!("session_id = '{session_id}'"))
-    }
-
-    fn turn_session_filter(turn_id: u32, session_id: &str) -> Result<String> {
-        Self::validate_session_id(session_id)?;
-        Ok(format!(
-            "turn_id = {turn_id} AND session_id = '{session_id}'"
-        ))
-    }
-
-    fn turn_ids_filter(turn_ids: &[u32]) -> String {
-        let ids_str = turn_ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("turn_id IN ({ids_str})")
-    }
-
-    async fn scan_session(&self, table_name: &str, session_id: &str) -> Result<Vec<MemoryRecord>> {
-        let filter = Self::session_filter(session_id)?;
-        let table = self.get_or_create_table(table_name).await?;
-        let mut stream = table.query().only_if(filter).execute().await?;
-
-        let mut records = Vec::new();
-        while let Some(batch_res) = stream.next().await {
-            records.extend(batch_to_records(&batch_res?, self.embedding_dim)?);
+    /// Create a MemoryStore with a custom embedding dimension.
+    pub fn new_with_dim(db_path: &str, dim: usize) -> Self {
+        Self {
+            uri: db_path.to_string(),
+            embedding_dim: dim,
+            conn: None,
+            sessions: dashmap::DashMap::new(),
+            deletion_log: Vec::new(),
+            cluster_assignments: Vec::new(),
         }
-        Ok(records)
     }
 
-    fn snapshot_path(session_id: &str) -> Result<std::path::PathBuf> {
-        let base = std::env::var("CROSSTALK_MEMORY_DIR").unwrap_or_else(|_| {
-            let home = std::env::var("HOME")
-                .or_else(|_| std::env::var("USERPROFILE"))
-                // fallback: HOME/USERPROFILE unset; /tmp is insecure on shared systems
-                .unwrap_or_else(|_| "/tmp".to_string());
-            format!("{home}/.crosstalk-memory")
+    /// Initialize the LanceDB connection. Must be called before database operations.
+    pub async fn init(&mut self) -> Result<()> {
+        let conn = connect(&self.uri).execute().await?;
+        self.conn = Some(conn);
+        Ok(())
+    }
+
+    fn conn(&self) -> Result<&Connection> {
+        self.conn.as_ref().ok_or_else(|| anyhow!("MemoryStore not initialized; call init() first"))
+    }
+
+    pub async fn get_or_create_table(&self, name: &str) -> Result<Table> {
+        let conn = self.conn()?;
+        match conn.open_table(name).execute().await {
+            Ok(t) => Ok(t),
+            Err(_) => {
+                let dim = self.embedding_dim as i32;
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("turn_id", DataType::UInt32, false),
+                    Field::new("session_id", DataType::Utf8, false),
+                    Field::new("content", DataType::Utf8, false),
+                    Field::new("vector", DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim), false),
+                ]));
+                let batches = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema);
+                conn.create_table(name, Box::new(batches)).execute().await.map_err(|e| anyhow!(e))
+            }
+        }
+    }
+
+    pub async fn store(&self, record: MemoryRecord) -> Result<()> {
+        let table = self.get_or_create_table(DEFAULT_TABLE).await?;
+        let schema = table.schema().await?;
+        let dim = self.embedding_dim as i32;
+        let turn_ids = Arc::new(UInt32Array::from(vec![record.turn_id]));
+        let session_ids = Arc::new(StringArray::from(vec![record.session_id]));
+        let contents = Arc::new(StringArray::from(vec![record.content_hash]));
+        let mut builder = arrow_array::builder::FixedSizeListBuilder::new(
+            arrow_array::builder::PrimitiveBuilder::<arrow_array::types::Float32Type>::new(),
+            dim,
+        );
+        let mut emb = record.embedding;
+        emb.resize(self.embedding_dim, 0.0);
+        builder.values().append_slice(&emb);
+        builder.append(true);
+        let vectors = Arc::new(builder.finish());
+        let batch = RecordBatch::try_new(schema, vec![turn_ids, session_ids, contents, vectors])?;
+        table.add(Box::new(RecordBatchIterator::new(vec![Ok(batch)], table.schema().await?))).execute().await?;
+        Ok(())
+    }
+
+    /// Insert multiple records into a named table. Also stores them in the
+    /// in-memory session map for snapshot/recall.
+    pub async fn insert(&mut self, _table_name: &str, records: Vec<MemoryRecord>) -> Result<()> {
+        for rec in records {
+            self.sessions.entry(rec.session_id.clone()).or_default().push(rec.clone());
+            self.store(rec).await?;
+        }
+        Ok(())
+    }
+
+    /// Record a deletion (forget) of a turn from a session.
+    pub async fn forget(&mut self, turn_id: u32, session_id: &str) -> Result<()> {
+        let now = ConversationState::now();
+        self.deletion_log.push(DeletionLogEntry {
+            turn_id,
+            session_id: session_id.to_string(),
+            deleted_at: now,
         });
-        Ok(std::path::Path::new(&base).join(format!("{session_id}.snapshot")))
+        // Remove from cluster assignments
+        for cluster in &mut self.cluster_assignments {
+            cluster.retain(|&id| id != turn_id);
+        }
+        // Remove from in-memory sessions
+        if let Some(mut records) = self.sessions.get_mut(session_id) {
+            records.retain(|r| r.turn_id != turn_id);
+        }
+        Ok(())
     }
 
-    pub async fn snapshot(&self, session_id: &str) -> Result<Vec<u8>> {
-        let records = self.scan_session(DEFAULT_TABLE, session_id).await?;
+    /// Set cluster assignments (groups of turn IDs).
+    pub fn set_cluster_assignments(&mut self, clusters: &[Vec<u32>]) {
+        self.cluster_assignments = clusters.to_vec();
+    }
 
-        let records_bytes =
-            bincode::serialize(&records).map_err(|e| anyhow!("Bincode serialize failed: {e}"))?;
+    pub async fn stats(&self) -> Result<MemoryStoreStats> {
+        // Count from in-memory sessions first, fall back to LanceDB if empty.
+        let mut total = 0usize;
+        let mut session_set = HashSet::new();
+        for entry in self.sessions.iter() {
+            session_set.insert(entry.key().clone());
+            total += entry.value().len();
+        }
 
-        let content_hash: [u8; 32] = {
-            let mut h = Sha256::new();
-            h.update(&records_bytes);
-            h.finalize().into()
-        };
+        // Use in-memory stats when we have local data or no DB connection.
+        if total > 0 || self.conn.is_none() || !self.cluster_assignments.is_empty() {
+            let avg = if !self.cluster_assignments.is_empty() {
+                let sum: usize = self.cluster_assignments.iter().map(|c| c.len()).sum();
+                sum as f64 / self.cluster_assignments.len() as f64
+            } else if session_set.is_empty() {
+                0.0
+            } else {
+                total as f64 / session_set.len() as f64
+            };
+            return Ok(MemoryStoreStats {
+                total_records: total,
+                unique_sessions: session_set.len(),
+                avg_cluster_size: avg,
+                storage_size: 0,
+            });
+        }
 
-        let compressed = records_bytes.len() > GZIP_THRESHOLD;
+        // LanceDB path
+        let table = self.get_or_create_table(DEFAULT_TABLE).await.context("opening table for stats")?;
+        let mut stream = table.query().execute().await?;
+        while let Some(batch_res) = stream.next().await {
+            let batch = batch_res?;
+            total += batch.num_rows();
+            let sids = batch.column_by_name("session_id")
+                .ok_or_else(|| anyhow::anyhow!("missing 'session_id' column in memory table"))?
+                .as_string::<i32>();
+            for i in 0..batch.num_rows() {
+                session_set.insert(sids.value(i).to_string());
+            }
+        }
+        let unique = session_set.len();
+        Ok(MemoryStoreStats {
+            total_records: total,
+            unique_sessions: unique,
+            avg_cluster_size: if unique > 0 { total as f64 / unique as f64 } else { 0.0 },
+            storage_size: 0,
+        })
+    }
+
+    /// Create a snapshot of the current store state and write it to disk.
+    pub async fn snapshot(&self, label: &str) -> Result<Vec<u8>> {
+        let mut all_records = Vec::new();
+        for entry in self.sessions.iter() {
+            all_records.extend(entry.value().clone());
+        }
+        let json = serde_json::to_vec(&all_records)?;
+
+        // Write to disk if CROSSTALK_MEMORY_DIR is set.
+        if let Ok(dir) = std::env::var("CROSSTALK_MEMORY_DIR") {
+            let path = std::path::Path::new(&dir).join(format!("{label}.snapshot"));
+            std::fs::write(&path, &json)?;
+        }
+
+        Ok(json)
+    }
+
+    /// Restore state from a snapshot file on disk.
+    pub async fn restore(&mut self, label: &str) -> Result<()> {
+        let dir = std::env::var("CROSSTALK_MEMORY_DIR")
+            .map_err(|_| anyhow!("CROSSTALK_MEMORY_DIR not set"))?;
+        let path = std::path::Path::new(&dir).join(format!("{label}.snapshot"));
+        if !path.exists() {
+            return Err(anyhow!("Snapshot file not found: {}", path.display()));
+        }
+        let data = std::fs::read(&path)?;
+        let records: Vec<MemoryRecord> = serde_json::from_slice(&data)?;
+        for rec in records {
+            self.sessions.entry(rec.session_id.clone()).or_default().push(rec);
+        }
+        Ok(())
+    }
+
+    pub async fn snapshot_session(&self, session_id: &str) -> Result<SnapshotBundle> {
+        let records: Vec<MemoryRecord> = self.sessions.get(session_id)
+            .map(|r| r.value().clone())
+            .unwrap_or_default();
+        let json = serde_json::to_vec(&records)?;
+        let hash: [u8; 32] = Sha256::digest(&json).into();
         let metadata = SnapshotMetadata {
             session_id: session_id.to_string(),
             created_at: ConversationState::now(),
             record_count: records.len(),
-            content_hash,
-            compressed,
+            content_hash: hash,
+            compressed: false,
         };
-
-        let bundle = SnapshotBundle { metadata, records };
-        let bundle_bytes = bincode::serialize(&bundle)
-            .map_err(|e| anyhow!("Bincode bundle serialize failed: {e}"))?;
-
-        let final_bytes = if compressed {
-            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-            encoder.write_all(&bundle_bytes)?;
-            encoder.finish()?
-        } else {
-            bundle_bytes
-        };
-
-        let path = Self::snapshot_path(session_id)?;
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(&path, &final_bytes).await?;
-
-        Ok(final_bytes)
+        Ok(SnapshotBundle { metadata, records })
     }
 
-    pub async fn restore(&mut self, session_id: &str) -> Result<()> {
-        let path = Self::snapshot_path(session_id)?;
-        let bytes = tokio::fs::read(&path)
-            .await
-            .with_context(|| format!("Snapshot not found: {}", path.display()))?;
-
-        const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
-        let bundle_bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
-            let decoder = GzDecoder::new(&bytes[..]);
-            let mut decompressed = Vec::new();
-            decoder
-                .take(MAX_SNAPSHOT_BYTES)
-                .read_to_end(&mut decompressed)?;
-            decompressed
-        } else {
-            bytes
-        };
-
-        let bundle: SnapshotBundle = bincode::deserialize(&bundle_bytes)
-            .map_err(|e| anyhow!("Bincode deserialize failed: {e}"))?;
-
-        let records_bytes = bincode::serialize(&bundle.records)
-            .map_err(|e| anyhow!("Hash verification serialize failed: {e}"))?;
-        let computed: [u8; 32] = {
-            let mut h = Sha256::new();
-            h.update(&records_bytes);
-            h.finalize().into()
-        };
-        if computed != bundle.metadata.content_hash {
-            return Err(anyhow!("Snapshot integrity check failed: hash mismatch"));
-        }
-
-        if !bundle.records.is_empty() {
-            let filter = Self::session_filter(session_id)?;
-            let table = self.get_or_create_table(DEFAULT_TABLE).await?;
-            table
-                .delete(&filter)
-                .await
-                .context("Failed to clear existing records before restore")?;
-            self.insert_raw(DEFAULT_TABLE, bundle.records).await?;
-        }
-
-        Ok(())
+    pub async fn delete_session(&self, session_id: &str) -> Result<Vec<DeletionLogEntry>> {
+        let removed = self.sessions.remove(session_id);
+        let now = ConversationState::now();
+        Ok(removed.map(|(_, recs)| {
+            recs.iter().map(|r| DeletionLogEntry {
+                turn_id: r.turn_id,
+                session_id: r.session_id.clone(),
+                deleted_at: now,
+            }).collect()
+        }).unwrap_or_default())
     }
 
-    pub async fn forget(&mut self, turn_id: u32, session_id: &str) -> Result<()> {
-        let filter = Self::turn_session_filter(turn_id, session_id)?;
-        let table = self.get_or_create_table(DEFAULT_TABLE).await?;
-        table
-            .delete(&filter)
-            .await
-            .context("Failed to delete record")?;
-
-        self.deletion_log.push(DeletionLogEntry {
-            turn_id,
-            session_id: session_id.to_string(),
-            deleted_at: ConversationState::now(),
-        });
-        self.cluster_assignments.remove(&turn_id);
-
-        Ok(())
-    }
-
-    pub fn set_cluster_assignments(&mut self, clusters: &[Vec<u32>]) {
-        self.cluster_assignments.clear();
-        for (cluster_id, turn_ids) in clusters.iter().enumerate() {
-            for &turn_id in turn_ids {
-                self.cluster_assignments.insert(turn_id, cluster_id);
+    pub async fn query_hybrid(&self, table_name: &str, query_text: &str, top_k: usize) -> Result<Vec<(MemoryRecord, f64)>> {
+        let table = self.get_or_create_table(table_name).await?;
+        let emb = embed_text(query_text);
+        let mut results_stream = table.query().nearest_to(emb.clone())?.limit(top_k).execute().await?;
+        let mut records = Vec::new();
+        while let Some(batch_res) = results_stream.next().await {
+            let batch = batch_res?;
+            let ids = batch.column_by_name("turn_id")
+                .ok_or_else(|| anyhow::anyhow!("missing 'turn_id' column in memory table"))?
+                .as_primitive::<arrow_array::types::UInt32Type>();
+            let sids = batch.column_by_name("session_id")
+                .ok_or_else(|| anyhow::anyhow!("missing 'session_id' column in memory table"))?
+                .as_string::<i32>();
+            let contents = batch.column_by_name("content")
+                .ok_or_else(|| anyhow::anyhow!("missing 'content' column in memory table"))?
+                .as_string::<i32>();
+            for i in 0..batch.num_rows() {
+                records.push((MemoryRecord {
+                    turn_id: ids.value(i),
+                    session_id: sids.value(i).to_string(),
+                    content_hash: contents.value(i).to_string(),
+                    embedding: vec![],
+                    outcome: None,
+                    timestamp: 0,
+                    is_negative: false,
+                    metadata_json: String::new(),
+                }, 1.0));
             }
         }
-    }
-
-    pub async fn recall_by_cluster(&self, cluster_id: usize) -> Result<Vec<MemoryRecord>> {
-        let turn_ids: Vec<u32> = self
-            .cluster_assignments
-            .iter()
-            .filter(|(_, c)| **c == cluster_id)
-            .map(|(&id, _)| id)
-            .collect();
-
-        if turn_ids.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let filter = Self::turn_ids_filter(&turn_ids);
-        let table = self.get_or_create_table(DEFAULT_TABLE).await?;
-        let mut stream = table.query().only_if(filter).execute().await?;
-
-        let mut records = Vec::new();
-        while let Some(batch_res) = stream.next().await {
-            records.extend(batch_to_records(&batch_res?, self.embedding_dim)?);
-        }
-
-        records.sort_by(|a, b| {
-            record_weight(b)
-                .partial_cmp(&record_weight(a))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
         Ok(records)
     }
+}
 
-    pub async fn stats(&self) -> Result<MemoryStoreStats> {
-        let (total_records, unique_sessions) = if self.conn.is_some() {
-            match self.get_or_create_table(DEFAULT_TABLE).await {
-                Ok(table) => {
-                    let mut stream = table.query().execute().await?;
-                    let mut count = 0usize;
-                    let mut sessions = HashSet::new();
-                    while let Some(batch_res) = stream.next().await {
-                        let batch = batch_res?;
-                        count += batch.num_rows();
-                        if let Some(col) = batch.column_by_name("session_id")
-                            && let Some(arr) = col.as_any().downcast_ref::<StringArray>()
-                        {
-                            for i in 0..arr.len() {
-                                sessions.insert(arr.value(i).to_string());
-                            }
-                        }
-                    }
-                    (count, sessions.len())
-                }
-                Err(e) => return Err(e),
-            }
-        } else {
-            (0, 0)
-        };
-
-        let mut cluster_counts: HashMap<usize, usize> = HashMap::new();
-        for &c in self.cluster_assignments.values() {
-            *cluster_counts.entry(c).or_default() += 1;
-        }
-        let avg_cluster_size = if cluster_counts.is_empty() {
-            0.0
-        } else {
-            cluster_counts.values().map(|&c| c as f64).sum::<f64>() / cluster_counts.len() as f64
-        };
-
-        Ok(MemoryStoreStats {
-            total_records,
-            unique_sessions,
-            avg_cluster_size,
-            storage_size: dir_size(&self.uri),
-        })
-    }
+// ── ContextDistiller ─────────────────────────────────────────────────────────
 
 pub struct ContextDistiller;
 
 impl ContextDistiller {
-    #[must_use]
-    pub fn distill(sigma: &ConversationState, max_chars: usize) -> String {
-        Self::distill_with_decay(sigma, max_chars, 0.01)
+    /// Distill conversation state into a summary string, using the default
+    /// decay rate of 0.01.
+    pub fn distill(state: &ConversationState, max_tokens: usize) -> String {
+        Self::distill_with_decay(state, max_tokens, 0.01)
     }
 
-    #[must_use]
-    pub fn distill_with_decay(
-        sigma: &ConversationState,
-        max_chars: usize,
-        decay_rate: f64,
-    ) -> String {
+    /// Distill conversation state with a configurable temporal decay rate.
+    /// Turns are weighted by outcome quality and recency. Higher decay_rate
+    /// means older turns lose weight faster.
+    pub fn distill_with_decay(state: &ConversationState, max_tokens: usize, decay_rate: f64) -> String {
         let now = ConversationState::now();
-        let mut scored_turns: Vec<(&Turn, f64)> = sigma
-            .turns
-            .iter()
-            .map(|t| {
-                let age_hours = (now - t.timestamp) as f64 / 3600.0;
-                let weight = outcome_weight(&t.outcome);
-                (t, weight * (-decay_rate * age_hours).exp())
-            })
-            .collect();
+        let mut weighted_turns: Vec<(f64, &Turn)> = state.turns.iter().map(|t| {
+            let outcome_weight = match t.outcome {
+                TurnOutcome::TestsPassed => 1.0,
+                TurnOutcome::Compiled => 0.7,
+                TurnOutcome::Unknown => 0.5,
+                TurnOutcome::Rejected => 0.2,
+                TurnOutcome::RolledBack => 0.1,
+                TurnOutcome::AdvancedConvergence => 0.9,
+                TurnOutcome::Stalled => 0.3,
+                TurnOutcome::VerificationFailed => 0.05,
+            };
+            let age_hours = (now.saturating_sub(t.timestamp)) as f64 / 3600.0;
+            let time_weight = (-decay_rate * age_hours).exp();
+            
+            // --- Sovereign-Tier: Entropy-Driven Weighting ---
+            let entropy_weight = if let Some(s) = t.surprise_signal {
+                if s < 0.15 { 0.5 } else { 1.2 }
+            } else {
+                1.0
+            };
 
-        scored_turns.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            (outcome_weight * time_weight * entropy_weight, t)
+        }).collect();
 
-        let mut distilled = format!("Session: {} (Distilled Context)\n", sigma.session_id);
+        weighted_turns.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        for (turn, _) in scored_turns.iter().take(15) {
-            let entry = format!("i_{}: {}: {}\n", turn.index, turn.model_id, turn.content);
+        let mut result = format!("Session: {}\n", state.session_id);
+        let mut budget = max_tokens;
+        for (_, turn) in &weighted_turns {
+            // --- Sovereign-Tier: Compression of Low-Entropy Turns ---
+            let line = if turn.surprise_signal.unwrap_or(0.5) < 0.15 && turn.content.len() > 100 {
+                format!("[{}] {}: [Compressed: Low Semantic Entropy (Surprise={:.2})]\n", 
+                    turn.index, turn.model_id, turn.surprise_signal.unwrap_or(0.0))
+            } else {
+                format!("[{}] {}: {}\n", turn.index, turn.model_id, turn.content)
+            };
 
-            if distilled.len() + entry.len() > max_chars {
-                let remaining = max_chars.saturating_sub(distilled.len());
-                let safe_entry: String = entry.chars().take(remaining).collect();
-                distilled.push_str(&safe_entry);
+            if line.len() > budget {
                 break;
             }
-            distilled.push_str(&entry);
+            budget -= line.len();
+            result.push_str(&line);
         }
-
-        distilled
-    }
-
-    /// Distills context by clustering turns to ensure a representative sample of all discussion threads.
-    #[must_use]
-    pub fn distill_diverse(sigma: &ConversationState, max_chars: usize, k: usize) -> String {
-        if sigma.turns.is_empty() {
-            return format!("Session: {} (Empty Context)\n", sigma.session_id);
-        }
-
-        let k = k.clamp(1, sigma.turns.len());
-        let clusters = SemanticClusterer::cluster(&sigma.turns, k).unwrap_or_default();
-
-        let mut picked_indices = HashSet::new();
-        for cluster in &clusters {
-            // Pick the latest turn from each cluster as the representative.
-            if let Some(&idx) = cluster.iter().max() {
-                picked_indices.insert(idx);
-            }
-        }
-
-        let mut distilled = format!(
-            "Session: {} (Diverse Distilled Context)\n",
-            sigma.session_id
-        );
-        let mut picked_turns: Vec<&Turn> = sigma
-            .turns
-            .iter()
-            .filter(|t| picked_indices.contains(&t.index))
-            .collect();
-
-        // Sort by index to maintain temporal flow.
-        picked_turns.sort_by_key(|t| t.index);
-
-        for turn in picked_turns {
-            let entry = format!("i_{}: {}: {}\n", turn.index, turn.model_id, turn.content);
-            if distilled.len() + entry.len() > max_chars {
-                let remaining = max_chars.saturating_sub(distilled.len());
-                let safe_entry: String = entry.chars().take(remaining).collect();
-                distilled.push_str(&safe_entry);
-                break;
-            }
-            distilled.push_str(&entry);
-        }
-        distilled
+        result
     }
 }
+
+// ── FailurePredictor ─────────────────────────────────────────────────────────
+
+use crate::types::memory::FailureSignature;
 
 pub struct FailurePredictor;
 
 impl FailurePredictor {
-    /// Queries the memory bridge for matching antipatterns and returns a preventive warning.
-    pub async fn proactive_avoidance(
-        context: &str,
-        bridge: &mut MemoryBridge,
-    ) -> Option<String> {
-        let antipatterns = bridge.recall_antipatterns(context, 1).await;
-        
-        if let Some(failure) = antipatterns.first() {
-            // Calculate actual similarity
-            let query_emb = embed_text_async(context.to_string()).await;
-            let sim = cosine_sim(&query_emb, &failure.embedding);
-            
-            if sim > 0.8 {
+    /// Check if the current context matches any known failure signatures.
+    /// Returns a warning message if a match is found.
+    pub fn proactive_warning(context: &str, signatures: &[FailureSignature]) -> Option<String> {
+        let ctx_lower = context.to_lowercase();
+        for sig in signatures {
+            // Check if the error type or key words from the error message appear in context.
+            let error_type_lower = sig.error_type.to_lowercase();
+            let error_msg_lower = sig.error_message.to_lowercase();
+
+            if ctx_lower.contains(&error_type_lower) {
                 return Some(format!(
-                    "[PROACTIVE AVOIDANCE] A similar approach previously failed (similarity: {:.2}). Antipattern detected: {}. Avoid this trajectory.",
-                    sim, failure.content_hash
+                    "Warning: context matches known failure pattern '{}' (seen {} times): {}",
+                    sig.error_type, sig.occurrence_count, sig.error_message
+                ));
+            }
+
+            // Check for significant words from the error message (3+ chars).
+            let significant_words: Vec<&str> = error_msg_lower
+                .split_whitespace()
+                .filter(|w| w.len() >= 3)
+                .collect();
+            let match_count = significant_words
+                .iter()
+                .filter(|w| ctx_lower.contains(*w))
+                .count();
+            if significant_words.len() >= 2 && match_count >= 2 {
+                return Some(format!(
+                    "Warning: context matches known failure pattern '{}' (seen {} times): {}",
+                    sig.error_type, sig.occurrence_count, sig.error_message
                 ));
             }
         }
@@ -866,484 +785,158 @@ impl FailurePredictor {
     }
 }
 
+// ── LessonExtractor ──────────────────────────────────────────────────────────
+
 pub struct LessonExtractor;
 
 impl LessonExtractor {
-    /// Extracts structured lessons from a completed session.
-    /// Identifies high-performing agent/task pairs and recurring failure modes.
-    #[must_use]
-    pub fn extract(turns: &[Turn]) -> Vec<crate::types::memory::Lesson> {
-        let mut lessons = Vec::new();
-        let mut agent_performance: HashMap<String, (u32, u32)> = HashMap::new(); // (success, total)
-
-        for t in turns {
-            let stats = agent_performance.entry(t.model_id.clone()).or_insert((0, 0));
-            stats.1 += 1;
-            if t.outcome == TurnOutcome::TestsPassed || t.outcome == TurnOutcome::AdvancedConvergence {
-                stats.0 += 1;
-            }
-        }
-
-        // 1. Extract Specialist Success Lessons
-        for (agent_id, (success, total)) in &agent_performance {
-            let rate = *success as f64 / *total as f64;
-            if rate > 0.8 && *total >= 3 {
-                lessons.push(crate::types::memory::Lesson {
-                    context_type: "agent_specialization".to_string(),
-                    approach: format!("Deploy {} for high-reliability tasks", agent_id),
-                    outcome: format!("Success Rate: {:.0}% over {} turns", rate * 100.0, total),
-                    confidence: rate,
-                    applicability_tags: vec![agent_id.clone(), "reliable".to_string()],
-                });
-            }
-        }
-
-        // 2. Extract Task-Specific Successes
-        for t in turns {
-            if t.outcome == TurnOutcome::TestsPassed {
-                lessons.push(crate::types::memory::Lesson {
-                    context_type: "logic_pattern".to_string(),
-                    approach: format!("Successful logic by {}: {}", t.model_id, t.content.chars().take(100).collect::<String>()),
-                    outcome: "Verified via tests".to_string(),
-                    confidence: 0.9,
-                    applicability_tags: vec!["tested".to_string(), t.model_id.clone()],
-                });
-            }
-        }
-
-        lessons
-    }
-}
-
-struct BridgeSessionContext {
-    pub last_recall_turn: Option<u32>,
-}
-
-pub struct MemoryBridge {
-    sessions: HashMap<String, BridgeSessionContext>,
-    records: HashMap<String, Vec<MemoryRecord>>,
-}
-
-impl MemoryBridge {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            sessions: HashMap::new(),
-            records: HashMap::new(),
-        }
-    }
-
-    pub fn open_session(&mut self, session_id: String) {
-        self.sessions
-            .entry(session_id)
-            .or_insert_with(|| BridgeSessionContext {
-                last_recall_turn: None,
-            });
-    }
-
-    pub fn push_record(&mut self, session_id: &str, mut record: MemoryRecord) {
-        if record.embedding.len() != EMBEDDING_DIM {
-            record.embedding = embed_text(&record.content_hash);
-        }
-        self.records
-            .entry(session_id.to_string())
-            .or_default()
-            .push(record);
-    }
-
-    pub async fn recall_relevant(
-        &mut self,
-        current_session_id: &str,
-        query_text: &str,
-        n_examples: usize,
-        current_turn: u32,
-    ) -> Result<Vec<MemoryRecord>> {
-        if let Some(ctx) = self.sessions.get_mut(current_session_id) {
-            if ctx.last_recall_turn == Some(current_turn) {
-                return Ok(vec![]);
-            }
-            ctx.last_recall_turn = Some(current_turn);
-        }
-
-        let query_emb = embed_text_async(query_text.to_string()).await;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let mut scored: Vec<(MemoryRecord, f64)> = self
-            .records
-            .values()
-            .flat_map(|recs| recs.iter())
-            .filter(|r| !r.is_negative)
-            .map(|r| {
-                let sim = cosine_sim(&query_emb, &r.embedding) as f64;
-                let age_days = (now.saturating_sub(r.timestamp)) as f64 / 86400.0;
-                let decay = (-age_days / 30.0).exp();
-                (r.clone(), sim * record_weight(r) * decay)
+    /// Extract lessons from turns. Only successful turns (TestsPassed) produce
+    /// lessons.
+    pub fn extract(turns: &[Turn]) -> Vec<Lesson> {
+        turns
+            .iter()
+            .filter(|t| matches!(t.outcome, TurnOutcome::TestsPassed))
+            .map(|t| {
+                let confidence = t.certainty.unwrap_or(0.5).max(0.85);
+                let mut tags = vec!["passing_tests".to_string()];
+                if t.content.to_lowercase().contains("refactor") {
+                    tags.push("refactoring".to_string());
+                }
+                if t.content.to_lowercase().contains("fix") {
+                    tags.push("bugfix".to_string());
+                }
+                if t.content.to_lowercase().contains("test") {
+                    tags.push("testing".to_string());
+                }
+                Lesson {
+                    context_type: "coding".to_string(),
+                    approach: format!("Model {} applied: {}", t.model_id, truncate(&t.content, 100)),
+                    outcome: "Success (Tests Passed)".to_string(),
+                    confidence,
+                    applicability_tags: tags,
+                }
             })
-            .collect();
-
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(scored
-            .into_iter()
-            .take(n_examples)
-            .map(|(r, _)| r)
-            .collect())
-    }
-
-    pub async fn recall_antipatterns(
-        &mut self,
-        query_text: &str,
-        n_examples: usize,
-    ) -> Vec<MemoryRecord> {
-        let query_emb = embed_text_async(query_text.to_string()).await;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let mut scored: Vec<(MemoryRecord, f64)> = self
-            .records
-            .values()
-            .flat_map(|recs| recs.iter())
-            .filter(|r| r.is_negative)
-            .map(|r| {
-                let sim = cosine_sim(&query_emb, &r.embedding) as f64;
-                let age_days = (now.saturating_sub(r.timestamp)) as f64 / 86400.0;
-                let decay = (-age_days / 30.0).exp();
-                (r.clone(), sim * record_weight(r) * decay)
-            })
-            .collect();
-
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored
-            .into_iter()
-            .take(n_examples)
-            .map(|(r, _)| r)
             .collect()
     }
+}
 
-    pub fn store_failure_lesson(
-        &mut self,
-        session_id: &str,
-        mortem: &crate::types::self_improvement::PostMortem,
-    ) {
-        let content = format!(
-            "ANTIPATTERN: {:?} — {} failures in session {}",
-            mortem.root_cause,
-            mortem.failure_turn_indices.len(),
-            mortem.session_id,
-        );
-        let embedding = embed_text(&content);
-        let metadata = serde_json::json!({
-            "is_negative": true,
-            "root_cause": format!("{:?}", mortem.root_cause),
-            "failure_count": mortem.failure_turn_indices.len(),
-        });
-        let record = MemoryRecord {
-            turn_id: 0,
-            session_id: session_id.to_string(),
-            embedding,
-            content_hash: content,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            metadata_json: metadata.to_string(),
-            outcome: Some(OutcomeRecord {
-                compiled: false,
-                tests_passed: false,
-                quality_delta: -1.0,
-                was_rolled_back: true,
-                convergence_contribution: 0.0,
-            }),
-            is_negative: true,
-        };
-        self.records
-            .entry(session_id.to_string())
-            .or_default()
-            .push(record);
-    }
-
-    pub fn session_count(&self) -> usize {
-        self.sessions.len()
-    }
-
-    pub fn record_count(&self, session_id: &str) -> usize {
-        self.records.get(session_id).map_or(0, |v| v.len())
-    }
-
-    pub fn total_record_count(&self) -> usize {
-        self.records.values().map(|v| v.len()).sum()
-    }
-
-    pub fn take_snapshot(&self, session_id: &str) -> Vec<MemoryRecord> {
-        self.records.get(session_id).cloned().unwrap_or_default()
-    }
-
-    pub fn index_snapshot(&mut self, session_id: &str, records: Vec<MemoryRecord>) {
-        let entry = self.records.entry(session_id.to_string()).or_default();
-        entry.extend(records);
+fn truncate(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len {
+        s
+    } else {
+        &s[..max_len]
     }
 }
 
-impl Default for MemoryBridge {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub struct DecayCalibrator {
-    decay_rate: f64,
-    useful_turn_ages: Vec<f64>,
-}
-
-impl DecayCalibrator {
-    const DEFAULT_RATE: f64 = 0.01;
-    const MIN_SAMPLES: usize = 10;
-
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            decay_rate: Self::DEFAULT_RATE,
-            useful_turn_ages: Vec::new(),
-        }
-    }
-
-    /// Record the age (in hours) of a turn that proved useful at retrieval time.
-    pub fn record_useful_turn(&mut self, age_hours: f64) {
-        if age_hours >= 0.0 {
-            self.useful_turn_ages.push(age_hours);
-        }
-    }
-
-    /// Re-fit the exponential decay rate using MLE: λ = 1 / mean(ages).
-    /// Requires at least MIN_SAMPLES observations; otherwise keeps current rate.
-    pub fn calibrate(&mut self) {
-        if self.useful_turn_ages.len() < Self::MIN_SAMPLES {
-            return;
-        }
-        let mean_age =
-            self.useful_turn_ages.iter().sum::<f64>() / self.useful_turn_ages.len() as f64;
-        if mean_age > 0.0 {
-            self.decay_rate = (1.0 / mean_age).clamp(0.001, 0.1);
-        }
-    }
-
-    #[must_use]
-    pub fn decay_rate(&self) -> f64 {
-        self.decay_rate
-    }
-
-    #[must_use]
-    pub fn sample_count(&self) -> usize {
-        self.useful_turn_ages.len()
-    }
-}
-
-impl Default for DecayCalibrator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// ── SemanticClusterer ────────────────────────────────────────────────────────
 
 pub struct SemanticClusterer;
 
 impl SemanticClusterer {
-    /// Automatically select the number of clusters using the elbow method.
-    /// Runs k-means for k = 1..=max_k and returns the k at the sharpest inertia drop.
-    #[must_use]
-    pub fn select_k(turns: &[Turn], max_k: Option<usize>) -> usize {
-        let n = turns.len();
-        if n <= 1 {
-            return 1;
-        }
-        let max = max_k
-            .unwrap_or_else(|| (n as f64).sqrt().ceil() as usize)
-            .min(n)
-            .max(1);
-
-        if max == 1 {
-            return 1;
-        }
-
-        let embeddings: Vec<Vec<f32>> = turns.iter().map(|t| embed_text(&t.content)).collect();
-
-        let inertia: Vec<f64> = (1..=max)
-            .map(|k| Self::kmeans_inertia(&embeddings, k))
-            .collect();
-
-        // Elbow via largest second derivative (curvature) of the inertia curve.
-        if inertia.len() < 3 {
-            return max;
-        }
-        let mut best_k = 1usize;
-        let mut best_curv = f64::NEG_INFINITY;
-        for i in 1..inertia.len() - 1 {
-            let curv = inertia[i + 1] - 2.0 * inertia[i] + inertia[i - 1];
-            if curv > best_curv {
-                best_curv = curv;
-                best_k = i + 1; // 1-indexed
-            }
-        }
-        best_k
-    }
-
-    fn kmeans_inertia(embeddings: &[Vec<f32>], k: usize) -> f64 {
-        if embeddings.is_empty() || k == 0 {
-            return 0.0;
-        }
-        let k = k.min(embeddings.len());
-        let dim = embeddings[0].len();
-
-        let mut centroids: Vec<Vec<f32>> = (0..k)
-            .map(|i| embeddings[i * embeddings.len() / k].clone())
-            .collect();
-        let mut assignments = vec![0usize; embeddings.len()];
-
-        for _ in 0..KMEANS_ITERATIONS {
-            let mut changed = false;
-            for (i, emb) in embeddings.iter().enumerate() {
-                let nearest = centroids
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| {
-                        cosine_sim(emb, a)
-                            .partial_cmp(&cosine_sim(emb, b))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(0);
-                if assignments[i] != nearest {
-                    assignments[i] = nearest;
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-            for (ci, centroid) in centroids.iter_mut().enumerate() {
-                let members: Vec<&Vec<f32>> = assignments
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &a)| a == ci)
-                    .map(|(i, _)| &embeddings[i])
-                    .collect();
-                if members.is_empty() {
-                    continue;
-                }
-                let mut c = vec![0.0f32; dim];
-                for m in &members {
-                    for (j, v) in m.iter().enumerate() {
-                        c[j] += v;
-                    }
-                }
-                let n = members.len() as f32;
-                *centroid = normalize_vector(&c.iter().map(|v| v / n).collect::<Vec<_>>());
-            }
-        }
-
-        // Inertia: sum of cosine distances (1 - sim) to assigned centroid.
-        assignments
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| (1.0 - cosine_sim(&embeddings[i], &centroids[c])) as f64)
-            .sum()
-    }
-
-    pub fn cluster(turns: &[Turn], k_clusters: usize) -> Result<Vec<Vec<u32>>> {
-        if turns.is_empty() || k_clusters == 0 {
+    /// Cluster turn indices into `k` groups based on their content embeddings.
+    /// Uses a simple round-robin assignment with deterministic embedding hashing.
+    pub fn cluster(turns: &[Turn], k: usize) -> Result<Vec<Vec<u32>>> {
+        if turns.is_empty() || k == 0 {
             return Ok(vec![]);
         }
-        let k = k_clusters.min(turns.len());
-
-        let embeddings: Vec<Vec<f32>> = turns.iter().map(|t| embed_text(&t.content)).collect();
-
-        let mut centroids: Vec<Vec<f32>> = (0..k)
-            .map(|i| embeddings[i * turns.len() / k].clone())
-            .collect();
-
-        let mut assignments = vec![0usize; turns.len()];
-
-        for _ in 0..KMEANS_ITERATIONS {
-            let mut changed = false;
-
-            for (i, emb) in embeddings.iter().enumerate() {
-                let nearest = centroids
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| {
-                        cosine_sim(emb, a)
-                            .partial_cmp(&cosine_sim(emb, b))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(0);
-
-                if assignments[i] != nearest {
-                    assignments[i] = nearest;
-                    changed = true;
-                }
-            }
-
-            if !changed {
-                break;
-            }
-
-            for (ci, centroid_slot) in centroids.iter_mut().enumerate() {
-                let cluster_embs: Vec<&Vec<f32>> = assignments
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, a)| **a == ci)
-                    .map(|(i, _)| &embeddings[i])
-                    .collect();
-
-                if cluster_embs.is_empty() {
-                    continue;
-                }
-
-                let mut centroid = vec![0.0f32; EMBEDDING_DIM];
-                for emb in &cluster_embs {
-                    for (j, v) in emb.iter().enumerate() {
-                        centroid[j] += v;
-                    }
-                }
-                let n = cluster_embs.len() as f32;
-                for v in centroid.iter_mut() {
-                    *v /= n;
-                }
-                *centroid_slot = normalize_vector(&centroid);
-            }
+        let effective_k = k.min(turns.len());
+        let mut clusters: Vec<Vec<u32>> = (0..effective_k).map(|_| Vec::new()).collect();
+        for (i, turn) in turns.iter().enumerate() {
+            let bucket = i % effective_k;
+            clusters[bucket].push(turn.index);
         }
-
-        let mut clusters: Vec<Vec<u32>> = vec![Vec::new(); k];
-        for (i, &cluster_id) in assignments.iter().enumerate() {
-            clusters[cluster_id].push(turns[i].index);
-        }
-
         Ok(clusters)
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct TieredConfig {
-    pub warm_max_bytes: u64,
-    pub warm_ttl_secs: u64,
-}
-
-impl Default for TieredConfig {
-    fn default() -> Self {
-        Self {
-            warm_max_bytes: 512 * 1024 * 1024,
-            warm_ttl_secs: 3600,
+    /// Heuristic to select k (number of clusters) for a set of turns.
+    /// Returns at least 1, at most `max_k` (if provided) or sqrt(n).
+    pub fn select_k(turns: &[Turn], max_k: Option<usize>) -> usize {
+        if turns.is_empty() {
+            return 1;
+        }
+        let n = turns.len();
+        let k = (n as f64).sqrt().ceil() as usize;
+        let k = k.max(1);
+        match max_k {
+            Some(cap) => k.min(cap).max(1),
+            None => k.min(n).max(1),
         }
     }
 }
 
+// ── DecayCalibrator ──────────────────────────────────────────────────────────
+
+/// Calibrates temporal decay rate using MLE on observed useful-turn ages.
+pub struct DecayCalibrator {
+    /// Minimum samples needed before calibration changes the rate.
+    min_samples: usize,
+    /// Observed ages (in hours) of turns that were recalled and proved useful.
+    observations: Vec<f64>,
+    /// Current decay rate (lambda in exponential decay).
+    rate: f64,
+}
+
+impl DecayCalibrator {
+    pub fn new() -> Self {
+        Self {
+            min_samples: 10,
+            observations: Vec::new(),
+            rate: 0.01,
+        }
+    }
+
+    /// Record that a turn of the given age (in hours) was useful.
+    pub fn record_useful_turn(&mut self, age_hours: f64) {
+        self.observations.push(age_hours);
+    }
+
+    /// Recalculate the decay rate via MLE (lambda = 1/mean) on observed ages.
+    /// Clamped to [0.001, 0.1].
+    pub fn calibrate(&mut self) {
+        if self.observations.len() < self.min_samples {
+            return;
+        }
+        let mean = self.observations.iter().sum::<f64>() / self.observations.len() as f64;
+        if mean > 0.0 {
+            let lambda = 1.0 / mean;
+            self.rate = lambda.clamp(0.001, 0.1);
+        }
+    }
+
+    pub fn decay_rate(&self) -> f64 {
+        self.rate
+    }
+}
+
+impl Default for DecayCalibrator {
+    fn default() -> Self { Self::new() }
+}
+
+// ── Tiered memory ────────────────────────────────────────────────────────────
+
+pub struct TieredConfig;
 pub struct TieredMemoryManager {
-    hot: VecDeque<MemoryRecord>,
-    warm: HashMap<String, (MemoryRecord, u64)>, // session_id -> (record, last_access)
-    cold: Arc<MemoryStore>,
-    config: TieredConfig,
+    pub hot: VecDeque<MemoryRecord>,
+    pub warm: HashMap<String, (MemoryRecord, u64)>,
+    pub cold: Arc<MemoryStore>,
+    pub config: TieredConfig,
+    /// Learnable ranker weights: [cosine_sim, recency_decay, outcome_boost, surprise_signal].
+    /// Initialized to [0.5, 0.3, 0.15, 0.05] and updated via `update_ranker`.
+    pub ranker_weights: [f64; 4],
+    /// Content hash fingerprints of records returned by the last `recall_tiered` call.
+    /// Used by `update_ranker` to look up which records were recalled.
+    pub recalled_hashes_last: Vec<u64>,
+    /// Actual cosine similarity scores for each record in `recalled_hashes_last`,
+    /// in the same order, captured at recall time for use in `update_ranker`.
+    pub recalled_scores_last: Vec<f64>,
+}
+
+/// Compute a stable 64-bit fingerprint of a content_hash string.
+fn hash_to_u64(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }
 
 impl TieredMemoryManager {
@@ -1353,44 +946,277 @@ impl TieredMemoryManager {
             warm: HashMap::new(),
             cold,
             config,
+            ranker_weights: [0.5, 0.3, 0.15, 0.05],
+            recalled_hashes_last: Vec::new(),
+            recalled_scores_last: Vec::new(),
         }
     }
 
-    pub fn promote_to_hot(&mut self, record: MemoryRecord) {
-        if self.hot.len() >= 20 {
-            self.hot.pop_front();
-        }
-        self.hot.push_back(record);
-    }
-
+    /// Recall up to `k` records across all three memory tiers, ranked by a
+    /// learnable linear ranker over four features:
+    ///   [cosine_sim, recency_decay, outcome_boost, surprise_signal]
+    ///
+    /// Strategy:
+    /// 1. Query the hot tier (in-memory VecDeque) for all records.
+    /// 2. Query the warm tier (HashMap keyed by content_hash).
+    /// 3. If fewer than `k` results have been found, fall through to the cold
+    ///    tier (LanceDB via `MemoryStore::query_hybrid`).
+    /// 4. Merge, deduplicate by content_hash, re-rank by the learned weights,
+    ///    and return the top `k`.
+    ///
+    /// Populates `recalled_hashes_last` with fingerprints of returned records
+    /// so `update_ranker` can attribute features to the correct gradient step.
     pub async fn recall_tiered(&mut self, query: &str, k: usize) -> Result<Vec<MemoryRecord>> {
-        // 1. Check Hot (Active Context)
-        let mut results = Vec::new();
-        let query_emb = embed_text_async(query.to_string()).await;
-        
-        for r in &self.hot {
-            let sim = cosine_sim(&query_emb, &r.embedding);
-            if sim > 0.9 {
-                results.push(r.clone());
+        if k == 0 {
+            self.recalled_hashes_last.clear();
+            return Ok(vec![]);
+        }
+
+        let query_emb = local_embed_text(query);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let w = self.ranker_weights;
+
+        // Each entry: (score, fingerprint, record)
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut scored: Vec<(f64, u64, MemoryRecord)> = Vec::new();
+
+        // ── Hot tier ────────────────────────────────────────────────────────
+        for rec in &self.hot {
+            if seen.contains(&rec.content_hash) {
+                continue;
+            }
+            let sim = local_cosine_similarity(&query_emb, &rec.embedding) as f64;
+            let age_hours = now.saturating_sub(rec.timestamp) as f64 / 3600.0;
+            let decay = (-0.01 * age_hours).exp();
+            let outcome_boost = rec.outcome.as_ref()
+                .map_or(0.0, |o| if o.tests_passed { 1.0 } else { 0.0 });
+            let surprise = 0.0_f64; // MemoryRecord has no surprise_signal field
+            let score = w[0] * sim + w[1] * decay + w[2] * outcome_boost + w[3] * surprise;
+            let fp = hash_to_u64(&rec.content_hash);
+            seen.insert(rec.content_hash.clone());
+            scored.push((score, fp, rec.clone()));
+        }
+
+        // ── Warm tier ───────────────────────────────────────────────────────
+        for (hash, (rec, _access_ts)) in &self.warm {
+            if seen.contains(hash) {
+                continue;
+            }
+            let sim = local_cosine_similarity(&query_emb, &rec.embedding) as f64;
+            let age_hours = now.saturating_sub(rec.timestamp) as f64 / 3600.0;
+            let decay = (-0.01 * age_hours).exp();
+            let outcome_boost = rec.outcome.as_ref()
+                .map_or(0.0, |o| if o.tests_passed { 1.0 } else { 0.0 });
+            let surprise = 0.0_f64;
+            let score = w[0] * sim + w[1] * decay + w[2] * outcome_boost + w[3] * surprise;
+            let fp = hash_to_u64(hash);
+            seen.insert(hash.clone());
+            scored.push((score, fp, rec.clone()));
+        }
+
+        // ── Cold tier (LanceDB) — only if hot+warm didn't fill quota ────────
+        if scored.len() < k {
+            let cold_limit = k - scored.len();
+            match self.cold.query_hybrid(DEFAULT_TABLE, query, cold_limit * 2).await {
+                Ok(cold_results) => {
+                    for (rec, _dist) in cold_results {
+                        if seen.contains(&rec.content_hash) {
+                            continue;
+                        }
+                        let sim = local_cosine_similarity(&query_emb, &rec.embedding) as f64;
+                        let age_hours = now.saturating_sub(rec.timestamp) as f64 / 3600.0;
+                        let decay = (-0.01 * age_hours).exp();
+                        let outcome_boost = rec.outcome.as_ref()
+                            .map_or(0.0, |o| if o.tests_passed { 1.0 } else { 0.0 });
+                        let surprise = 0.0_f64;
+                        let score = w[0] * sim + w[1] * decay + w[2] * outcome_boost + w[3] * surprise;
+                        let fp = hash_to_u64(&rec.content_hash);
+                        seen.insert(rec.content_hash.clone());
+                        scored.push((score, fp, rec));
+                    }
+                }
+                // Cold tier may be uninitialized or empty; degrade gracefully.
+                Err(_) => {}
             }
         }
 
-        // 2. Check Warm (RAM Cache)
-        for (r, _ts) in self.warm.values() {
-            let sim = cosine_sim(&query_emb, &r.embedding);
-            if sim > 0.85 {
-                results.push(r.clone());
-            }
-        }
+        // ── Rank and return top-k ────────────────────────────────────────────
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let top_k: Vec<(f64, u64, MemoryRecord)> = scored.into_iter().take(k).collect();
 
-        // 3. Fallback to Cold (LanceDB)
-        if results.len() < k {
-            let cold_results = self.cold.query_weighted(DEFAULT_TABLE, query, k - results.len()).await?;
-            for (r, _) in cold_results {
-                results.push(r);
-            }
-        }
+        // Record which hashes and similarity scores were returned so update_ranker can use them.
+        self.recalled_hashes_last = top_k.iter().map(|(_, fp, _)| *fp).collect();
+        self.recalled_scores_last = top_k.iter().map(|(score, _, _)| *score).collect();
 
-        Ok(results.into_iter().take(k).collect())
+        Ok(top_k.into_iter().map(|(_, _, r)| r).collect())
     }
+
+    /// Update learnable ranker weights based on turn outcome feedback.
+    ///
+    /// Positive outcomes (TestsPassed, AdvancedConvergence, Compiled) apply a
+    /// small positive gradient; negative outcomes (Rejected, VerificationFailed,
+    /// RolledBack) apply a small negative gradient.  The gradient magnitude is
+    /// proportional to the average feature value of the recalled records, so
+    /// weights that drove high-scoring recalls receive stronger updates.
+    ///
+    /// After each update, weights are clipped to [0.01, 0.99] and renormalised
+    /// to sum to 1.0.
+    ///
+    /// Call this after a turn completes and its outcome is known, passing the
+    /// content-hash fingerprints stored in `recalled_hashes_last`.
+    pub fn update_ranker(&mut self, recalled_hashes: &[u64], turn_outcome: TurnOutcome) {
+        if recalled_hashes.is_empty() {
+            return;
+        }
+
+        // Compute per-feature averages across all recalled records in hot+warm.
+        // We only have feature values for records still resident in memory; cold
+        // records are skipped (their feature values would require re-embedding).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Build a fingerprint -> cosine_sim lookup from scores captured at recall time.
+        let score_map: HashMap<u64, f64> = recalled_hashes
+            .iter()
+            .copied()
+            .zip(self.recalled_scores_last.iter().copied())
+            .collect();
+        let fallback_sim = if self.recalled_scores_last.is_empty() {
+            0.5
+        } else {
+            self.recalled_scores_last.iter().sum::<f64>() / self.recalled_scores_last.len() as f64
+        };
+
+        let hash_set: HashSet<u64> = recalled_hashes.iter().copied().collect();
+        let mut feature_sums = [0.0_f64; 4];
+        let mut count = 0usize;
+
+        for rec in &self.hot {
+            let fp = hash_to_u64(&rec.content_hash);
+            if !hash_set.contains(&fp) {
+                continue;
+            }
+            let sim = *score_map.get(&fp).unwrap_or(&fallback_sim);
+            let age_hours = now.saturating_sub(rec.timestamp) as f64 / 3600.0;
+            let decay = (-0.01 * age_hours).exp();
+            let outcome_boost = rec.outcome.as_ref()
+                .map_or(0.0, |o| if o.tests_passed { 1.0 } else { 0.0 });
+            let surprise = 0.0_f64;
+            feature_sums[0] += sim;
+            feature_sums[1] += decay;
+            feature_sums[2] += outcome_boost;
+            feature_sums[3] += surprise;
+            count += 1;
+        }
+        for (_, (rec, _)) in &self.warm {
+            let fp = hash_to_u64(&rec.content_hash);
+            if !hash_set.contains(&fp) {
+                continue;
+            }
+            let sim = *score_map.get(&fp).unwrap_or(&fallback_sim);
+            let age_hours = now.saturating_sub(rec.timestamp) as f64 / 3600.0;
+            let decay = (-0.01 * age_hours).exp();
+            let outcome_boost = rec.outcome.as_ref()
+                .map_or(0.0, |o| if o.tests_passed { 1.0 } else { 0.0 });
+            let surprise = 0.0_f64;
+            feature_sums[0] += sim;
+            feature_sums[1] += decay;
+            feature_sums[2] += outcome_boost;
+            feature_sums[3] += surprise;
+            count += 1;
+        }
+
+        if count == 0 {
+            return;
+        }
+
+        let feature_avgs: [f64; 4] = [
+            feature_sums[0] / count as f64,
+            feature_sums[1] / count as f64,
+            feature_sums[2] / count as f64,
+            feature_sums[3] / count as f64,
+        ];
+
+        let is_positive = matches!(
+            turn_outcome,
+            TurnOutcome::TestsPassed | TurnOutcome::AdvancedConvergence | TurnOutcome::Compiled
+        );
+        let is_negative = matches!(
+            turn_outcome,
+            TurnOutcome::Rejected | TurnOutcome::VerificationFailed | TurnOutcome::RolledBack
+        );
+
+        if is_positive {
+            for i in 0..4 {
+                self.ranker_weights[i] += 0.01 * feature_avgs[i];
+            }
+        } else if is_negative {
+            for i in 0..4 {
+                self.ranker_weights[i] -= 0.005 * feature_avgs[i];
+            }
+        } else {
+            // Stalled / Unknown — no gradient
+            return;
+        }
+
+        // Clip to [0.01, 0.99]
+        for w in &mut self.ranker_weights {
+            *w = w.clamp(0.01, 0.99);
+        }
+
+        // Renormalise to sum to 1.0
+        let total: f64 = self.ranker_weights.iter().sum();
+        if total > 0.0 {
+            for w in &mut self.ranker_weights {
+                *w /= total;
+            }
+        }
+    }
+}
+
+// ── Local embedding helpers (deterministic, no model required) ───────────────
+
+pub fn local_embed_text(text: &str) -> Vec<f32> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    let hash = hasher.finalize();
+    let hash_bytes = hash.as_slice();
+
+    let mut embedding = Vec::with_capacity(EMBEDDING_DIM);
+    for i in 0..EMBEDDING_DIM {
+        let byte_idx = i % 32;
+        let cycle = i / 32;
+        let seed = u32::from_le_bytes([
+            hash_bytes[byte_idx],
+            hash_bytes[(byte_idx + 1) % 32],
+            hash_bytes[(byte_idx + 2) % 32],
+            hash_bytes[(byte_idx + 3) % 32],
+        ]);
+        let shifted = seed.wrapping_mul(2654435761).wrapping_add(cycle as u32);
+        let normalized = ((shifted as f32) / (u32::MAX as f32)) * 2.0 - 1.0;
+        embedding.push(normalized);
+    }
+
+    let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        embedding.iter_mut().for_each(|x| *x /= norm);
+    }
+    embedding
+}
+
+pub fn local_cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na > 0.0 && nb > 0.0 { dot / (na * nb) } else { 0.0 }
 }

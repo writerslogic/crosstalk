@@ -37,6 +37,9 @@ thiserror = "2.0.18"
 tokio = { version = "1.51.0", features = ["full"] }
 tokio-util = { version = "0.7.13", features = ["codec"] }
 toml = "0.8.20"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
 tree-sitter = "0.24.7"
 tree-sitter-rust = "0.23.2"
 wasmtime = "29.0.1"
@@ -45,11 +48,16 @@ which = "7.0.1"
 wgpu = "24.0.1"
 winit = "0.30.9"
 bytemuck = { version = "1.21.0", features = ["derive"] }
-fastembed = { version = "3", default-features = false, features = ["online", "ort-load-dynamic"] }
-ort = { version = "=2.0.0-rc.4", features = ["coreml"] }
+fastembed = { version = "3", default-features = false, features = ["online", "ort-load-dynamic"], optional = true }
+ort = { version = "=2.0.0-rc.4", features = ["coreml"], optional = true }
 flate2 = "1.0"
+glob = "0.3"
 zeroize = { version = "1.8", features = ["derive"] }
 reqwest = { version = "0.12", features = ["json"] }
+
+[features]
+default = []
+ort-embeddings = ["dep:fastembed", "dep:ort"]
 
 [package.metadata.bundle]
 name = "Crosstalk"
@@ -79,3 +87,4 @@ lto = true
 strip = true
 panic = "abort"
 codegen-units = 1
+opt-level = 3
