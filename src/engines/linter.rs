@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use crate::engines::sandbox::SandboxResult;
 use crate::types::artifact::Artifact;
 use std::process::Command;
@@ -86,8 +86,11 @@ impl LinterGuard {
             return Ok(LintReport { passed: false, errors, ..Default::default() });
         }
 
+        let canonical_root = std::fs::canonicalize(workspace_root)
+            .with_context(|| format!("failed to canonicalize workspace root: {}", workspace_root))?;
+
         // Only run clippy if workspace has a Cargo.toml
-        if Path::new(workspace_root).join("Cargo.toml").exists() {
+        if canonical_root.join("Cargo.toml").exists() {
             let mut cmd = if let Some(env) = nix_env {
                 let mut c = Command::new("nix");
                 c.args(["develop", "-c", "cargo", "clippy", "--all-targets", "--", "-D", "warnings"]);
@@ -99,7 +102,7 @@ impl LinterGuard {
                 c
             };
 
-            let clippy = cmd.current_dir(workspace_root).output()?;
+            let clippy = cmd.current_dir(&canonical_root).output()?;
             if !clippy.status.success() {
                 errors.push(Diagnostic {
                     severity: Severity::Error,

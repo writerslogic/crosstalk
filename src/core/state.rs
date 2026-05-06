@@ -133,13 +133,14 @@ impl StateManager {
 /// Read the stored schema version, run any missing migrations in order, then
 /// write the current `SCHEMA_VERSION` so the check is idempotent on restart.
 fn run_migrations(db: &Db) -> Result<()> {
-    let stored: u64 = db
-        .get(SCHEMA_KEY)?
-        .and_then(|v| {
-            let arr: [u8; 8] = v.as_ref().try_into().ok()?;
-            Some(u64::from_le_bytes(arr))
-        })
-        .unwrap_or(0);
+    let stored: u64 = match db.get(SCHEMA_KEY)? {
+        None => 0,
+        Some(v) => {
+            let arr: [u8; 8] = v.as_ref().try_into()
+                .context("SCHEMA_KEY corrupted: invalid byte length")?;
+            u64::from_le_bytes(arr)
+        }
+    };
 
     if stored > SCHEMA_VERSION {
         bail!(

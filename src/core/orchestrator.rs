@@ -2548,6 +2548,7 @@ impl Orchestrator {
             .unwrap_or(rest);
         if candidate.contains('.')
             && !candidate.contains(' ')
+            && !candidate.contains("..")
             && !candidate.is_empty()
             && candidate.len() < 200
         {
@@ -2668,6 +2669,11 @@ impl Orchestrator {
                 .trim_start_matches("./")
                 .trim_start_matches('/')
                 .to_string();
+
+            if name.contains("..") {
+                i += 1;
+                continue;
+            }
 
             let content = content_lines.join("\n").trim_end().to_string();
             if !content.is_empty() {

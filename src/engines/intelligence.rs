@@ -4,7 +4,7 @@ use crate::types::self_improvement::CalibrationRecord;
 use anyhow::{Context, Result, anyhow};
 use sled;
 use dashmap::DashMap;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::{RwLock, mpsc};
@@ -354,11 +354,12 @@ impl IntelligenceEngine {
             ));
         }
 
+        let blacklist_set: HashSet<&str> = blacklist.iter().map(|s| s.as_str()).collect();
         let mut best_candidate: Option<&String> = None;
         let mut highest_sample = -1.0;
 
         for model_id in available_models {
-            if blacklist.contains(model_id) {
+            if blacklist_set.contains(model_id.as_str()) {
                 continue;
             }
 

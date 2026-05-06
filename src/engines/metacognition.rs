@@ -91,7 +91,8 @@ impl EpistemicState {
                     .trim_start_matches("ASSUMPTION:")
                     .trim()
                     .to_string();
-                if !claim.is_empty() {
+                const MAX_ASSUMPTIONS: usize = 20;
+                if !claim.is_empty() && state.assumptions.len() < MAX_ASSUMPTIONS {
                     state.assumptions.push(Assumption {
                         claim,
                         confidence: 0.7,

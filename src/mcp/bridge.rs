@@ -50,9 +50,9 @@ pub struct CliBridge;
 impl CliBridge {
     pub async fn call(binary: &str, args: Vec<String>, current_dir: &str) -> Result<ToolResult> {
         if binary.is_empty()
-            || !binary.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+            || !binary.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         {
-            return Err(anyhow::anyhow!("invalid binary name (must be [a-zA-Z0-9._-]+): {binary}"));
+            return Err(anyhow::anyhow!("invalid binary name (must be [a-zA-Z0-9_-]+): {binary}"));
         }
         let start = Instant::now();
 

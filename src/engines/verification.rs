@@ -171,7 +171,7 @@ impl ContinuousAuditor {
                         }
                         // Do NOT update last_hash; preserve last valid anchor
                     }
-                    Err(_) => {}
+                    Err(e) => { tracing::error!(error = %e, "hash chain computation failed"); }
                 }
             }
         });

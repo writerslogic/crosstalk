@@ -322,7 +322,7 @@ impl TopologyManager {
         ];
 
         (0..n_branches.min(directives.len()))
-            .map(|i| format!("{}\n\n[THOUGHT BRANCH {}]\n{}", base_prompt, i + 1, directives[i]))
+            .map(|i| format!("<context>\n{}\n</context>\n\n[THOUGHT BRANCH {}]\n{}", base_prompt, i + 1, directives[i]))
             .collect()
     }
 

@@ -488,7 +488,8 @@ fn sample_gamma(rng: &mut impl rand::Rng, shape: f64) -> f64 {
     }
     let d = shape - 1.0 / 3.0;
     let c = 1.0 / (9.0 * d).sqrt();
-    loop {
+    let mut best_dv = d * f64::EPSILON;
+    for _ in 0..1000 {
         let x: f64 = {
             let u1: f64 = rng.random();
             let u2: f64 = rng.random();
@@ -498,14 +499,17 @@ fn sample_gamma(rng: &mut impl rand::Rng, shape: f64) -> f64 {
         if v <= 0.0 {
             continue;
         }
+        best_dv = d * v;
         let u: f64 = rng.random();
         if u < 1.0 - 0.0331 * x.powi(4) {
-            return d * v;
+            return best_dv;
         }
         if u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) {
-            return d * v;
+            return best_dv;
         }
     }
+    // Iteration cap reached: return best approximation or shape as fallback.
+    if best_dv > d * f64::EPSILON { best_dv } else { shape }
 }
 
 // ── SwarmPremiumCalculator ────────────────────────────────────────────────────
