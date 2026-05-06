@@ -1,9 +1,9 @@
 use crosstalk::mcp::bridge::{CargoBridge, GitBridge};
-use crosstalk::mcp::gateway::{
-    McpGateway, McpResource, McpTool, PermissionError, PermissionManager, PermissionTier,
+use crosstalk::mcp::gateway::McpGateway;
+use crosstalk::types::mcp::{
+    JsonRpcRequest, McpResource, McpTool, PermissionError, PermissionManager, PermissionTier,
     TimeoutManager,
 };
-use crosstalk::mcp::transport::JsonRpcRequest;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -209,7 +209,7 @@ async fn test_agent_disabled_after_5_failures() {
     for _ in 0..5 {
         let _ = mgr.check_with_reason("bad_agent", "forbidden_tool", &serde_json::json!({}));
     }
-    assert!(mgr.disabled_agents.contains(&"bad_agent".to_string()));
+    assert!(mgr.disabled_agents.contains("bad_agent"));
 
     let result = mgr.check_with_reason("bad_agent", "git", &serde_json::json!({}));
     assert!(matches!(result, Err(PermissionError::AgentDisabled(_))));
@@ -548,4 +548,75 @@ async fn dispatch_tools_call_missing_tool_errors() {
         )
         .await;
     assert!(res.is_err());
+}
+
+// ── Python verification tool generation ──────────────────────────────────────
+
+#[test]
+fn python_artifact_generates_py_compile_command() {
+    // Verify py_compile argument shape matches what run_verification produces
+    let args_json = serde_json::json!({"args": ["-m", "py_compile", "script.py"]});
+    let args: Vec<String> = args_json["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    assert_eq!(args, vec!["-m", "py_compile", "script.py"]);
+}
+
+#[test]
+fn multiple_python_artifacts_each_get_py_compile() {
+    let python_files = vec!["app.py", "utils.py", "tests/test_main.py"];
+    let mut tool_sets: Vec<(&str, serde_json::Value)> = Vec::new();
+
+    for file in &python_files {
+        tool_sets.push((
+            "python3",
+            serde_json::json!({"args": ["-m", "py_compile", file]}),
+        ));
+    }
+
+    assert_eq!(tool_sets.len(), 3);
+    for (i, (cmd, args)) in tool_sets.iter().enumerate() {
+        assert_eq!(*cmd, "python3");
+        let argv = args["args"].as_array().unwrap();
+        assert_eq!(argv[0], "-m");
+        assert_eq!(argv[1], "py_compile");
+        assert_eq!(argv[2], python_files[i]);
+    }
+}
+
+#[test]
+fn rust_and_python_mixed_artifacts_produce_correct_tools() {
+    let has_rust = true;
+    let python_files = vec!["helper.py"];
+
+    let mut tool_sets: Vec<(&str, Vec<&str>)> = Vec::new();
+
+    if has_rust {
+        tool_sets.push(("cargo", vec!["check"]));
+        tool_sets.push(("cargo", vec!["test", "--no-fail-fast"]));
+    }
+    for file in &python_files {
+        tool_sets.push(("python3", vec!["-m", "py_compile", file]));
+    }
+
+    assert_eq!(tool_sets.len(), 3);
+    assert_eq!(tool_sets[0].0, "cargo");
+    assert_eq!(tool_sets[1].0, "cargo");
+    assert_eq!(tool_sets[2].0, "python3");
+    assert_eq!(tool_sets[2].1[2], "helper.py");
+}
+
+#[test]
+fn no_python_artifacts_produces_no_py_compile() {
+    let has_python = false;
+    let mut tool_sets: Vec<(&str, Vec<&str>)> = Vec::new();
+
+    if has_python {
+        tool_sets.push(("python3", vec!["-m", "py_compile", "script.py"]));
+    }
+
+    assert!(tool_sets.is_empty());
 }

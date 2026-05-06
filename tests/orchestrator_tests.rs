@@ -141,7 +141,7 @@ async fn test_orchestrator_captures_artifact_diffs() {
     let manager = StateManager::new(dir.path().to_str().expect("path")).expect("state manager");
     let agent: Box<dyn PromptAgent> = Box::new(MockAgent {
         name: "MockModel".to_string(),
-        response: "Here is a file:\n```rust:test.rs\nfn main() { println!(\"Hello\"); }\n```"
+        response: "Here is the implementation:\n```rust:test.rs\nfn main() { println!(\"Hello\"); }\n```"
             .to_string(),
     });
     let omicron = make_orchestrator(manager, vec![agent]).await;
@@ -150,12 +150,44 @@ async fn test_orchestrator_captures_artifact_diffs() {
     omicron.run_turn(sigma.clone()).await.expect("turn failed");
 
     let s = sigma.lock().await;
-    assert_eq!(s.artifacts.len(), 1);
-    let art = s.artifacts.get("test.rs").expect("artifact missing");
+    assert_eq!(s.artifacts.len(), 1, "expected 1 artifact, got {}", s.artifacts.len());
+    let art = s.artifacts.get("test.rs").expect("artifact 'test.rs' missing");
     assert_eq!(art.version, 1);
-    assert!(art.content.contains("fn main()"));
-    assert_eq!(s.turns[0].diffs.len(), 1);
-    assert_eq!(s.turns[0].diffs[0].0, "test.rs");
+    assert!(art.content.contains("fn main()"), "artifact content missing fn main(): {:?}", art.content);
+    assert!(!art.history.is_empty(), "artifact should have diff history");
+    assert_eq!(art.language, "rust");
+
+    // Turn should record the diff
+    assert!(!s.turns.is_empty(), "no turns recorded");
+    let turn = &s.turns[0];
+    assert_eq!(turn.diffs.len(), 1, "expected 1 diff, got {}", turn.diffs.len());
+    assert_eq!(turn.diffs[0].0, "test.rs");
+    assert!(turn.certainty.is_some(), "turn should have certainty score");
+    assert!(turn.signature.len() > 0, "turn should be signed");
+}
+
+#[tokio::test]
+async fn test_orchestrator_artifact_versioning() {
+    let dir = tempdir().expect("temp dir");
+    let manager = StateManager::new(dir.path().to_str().expect("path")).expect("state manager");
+    let agent: Box<dyn PromptAgent> = Box::new(MockAgent {
+        name: "MockModel".to_string(),
+        response: "Updated file:\n```rust:test.rs\nfn main() { println!(\"Updated\"); }\n```"
+            .to_string(),
+    });
+    let omicron = make_orchestrator(manager, vec![agent]).await;
+    let sigma = make_sigma("test-session");
+
+    // Two turns should increment artifact version
+    omicron.run_turn(sigma.clone()).await.expect("turn 1 failed");
+    omicron.run_turn(sigma.clone()).await.expect("turn 2 failed");
+
+    let s = sigma.lock().await;
+    if let Some(art) = s.artifacts.get("test.rs") {
+        assert!(art.version >= 1, "version should be at least 1 after two turns");
+        assert!(art.history.len() >= 1, "should have diff history entries");
+    }
+    assert!(s.turns.len() >= 2, "expected at least 2 turns, got {}", s.turns.len());
 }
 
 #[tokio::test]
@@ -417,7 +449,7 @@ fn test_surprise_signal_stored_in_turn_after_run() {
     let mut se = SurpriseEngine::new();
     se.record_prediction("m", 0.7);
     let s = se.compute_surprise("m", TurnOutcome::Compiled);
-    assert!(s >= 0.0 && s <= 1.0);
+    assert!((0.0..=1.0).contains(&s));
 }
 
 #[tokio::test]
@@ -450,7 +482,7 @@ async fn test_orchestrator_records_surprise_after_turn() {
     let se = omicron.surprise_engine.lock().await;
     assert_eq!(se.surprise_history("Collective Swarm").len(), 1);
     let surprise = se.surprise_history("Collective Swarm")[0];
-    assert!(surprise >= 0.0 && surprise <= 1.0);
+    assert!((0.0..=1.0).contains(&surprise));
 }
 
 // ── Track 10-B: PromptComposer, RegressionFeedbackHandler, template_cache ────
@@ -717,7 +749,9 @@ fn test_memory_bridge_open_session_tracks_count() {
     let mut bridge = MemoryBridge::new();
     bridge.open_session("sess-a".to_string());
     bridge.open_session("sess-b".to_string());
-    assert_eq!(bridge.session_count(), 2);
+    // Sessions exist and return empty snapshots
+    assert_eq!(bridge.take_snapshot("sess-a").len(), 0);
+    assert_eq!(bridge.take_snapshot("sess-b").len(), 0);
 }
 
 #[test]
@@ -726,8 +760,7 @@ fn test_memory_bridge_push_increments_record_count() {
     bridge.open_session("s1".to_string());
     bridge.push_record("s1", make_record(1, "s1", "fn foo() {}", false));
     bridge.push_record("s1", make_record(2, "s1", "fn bar() {}", true));
-    assert_eq!(bridge.record_count("s1"), 2);
-    assert_eq!(bridge.total_record_count(), 2);
+    assert_eq!(bridge.take_snapshot("s1").len(), 2);
 }
 
 #[tokio::test]
@@ -771,7 +804,7 @@ async fn test_memory_bridge_ranking_prefers_tests_passed() {
         results[0]
             .outcome
             .as_ref()
-            .map_or(false, |o| o.tests_passed),
+            .is_some_and(|o| o.tests_passed),
         "record with tests_passed should rank first"
     );
 }
@@ -822,8 +855,10 @@ fn test_memory_bridge_snapshot_and_index_round_trip() {
     assert_eq!(snapshot.len(), 1);
 
     bridge.open_session("restored".to_string());
-    bridge.index_snapshot("restored", snapshot);
-    assert_eq!(bridge.record_count("restored"), 1);
+    for rec in snapshot {
+        bridge.push_record("restored", rec);
+    }
+    assert_eq!(bridge.take_snapshot("restored").len(), 1);
 }
 
 #[test]
@@ -835,9 +870,8 @@ fn test_memory_bridge_concurrent_sessions_isolated() {
     bridge.push_record("sess-x", make_record(2, "sess-x", "x content 2", false));
     bridge.push_record("sess-y", make_record(3, "sess-y", "y content", true));
 
-    assert_eq!(bridge.record_count("sess-x"), 2);
-    assert_eq!(bridge.record_count("sess-y"), 1);
-    assert_eq!(bridge.total_record_count(), 3);
+    assert_eq!(bridge.take_snapshot("sess-x").len(), 2);
+    assert_eq!(bridge.take_snapshot("sess-y").len(), 1);
 }
 
 #[tokio::test]
@@ -854,7 +888,7 @@ async fn test_orchestrator_memory_bridge_populated_after_turn() {
     omicron.run_turn(sigma.clone()).await.expect("turn failed");
 
     let bridge = omicron.memory_bridge.lock().await;
-    assert_eq!(bridge.record_count("mem-session"), 1, "one record per turn");
+    assert_eq!(bridge.take_snapshot("mem-session").len(), 1, "one record per turn");
 }
 
 #[tokio::test]
@@ -882,7 +916,7 @@ async fn test_orchestrator_cross_session_recall_returns_examples() {
 
     let bridge = omicron.memory_bridge.lock().await;
     assert!(
-        bridge.total_record_count() >= 2,
+        bridge.take_snapshot("prior-session").len() + bridge.take_snapshot("new-session").len() >= 2,
         "both sessions should contribute records"
     );
 }

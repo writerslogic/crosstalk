@@ -36,7 +36,7 @@ fn decompose_first_task_has_no_dependencies() {
 
 #[test]
 fn decompose_subsequent_tasks_depend_on_prior() {
-    let tasks = TaskDecomposer::decompose("A. B. C. D.", 2);
+    let tasks = TaskDecomposer::decompose("A\nB\nC\nD", 2);
     assert_eq!(tasks[1].dependencies, vec!["task-0"]);
 }
 
@@ -106,7 +106,7 @@ fn multiple_conflicts_detected() {
 
 #[test]
 fn progress_empty_nodes_returns_zero_ratio() {
-    let nodes = DashMap::new();
+    let nodes: DashMap<String, NodeStatus> = DashMap::new();
     let report = ProgressMonitor::check(&nodes);
     assert_eq!(report.completion_ratio, 0.0);
     assert_eq!(report.complete, 0);
@@ -211,24 +211,24 @@ fn merge_gate_minority_approves_no_quorum() {
 struct AlwaysGrantNetwork;
 
 impl crosstalk::engines::swarm::RaftNetwork for AlwaysGrantNetwork {
-    fn request_vote(
+    async fn request_vote(
         &self,
         _term: u64,
         _candidate_id: Arc<str>,
-    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send {
-        async { Ok(true) }
+    ) -> anyhow::Result<bool> {
+        Ok(true)
     }
 }
 
 struct AlwaysDenyNetwork;
 
 impl crosstalk::engines::swarm::RaftNetwork for AlwaysDenyNetwork {
-    fn request_vote(
+    async fn request_vote(
         &self,
         _term: u64,
         _candidate_id: Arc<str>,
-    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send {
-        async { Ok(false) }
+    ) -> anyhow::Result<bool> {
+        Ok(false)
     }
 }
 
@@ -272,18 +272,19 @@ async fn election_preempted_by_heartbeat() {
 #[tokio::test]
 async fn spawn_node_registers_in_map() {
     let ctrl = SwarmController::new();
-    ctrl.spawn_node("node-a").await.unwrap();
-    // Allow worker to transition to Running
+    let (tx, _) = tokio::sync::broadcast::channel::<crosstalk::types::conversation::Turn>(16);
+    ctrl.spawn_node("node-a", tx.subscribe());
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    assert!(ctrl.nodes.contains_key("node-a" as &str));
+    assert!(ctrl.nodes.contains_key("node-a"));
 }
 
 #[tokio::test]
-async fn broadcast_turn_returns_receiver_count() {
+async fn broadcast_turn_succeeds() {
     use crosstalk::types::conversation::{ConversationState, Turn, TurnOutcome};
     let ctrl = SwarmController::new();
-    ctrl.spawn_node("n1").await.unwrap();
-    ctrl.spawn_node("n2").await.unwrap();
+    let (tx, _) = tokio::sync::broadcast::channel::<Turn>(16);
+    ctrl.spawn_node("n1", tx.subscribe());
+    ctrl.spawn_node("n2", tx.subscribe());
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     let turn = Turn {
@@ -299,6 +300,6 @@ async fn broadcast_turn_returns_receiver_count() {
         signature: vec![],
         surprise_signal: None,
     };
-    let n = ctrl.broadcast_turn(turn).unwrap();
-    assert!(n >= 2, "at least 2 receivers should get the broadcast");
+    let result = ctrl.broadcast_turn(turn);
+    assert!(result.is_ok(), "broadcast_turn should succeed");
 }

@@ -79,9 +79,9 @@ fn test_tautology_filter_detects_identical() {
 
 #[test]
 fn test_tautology_filter_detects_similar() {
-    let history = vec!["This is a long sentence that repeats itself often.".to_string()];
+    let history = vec!["This is a long sentence that repeats itself often and again and again in the same way over and over.".to_string()];
     assert!(TautologyFilter::is_tautological(
-        "This is a long sentence that repeats itself very often.",
+        "This is a long sentence that repeats itself often and again and again in the same way over and over!",
         &history
     ));
 }

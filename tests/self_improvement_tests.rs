@@ -3,8 +3,9 @@ use crosstalk::engines::self_improvement::{
     PromptEvolutionaryOptimizer, RuntimeParameterAdjuster, SafetyInterlock, SelfCodeModifier,
     SelfEvaluationTrendAnalyzer, SelfImprovementEngine,
 };
-use crosstalk::types::conversation::{ConversationState, Turn, TurnOutcome};
-use crosstalk::types::self_improvement::{CalibrationRecord, PromptTemplate, SessionEvaluation};
+use crosstalk::types::conversation::{ConversationState, TaskCategory, Turn, TurnOutcome};
+use crosstalk::types::intelligence::PromptTemplate;
+use crosstalk::types::self_improvement::{CalibrationRecord, SessionEvaluation};
 use std::collections::BTreeMap;
 
 fn make_sigma(session_id: &str) -> ConversationState {
@@ -91,8 +92,10 @@ fn prompt_optimizer_mutates_correctly() {
     let parent = PromptTemplate {
         id: "p1".to_string(),
         version: 1,
-        content: "Hello".to_string(),
-        task_types: vec!["t1".to_string()],
+        template_text: "Hello".to_string(),
+        task_category: TaskCategory::General,
+        variables: vec![],
+        tags: vec!["t1".to_string()],
         performance_history: vec![],
     };
     let variants = PromptEvolutionaryOptimizer::generate_variants(&parent);

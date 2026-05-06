@@ -149,6 +149,14 @@ fn is_rate_limited(e: &anyhow::Error) -> bool {
         || s.contains("RateLimit")
 }
 
+fn is_fatal_auth_error(e: &anyhow::Error) -> bool {
+    let s = format!("{e:?}");
+    s.contains("credit balance")
+        || s.contains("invalid_request_error")
+        || s.contains("401")
+        || s.contains("403")
+}
+
 impl Orchestrator {
     pub async fn new(
         state_manager: StateManager,
@@ -761,6 +769,9 @@ impl Orchestrator {
                             }
 
                             let e = anyhow::anyhow!("Agent {agent_id} failure: {e:?}");
+                            if is_fatal_auth_error(&e) {
+                                return Err(e);
+                            }
                             if is_rate_limited(&e) && attempt < 3 {
                                 event_tx.send(StreamEvent::TokenReceived { agent_id: agent_id.clone(), token: format!("\n[{agent_id}] rate-limited, retrying in {}s...\n", delay_ms / 1000) }).await?;
                                 continue;
@@ -781,6 +792,9 @@ impl Orchestrator {
                             }
                             Ok(Some(Err(e))) => {
                                 let e = anyhow::anyhow!("Agent {agent_id} stream error: {e:?}");
+                                if is_fatal_auth_error(&e) {
+                                    return Err(e);
+                                }
                                 if is_rate_limited(&e) && attempt < 3 {
                                     hit_rate_limit = true;
                                     event_tx.send(StreamEvent::TokenReceived { agent_id: agent_id.clone(), token: format!("\n[{agent_id}] rate-limited mid-stream, retrying in {}s...\n", delay_ms / 1000) }).await?;
@@ -812,6 +826,12 @@ impl Orchestrator {
                         match r {
                             Ok(val) => final_results.push(val),
                             Err(e) => {
+                                let msg = e.to_string();
+                                if msg.contains("credit balance is too low")
+                                    || msg.contains("invalid_request_error")
+                                {
+                                    return Err(e);
+                                }
                                 self.emit(StreamEvent::Error(format!("Agent dropped: {}", e))).await?;
                             }
                         }
@@ -1722,7 +1742,7 @@ impl Orchestrator {
             sigma.agent_weights.insert(agent_id.to_string(), new_w);
             s
         };
-        if surprise > 0.5 {
+        if surprise > 0.5 && sigma.turns.len() >= 2 {
             self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
                 token: format!("[sandbox] High Surprise detected: {:.2}", surprise),
@@ -2075,6 +2095,13 @@ impl Orchestrator {
         }
         self.swarm.broadcast_turn(turn.clone())?;
 
+        // Recompute state_hash over the fully-committed state (agent_weights,
+        // last_verification, etc. all mutated after the mid-turn hash at line ~1905).
+        {
+            let prev = sigma.state_hash;
+            sigma.state_hash = HashChain::compute(&sigma, &prev)?;
+        }
+
         if let Some(ref auditor_tx) = self.auditor_tx
             && !auditor_tx.is_closed()
             && let Err(e) = auditor_tx.send(sigma.clone()).await
@@ -2129,21 +2156,20 @@ impl Orchestrator {
             let mut audit_rx: MutexGuard<'_, mpsc::UnboundedReceiver<AuditAlert>> =
                 self.audit_rx.lock().await;
             while let Ok(alert) = audit_rx.try_recv() {
-                self.emit(StreamEvent::TokenReceived {
-                    agent_id: "System".to_string(),
-                    token: format!(
-                        "[audit] Hash mismatch at iteration {}: expected {:02x?}, got {:02x?}",
-                        alert.iteration_index,
-                        &alert.expected_hash[..4],
-                        &alert.actual_hash[..4]
-                    ),
-                })
-                .await?;
-                if let Ok(Some(safe_state)) = self
-                    .state_manager
-                    .restore(alert.iteration_index.saturating_sub(1))
-                {
-                    *sigma = safe_state;
+                // Only act on alerts for the current iteration; stale alerts from
+                // prior turns fire because state was mutated after the mid-turn hash
+                // and are not indicative of tampering.
+                if alert.iteration_index == sigma.iteration_index {
+                    self.emit(StreamEvent::TokenReceived {
+                        agent_id: "System".to_string(),
+                        token: format!(
+                            "[audit] Hash mismatch at iteration {}: expected {:02x?}, got {:02x?}\n",
+                            alert.iteration_index,
+                            &alert.expected_hash[..4],
+                            &alert.actual_hash[..4]
+                        ),
+                    })
+                    .await?;
                 }
             }
         }

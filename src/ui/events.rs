@@ -1,6 +1,7 @@
 use crate::types::events::{ControlSignal, StreamEvent};
 use crate::ui::app::{App, AppMode};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use std::collections::HashMap;
 use std::io::Write;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -13,15 +14,40 @@ pub enum Action {
 }
 
 fn log_event(ev: &StreamEvent) {
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/crosstalk.log") {
-        let ts = chrono::Local::now().format("%H:%M:%S%.3f");
-        match ev {
-            StreamEvent::TokenReceived { agent_id, token } => {
-                let trimmed = token.trim();
-                if !trimmed.is_empty() {
-                    crate::log_warn!(writeln!(f, "{ts} [{agent_id}] {trimmed}"), "failed to write log event");
+    let ts = chrono::Local::now().format("%H:%M:%S%.3f");
+
+    if let StreamEvent::TokenReceived { agent_id, token } = ev {
+        thread_local! {
+            static BUF: std::cell::RefCell<HashMap<String, String>> =
+                std::cell::RefCell::new(HashMap::new());
+        }
+        let lines: Vec<String> = BUF.with(|b| {
+            let mut map = b.borrow_mut();
+            let entry = map.entry(agent_id.clone()).or_default();
+            entry.push_str(token);
+            let mut out = Vec::new();
+            while let Some(pos) = entry.find('\n') {
+                let line = entry[..pos].trim().to_string();
+                if !line.is_empty() {
+                    out.push(format!("{ts} [{agent_id}] {line}"));
+                }
+                *entry = entry[pos + 1..].to_string();
+            }
+            out
+        });
+        if !lines.is_empty() {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/crosstalk.log") {
+                for line in lines {
+                    crate::log_warn!(writeln!(f, "{line}"), "failed to write log event");
                 }
             }
+        }
+        return;
+    }
+
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/crosstalk.log") {
+        match ev {
+            StreamEvent::TokenReceived { .. } => unreachable!(),
             StreamEvent::TurnComplete(turn) => {
                 crate::log_warn!(writeln!(
                     f, "{ts} [TURN] i_{} by {} outcome={:?} cert={:.2} diffs={}",

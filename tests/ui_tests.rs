@@ -1,4 +1,5 @@
 use crosstalk::types::conversation::{TaskCategory, Turn, TurnOutcome, TurnStructure};
+use crosstalk::types::events::ArtifactSnapshot;
 use crosstalk::ui::app::{App, AppMode};
 use crosstalk::ui::render;
 use crosstalk::ui::visualization::{HeatmapGenerator, ThemeEngine};
@@ -60,8 +61,12 @@ fn draw_does_not_panic_on_full_state() {
         app.push_event(format!("event {i}"));
     }
     for i in 0..5 {
-        app.artifacts
-            .push((format!("artifact_{i}"), format!("v{i}")));
+        app.artifacts.push(ArtifactSnapshot {
+            name: format!("artifact_{i}"),
+            skeleton: format!("v{i}"),
+            version: i,
+            diff_count: 0,
+        });
     }
     app.agent_weights.insert("agent-a".to_string(), 0.84);
     app.agent_weights.insert("agent-b".to_string(), 1.2);

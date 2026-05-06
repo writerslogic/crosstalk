@@ -95,9 +95,15 @@ fn test_reasoning_scorer_detects_evidence() {
 #[test]
 fn test_structure_selector_prefers_step_by_step_for_complex_tasks() {
     let selector = StructureSelector::new();
-    let s = selector.recommend(TaskCategory::Architecture, "m1");
-    // Initially should be FreeForm if no history
-    assert_eq!(s, TurnStructure::FreeForm);
+    // Run multiple times; Architecture should predominantly yield StepByStep
+    let mut step_count = 0;
+    for _ in 0..20 {
+        let s = selector.recommend(TaskCategory::Architecture, "m1");
+        if s == TurnStructure::StepByStep {
+            step_count += 1;
+        }
+    }
+    assert!(step_count >= 10, "StepByStep should dominate for Architecture tasks, got {}/20", step_count);
 }
 
 #[test]

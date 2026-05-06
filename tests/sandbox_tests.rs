@@ -2,7 +2,6 @@ use crosstalk::engines::sandbox::{SandboxConfig, SandboxManager};
 use crosstalk::engines::simulation::MonteCarloRunner;
 use crosstalk::engines::validation::{AstValidator, AstVersionHistory};
 use crosstalk::types::artifact::Artifact;
-use crosstalk::types::conversation::ConversationState;
 use std::collections::HashMap;
 
 // Invalid WASM bytes for testing error handling
@@ -10,20 +9,18 @@ fn invalid_wasm_bytes() -> Vec<u8> {
     vec![0xFF, 0xFF, 0xFF, 0xFF]
 }
 
-#[tokio::test]
-async fn test_sandbox_fuel_limit() {
-    let manager = SandboxManager::new().expect("Failed to create SandboxManager");
-
+#[test]
+fn test_sandbox_fuel_limit() {
     let config = SandboxConfig {
         memory_limit_bytes: 1024 * 1024,
-        fuel_limit: 100, // Very low fuel limit
-        output_buffer_bytes: 1024 * 1024,
-        entry_point: None,
+        cpu_fuel_limit: 100,
+        ..Default::default()
     };
+    let manager = SandboxManager::new(config).expect("Failed to create SandboxManager");
 
     let wasm_bytes = invalid_wasm_bytes();
 
-    let result = manager.execute(&wasm_bytes, &config).await;
+    let result = manager.execute(&wasm_bytes);
 
     // Invalid WASM should produce an error
     assert!(
@@ -32,39 +29,35 @@ async fn test_sandbox_fuel_limit() {
     );
 }
 
-#[tokio::test]
-async fn test_sandbox_memory_limit() {
-    let manager = SandboxManager::new().expect("Failed to create SandboxManager");
-
+#[test]
+fn test_sandbox_memory_limit() {
     let config = SandboxConfig {
-        memory_limit_bytes: 1024, // 1KB memory limit
-        fuel_limit: 10_000_000,
-        output_buffer_bytes: 1024 * 1024,
-        entry_point: None,
+        memory_limit_bytes: 1024,
+        cpu_fuel_limit: 10_000_000,
+        ..Default::default()
     };
+    let manager = SandboxManager::new(config).expect("Failed to create SandboxManager");
 
     let wasm_bytes = invalid_wasm_bytes();
 
-    let result = manager.execute(&wasm_bytes, &config).await;
+    let result = manager.execute(&wasm_bytes);
 
     // Invalid WASM with memory limit should produce an error
     assert!(result.is_err(), "Invalid WASM should fail");
 }
 
-#[tokio::test]
-async fn test_sandbox_stdout_capture() {
-    let manager = SandboxManager::new().expect("Failed to create SandboxManager");
-
+#[test]
+fn test_sandbox_stdout_capture() {
     let config = SandboxConfig {
         memory_limit_bytes: 1024 * 1024,
-        fuel_limit: 10_000_000,
-        output_buffer_bytes: 1024 * 1024,
-        entry_point: None,
+        cpu_fuel_limit: 10_000_000,
+        ..Default::default()
     };
+    let manager = SandboxManager::new(config).expect("Failed to create SandboxManager");
 
     let wasm_bytes = invalid_wasm_bytes();
 
-    let result = manager.execute(&wasm_bytes, &config).await;
+    let result = manager.execute(&wasm_bytes);
 
     // Test that SandboxResult structure is available
     // Even with invalid WASM, if execution happens, stdout should be captured
@@ -110,7 +103,7 @@ async fn test_monte_carlo_trials() {
 
     // Probability should be between 0.0 and 1.0
     assert!(
-        probability >= 0.0 && probability <= 1.0,
+        (0.0..=1.0).contains(&probability),
         "Probability {probability} should be in [0.0, 1.0]"
     );
 }
@@ -147,8 +140,8 @@ async fn test_monte_carlo_variance() {
         .await
         .expect("predict failed");
 
-    assert!(result1 >= 0.0 && result1 <= 1.0);
-    assert!(result2 >= 0.0 && result2 <= 1.0);
+    assert!((0.0..=1.0).contains(&result1));
+    assert!((0.0..=1.0).contains(&result2));
     assert!(result1.is_finite(), "result1 should be finite");
     assert!(result2.is_finite(), "result2 should be finite");
 }
@@ -335,53 +328,23 @@ fn diff_nodes_identical_versions_has_no_changes() {
     );
 }
 
-// ── execute_with_rollback ─────────────────────────────────────────────────────
+// ── SandboxManager with valid WASM ──────────────────────────────────────────
 
-#[tokio::test]
-async fn execute_with_rollback_returns_snapshot_on_invalid_wasm() {
-    let manager = SandboxManager::new().unwrap();
-    let snapshot = ConversationState::new("snap-session");
+#[test]
+fn execute_returns_error_on_invalid_wasm() {
     let config = SandboxConfig {
         memory_limit_bytes: 1024 * 1024,
-        fuel_limit: 10_000_000,
-        output_buffer_bytes: 1024 * 1024,
-        entry_point: None,
+        cpu_fuel_limit: 10_000_000,
+        ..Default::default()
     };
-    let (result, rollback) = manager
-        .execute_with_rollback(&[0xFF, 0xFF], &config, &snapshot)
-        .await
-        .unwrap();
-    assert!(result.exit_code != 0);
-    assert!(rollback.is_some());
-    assert_eq!(rollback.unwrap().session_id, "snap-session");
+    let manager = SandboxManager::new(config).unwrap();
+    let result = manager.execute(&[0xFF, 0xFF]);
+    assert!(result.is_err());
 }
 
-#[tokio::test]
-async fn execute_with_rollback_rollback_is_none_on_success() {
-    // A minimal valid WASM module that immediately returns (empty _start).
-    // WAT: (module (func (export "_start")))
-    let wasm_bytes: Vec<u8> = vec![
-        0x00, 0x61, 0x73, 0x6D, // magic
-        0x01, 0x00, 0x00, 0x00, // version
-        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type section: () -> ()
-        0x03, 0x02, 0x01, 0x00, // function section
-        0x07, 0x0A, 0x01, 0x06, 0x5F, 0x73, 0x74, 0x61, 0x72, 0x74, 0x00,
-        0x00, // export "_start"
-        0x0A, 0x04, 0x01, 0x02, 0x00, 0x0B, // code section: empty body
-    ];
-    let manager = SandboxManager::new().unwrap();
-    let snapshot = ConversationState::new("success-session");
-    let config = SandboxConfig {
-        memory_limit_bytes: 1024 * 1024,
-        fuel_limit: 10_000_000,
-        output_buffer_bytes: 1024 * 1024,
-        entry_point: None,
-    };
-    let (_result, rollback) = manager
-        .execute_with_rollback(&wasm_bytes, &config, &snapshot)
-        .await
-        .unwrap();
-    // Either success (rollback=None) or compilation failure (rollback=Some).
-    // We can't guarantee the WASM is valid as a WASI component, so just assert the API works.
-    let _ = rollback;
+#[test]
+fn default_sandbox_config_has_reasonable_limits() {
+    let config = SandboxConfig::default();
+    assert!(config.memory_limit_bytes > 0);
+    assert!(config.cpu_fuel_limit > 0);
 }

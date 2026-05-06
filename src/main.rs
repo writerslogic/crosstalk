@@ -100,6 +100,12 @@ fn is_likely_text(path: &std::path::Path) -> bool {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load ~/.env then .env (project-local), silently ignoring missing files.
+    if let Ok(home) = std::env::var("HOME") {
+        let _ = dotenv::from_path(std::path::Path::new(&home).join(".env"));
+    }
+    let _ = dotenv::dotenv();
+
     // 0. Initialize structured logging -- one file per run, old logs wiped
     let log_dir = std::env::var("XDG_STATE_HOME")
         .unwrap_or_else(|_| {

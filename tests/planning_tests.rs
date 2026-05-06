@@ -344,7 +344,7 @@ fn context_pruner_returns_recent_turns() {
     for i in 0u32..20 {
         sigma.turns.push(make_turn(i, TurnOutcome::Unknown));
     }
-    let pruned = ContextPruner::prune(&sigma, "root", 5);
+    let pruned = ContextPruner::prune_sovereign(&sigma, "root", 5);
     assert!(
         pruned.len() <= 5 + 5,
         "should return at most max_turns + 5 critical"
@@ -354,7 +354,7 @@ fn context_pruner_returns_recent_turns() {
 #[test]
 fn context_pruner_empty_state_returns_empty() {
     let sigma = ConversationState::new("empty");
-    let pruned = ContextPruner::prune(&sigma, "root", 10);
+    let pruned = ContextPruner::prune_sovereign(&sigma, "root", 10);
     assert!(pruned.is_empty());
 }
 
@@ -367,7 +367,7 @@ fn context_pruner_reduces_by_more_than_50_percent() {
         sigma.turns.push(make_turn(i, TurnOutcome::Unknown));
     }
     let total = sigma.turns.len();
-    let pruned = ContextPruner::prune(&sigma, "nonexistent-goal", 5);
+    let pruned = ContextPruner::prune_sovereign(&sigma, "nonexistent-goal", 5);
     assert!(
         pruned.len() * 2 <= total,
         "pruned {} of {} turns — must reduce by >50%",

@@ -135,6 +135,8 @@ pub struct TopologyManager {
     recent_quality: std::collections::VecDeque<f64>,
     /// Recent turn outcomes for pattern detection (capped at 8).
     recent_outcomes: std::collections::VecDeque<TurnOutcome>,
+    /// Turn index at which the last shift occurred; used to enforce dwell time.
+    last_shift_turn: u32,
 }
 
 impl TopologyManager {
@@ -148,6 +150,7 @@ impl TopologyManager {
             agent_count,
             recent_quality: std::collections::VecDeque::with_capacity(8),
             recent_outcomes: std::collections::VecDeque::with_capacity(8),
+            last_shift_turn: 0,
         }
     }
 
@@ -283,6 +286,7 @@ impl TopologyManager {
         self.history.push((turn_idx, new, reason));
         self.current = new;
         self.deadlock_counter = 0;
+        self.last_shift_turn = turn_idx;
 
         self.build_directive(new)
     }
@@ -294,6 +298,9 @@ impl TopologyManager {
         sigma: &ConversationState,
         turn_idx: u32,
     ) -> Option<TopologyDirective> {
+        if turn_idx.saturating_sub(self.last_shift_turn) < 2 {
+            return None;
+        }
         let recommended = self.recommend_topology(sigma);
         if recommended == self.current {
             return None;

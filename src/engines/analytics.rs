@@ -232,19 +232,29 @@ impl StrategyRecommender {
             return recs;
         }
 
-        let success_rate = sigma
+        // Only count completed turns (not Unknown/dropped) to avoid credit errors and
+        // agent drops inflating the failure rate before we have meaningful signal.
+        let completed = sigma
             .turns
             .iter()
-            .filter(|t| matches!(t.outcome, TurnOutcome::TestsPassed | TurnOutcome::Compiled))
-            .count() as f64
-            / n as f64;
+            .filter(|t| !matches!(t.outcome, TurnOutcome::Unknown))
+            .count();
 
-        if success_rate < 0.4 {
-            recs.push(Recommendation {
-                action: "switch_to_critique_protocol".to_string(),
-                expected_impact: 0.25,
-                confidence: 0.7,
-            });
+        if completed >= 3 {
+            let success_rate = sigma
+                .turns
+                .iter()
+                .filter(|t| matches!(t.outcome, TurnOutcome::TestsPassed | TurnOutcome::Compiled))
+                .count() as f64
+                / completed as f64;
+
+            if success_rate < 0.4 {
+                recs.push(Recommendation {
+                    action: "switch_to_critique_protocol".to_string(),
+                    expected_impact: 0.25,
+                    confidence: 0.7,
+                });
+            }
         }
 
         if n > 15 && sigma.completion_probability < 0.6 {

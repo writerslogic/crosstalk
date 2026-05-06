@@ -289,3 +289,122 @@ fn dead_code_detector_flags_unused_import() {
             .any(|i| i.name == "HashMap" && i.kind == DeadItemKind::UnusedImport)
     );
 }
+
+// ── RegressionDetector edge cases ────────────────────────────────────────────
+
+#[test]
+fn regression_detector_zero_old_complexity_no_regression() {
+    let old = ArtifactMetrics {
+        cyclomatic_complexity: 0,
+        ..Default::default()
+    };
+    let new = ArtifactMetrics {
+        cyclomatic_complexity: 5,
+        ..Default::default()
+    };
+    // When old complexity is 0, percentage increase is treated as 0.0
+    assert!(!RegressionDetector::is_regressive(&old, &new));
+}
+
+#[test]
+fn regression_detector_identical_metrics_not_regressive() {
+    let m = ArtifactMetrics {
+        cyclomatic_complexity: 10,
+        coupling_factor: 3,
+        comment_density: 0.25,
+        line_count: 200,
+        health_score: 0.85,
+    };
+    assert!(!RegressionDetector::is_regressive(&m, &m));
+}
+
+#[test]
+fn regression_detector_zero_to_zero_not_regressive() {
+    let m = ArtifactMetrics::default();
+    assert!(!RegressionDetector::is_regressive(&m, &m));
+}
+
+#[test]
+fn regression_detector_health_score_drop_triggers() {
+    let old = ArtifactMetrics {
+        health_score: 0.9,
+        ..Default::default()
+    };
+    let new = ArtifactMetrics {
+        health_score: 0.8,
+        ..Default::default()
+    };
+    // 0.1 drop exceeds 0.05 threshold
+    assert!(RegressionDetector::is_regressive(&old, &new));
+}
+
+#[test]
+fn regression_detector_health_score_small_drop_ok() {
+    let old = ArtifactMetrics {
+        health_score: 0.9,
+        ..Default::default()
+    };
+    let new = ArtifactMetrics {
+        health_score: 0.86,
+        ..Default::default()
+    };
+    // 0.04 drop is below 0.05 threshold
+    assert!(!RegressionDetector::is_regressive(&old, &new));
+}
+
+#[test]
+fn regression_detector_comment_density_boundary() {
+    let old = ArtifactMetrics {
+        comment_density: 0.30,
+        ..Default::default()
+    };
+    let just_below = ArtifactMetrics {
+        comment_density: 0.16,
+        ..Default::default()
+    };
+    let just_above = ArtifactMetrics {
+        comment_density: 0.14,
+        ..Default::default()
+    };
+    // 0.14 drop is < 0.15 threshold
+    assert!(!RegressionDetector::is_regressive(&old, &just_below));
+    // 0.16 drop exceeds 0.15 threshold
+    assert!(RegressionDetector::is_regressive(&old, &just_above));
+}
+
+#[test]
+fn regression_detector_complexity_boundary_20_percent() {
+    let old = ArtifactMetrics {
+        cyclomatic_complexity: 10,
+        ..Default::default()
+    };
+    let at_20 = ArtifactMetrics {
+        cyclomatic_complexity: 12,
+        ..Default::default()
+    };
+    let over_20 = ArtifactMetrics {
+        cyclomatic_complexity: 13,
+        ..Default::default()
+    };
+    // 20% increase is at boundary (not strictly >)
+    assert!(!RegressionDetector::is_regressive(&old, &at_20));
+    // 30% increase exceeds 20% threshold
+    assert!(RegressionDetector::is_regressive(&old, &over_20));
+}
+
+#[test]
+fn regression_detector_improvement_not_regressive() {
+    let old = ArtifactMetrics {
+        cyclomatic_complexity: 20,
+        comment_density: 0.1,
+        health_score: 0.5,
+        ..Default::default()
+    };
+    let new = ArtifactMetrics {
+        cyclomatic_complexity: 10,
+        comment_density: 0.3,
+        health_score: 0.9,
+        ..Default::default()
+    };
+    assert!(!RegressionDetector::is_regressive(&old, &new));
+}

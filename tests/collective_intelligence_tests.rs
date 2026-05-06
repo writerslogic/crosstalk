@@ -111,7 +111,7 @@ fn ensemble_merge_selects_best_paragraphs() {
             0.9,
         ),
     ];
-    let merged = EnsembleEngine::merge_proposals(proposals);
+    let merged = EnsembleEngine::merge_proposals(proposals, TaskCategory::Research, "");
     assert!(merged.contains("Para 1 from m2"));
     assert!(merged.contains("Para 2 from m2"));
 }

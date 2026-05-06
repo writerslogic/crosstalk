@@ -377,7 +377,7 @@ fn compute_payoff_matrix_has_correct_dimensions() {
     let a = empty_artifact("a");
     let b = empty_artifact("b");
     let c = empty_artifact("c");
-    let proposals = vec![("ag1", &a), ("ag2", &b), ("ag3", &c)];
+    let proposals = vec![("ag1", &a, TurnOutcome::Compiled), ("ag2", &b, TurnOutcome::Compiled), ("ag3", &c, TurnOutcome::Compiled)];
     let current = empty_artifact("cur");
     let matrix = PayoffCalculator::compute_payoff_matrix(&proposals, &current);
     assert_eq!(matrix.len(), 3);
@@ -390,7 +390,7 @@ fn compute_payoff_matrix_has_correct_dimensions() {
 fn compute_payoff_matrix_values_in_unit_interval() {
     let a = empty_artifact("a");
     let b = empty_artifact("b");
-    let proposals = vec![("x", &a), ("y", &b)];
+    let proposals = vec![("x", &a, TurnOutcome::Compiled), ("y", &b, TurnOutcome::Compiled)];
     let current = empty_artifact("cur");
     let matrix = PayoffCalculator::compute_payoff_matrix(&proposals, &current);
     for row in &matrix {
@@ -417,4 +417,112 @@ fn best_response_picks_highest_joint_payoff() {
         idx, 1,
         "strategy 1 has highest combined payoff (0.9+0.8=1.7)"
     );
+}
+
+// ── NashSolver::resolve additional strategy tests ────────────────────────────
+
+#[test]
+fn resolve_voting_tie_picks_one() {
+    let proposals = vec![("a", 1.0, "X"), ("b", 1.0, "Y")];
+    let result = NashSolver::resolve(&proposals, ResolutionStrategy::Voting);
+    assert!(result == "X" || result == "Y");
+}
+
+#[test]
+fn resolve_voting_single_proposal() {
+    let proposals = vec![("a", 0.5, "only_option")];
+    let result = NashSolver::resolve(&proposals, ResolutionStrategy::Voting);
+    assert_eq!(result, "only_option");
+}
+
+#[test]
+fn resolve_voting_all_same() {
+    let proposals = vec![
+        ("a", 0.3, "consensus"),
+        ("b", 0.7, "consensus"),
+        ("c", 0.1, "consensus"),
+    ];
+    let result = NashSolver::resolve(&proposals, ResolutionStrategy::Voting);
+    assert_eq!(result, "consensus");
+}
+
+#[test]
+fn resolve_weighted_average_single_proposal() {
+    let proposals = vec![("solo", 0.42, "solo_plan")];
+    let result = NashSolver::resolve(&proposals, ResolutionStrategy::WeightedAverage);
+    assert_eq!(result, "solo_plan");
+}
+
+#[test]
+fn resolve_weighted_average_equal_weights_picks_one() {
+    let proposals = vec![("a", 0.5, "plan_A"), ("b", 0.5, "plan_B")];
+    let result = NashSolver::resolve(&proposals, ResolutionStrategy::WeightedAverage);
+    assert!(result == "plan_A" || result == "plan_B");
+}
+
+#[test]
+fn resolve_expert_deference_single_expert() {
+    let proposals = vec![("expert", 1.0, "expert_says")];
+    let result = NashSolver::resolve(&proposals, ResolutionStrategy::ExpertDeference);
+    assert_eq!(result, "expert_says");
+}
+
+#[test]
+fn resolve_expert_deference_ignores_low_weight() {
+    let proposals = vec![
+        ("novice1", 0.1, "bad_idea"),
+        ("novice2", 0.15, "worse_idea"),
+        ("expert", 0.99, "good_idea"),
+    ];
+    let result = NashSolver::resolve(&proposals, ResolutionStrategy::ExpertDeference);
+    assert_eq!(result, "good_idea");
+}
+
+#[test]
+fn resolve_mediation_single_proposal_returns_all_words() {
+    let proposals = vec![("a", 1.0, "deploy to production")];
+    let result = NashSolver::resolve(&proposals, ResolutionStrategy::Mediation);
+    // threshold = 1/2 = 0, so all words with count > 0 pass
+    assert!(result.contains("deploy"));
+    assert!(result.contains("production"));
+}
+
+#[test]
+fn resolve_mediation_no_common_words_returns_empty() {
+    let proposals = vec![
+        ("a", 1.0, "alpha"),
+        ("b", 1.0, "beta"),
+        ("c", 1.0, "gamma"),
+        ("d", 1.0, "delta"),
+    ];
+    let result = NashSolver::resolve(&proposals, ResolutionStrategy::Mediation);
+    // threshold = 4/2 = 2, no word appears more than once
+    assert!(result.is_empty());
+}
+
+#[test]
+fn resolve_mediation_common_words_extracted() {
+    let proposals = vec![
+        ("a", 1.0, "refactor the auth module"),
+        ("b", 1.0, "refactor the session module"),
+        ("c", 1.0, "refactor the cache module"),
+    ];
+    let result = NashSolver::resolve(&proposals, ResolutionStrategy::Mediation);
+    // threshold = 3/2 = 1, words appearing > 1 time pass
+    assert!(result.contains("refactor"));
+    assert!(result.contains("the"));
+    assert!(result.contains("module"));
+}
+
+#[test]
+fn resolve_all_strategies_handle_empty() {
+    for strategy in [
+        ResolutionStrategy::Voting,
+        ResolutionStrategy::WeightedAverage,
+        ResolutionStrategy::ExpertDeference,
+        ResolutionStrategy::Mediation,
+    ] {
+        let result = NashSolver::resolve(&[], strategy);
+        assert_eq!(result, "", "empty proposals should return empty for {:?}", strategy);
+    }
 }

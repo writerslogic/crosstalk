@@ -7,7 +7,7 @@ use crosstalk::engines::collective_intelligence::{
 };
 use crosstalk::engines::release::{ConvergenceReport, CpopVerifier, ReleaseManager};
 use crosstalk::types::analytics::QualityTrend;
-use crosstalk::types::conversation::{ConversationState, Turn, TurnOutcome};
+use crosstalk::types::conversation::{ConversationState, TaskCategory, Turn, TurnOutcome};
 use crosstalk::types::intelligence::AgentProfile;
 use crosstalk::ui::visualization::{
     ForceDirectedGraph, HeatmapGenerator, LatentMapper, Node, ReplayEngine, SvgExporter,
@@ -413,7 +413,7 @@ fn ensemble_merges_to_highest_quality() {
         ("b".to_string(), "proposal B content".to_string(), 0.9),
         ("c".to_string(), "proposal C content".to_string(), 0.6),
     ];
-    let merged = EnsembleEngine::merge_proposals(proposals);
+    let merged = EnsembleEngine::merge_proposals(proposals, TaskCategory::Research, "");
     assert!(
         merged.contains("B"),
         "highest-quality proposal should dominate merge"

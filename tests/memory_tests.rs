@@ -147,7 +147,7 @@ fn test_embedding_similarity_low() {
 #[test]
 fn test_memory_store_insert_and_query() {
     // Create 5 diverse records with different embeddings
-    let texts = vec![
+    let texts = [
         "Rust borrow checker prevents memory errors",
         "Type safety ensures compile-time guarantees",
         "Async programming with tokio runtime",
@@ -312,7 +312,7 @@ fn test_failure_predictor_detection() {
     let current_context = "Implementing a function that uses CompilationError handling";
 
     let warning =
-        FailurePredictor::proactive_warning(current_context, &[failure_signature.clone()]);
+        FailurePredictor::proactive_warning(current_context, std::slice::from_ref(&failure_signature));
 
     assert!(
         warning.is_some(),
@@ -555,10 +555,10 @@ fn test_outcome_record_round_trip() {
         serde_json::from_str(&serialized).expect("Deserialization failed");
 
     let result_outcome = deserialized.outcome.expect("Outcome should be present");
-    assert_eq!(result_outcome.compiled, true);
-    assert_eq!(result_outcome.tests_passed, true);
+    assert!(result_outcome.compiled);
+    assert!(result_outcome.tests_passed);
     assert!((result_outcome.quality_delta - 0.42).abs() < 1e-6);
-    assert_eq!(result_outcome.was_rolled_back, false);
+    assert!(!result_outcome.was_rolled_back);
     assert!((result_outcome.convergence_contribution - 0.78).abs() < 1e-6);
 }
 
@@ -604,7 +604,7 @@ fn test_failure_predictor_multiple_signatures() {
 // ============================================================================
 #[test]
 fn test_embedding_dimension_consistency() {
-    let texts = vec![
+    let texts = [
         "Short text",
         "A much longer text with more words and content to see if dimension changes",
         "Medium length content here",
@@ -823,7 +823,7 @@ async fn test_forget_removes_cluster_assignment() {
 
     // recall_by_cluster for cluster 0 should now only have turn_id 20 in assignments
     let cluster0: Vec<u32> = {
-        let clusters = vec![vec![10u32, 20], vec![30u32]];
+        let clusters = [vec![10u32, 20], vec![30u32]];
         clusters[0]
             .iter()
             .filter(|&&id| id != 10)
@@ -1341,5 +1341,118 @@ fn test_category_weights_generalist_dampened() {
     assert!(
         a_w > b_w * 2.0,
         "specialist a={a_w} should strongly outweigh dampened generalist b={b_w}"
+    );
+}
+
+// ============================================================================
+// local_embed_text and local_cosine_similarity direct tests
+// ============================================================================
+
+use crosstalk::engines::memory::{local_embed_text, local_cosine_similarity};
+
+#[test]
+fn local_embed_text_deterministic() {
+    let a = local_embed_text("hello world");
+    let b = local_embed_text("hello world");
+    assert_eq!(a, b);
+}
+
+#[test]
+fn local_embed_text_dimension_is_384() {
+    let v = local_embed_text("any text");
+    assert_eq!(v.len(), 384);
+}
+
+#[test]
+fn local_embed_text_normalized_to_unit_length() {
+    let v = local_embed_text("test normalization");
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!(
+        (norm - 1.0).abs() < 0.001,
+        "expected unit norm, got {}",
+        norm
+    );
+}
+
+#[test]
+fn local_embed_text_empty_string_still_normalized() {
+    let v = local_embed_text("");
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert_eq!(v.len(), 384);
+    assert!(
+        (norm - 1.0).abs() < 0.001,
+        "empty string embedding should still be normalized, got {}",
+        norm
+    );
+}
+
+#[test]
+fn local_embed_text_different_inputs_differ() {
+    let a = local_embed_text("alpha");
+    let b = local_embed_text("beta");
+    assert_ne!(a, b);
+}
+
+#[test]
+fn local_cosine_similarity_identical_vectors() {
+    let v = local_embed_text("same text");
+    let sim = local_cosine_similarity(&v, &v);
+    assert!(
+        (sim - 1.0).abs() < 1e-5,
+        "self-similarity should be ~1.0, got {}",
+        sim
+    );
+}
+
+#[test]
+fn local_cosine_similarity_different_texts_below_one() {
+    // The local embedding is hash-based (not semantic), so we verify that
+    // different inputs produce similarity strictly less than 1.0.
+    let a = local_embed_text("alpha beta gamma");
+    let b = local_embed_text("delta epsilon zeta");
+
+    let sim = local_cosine_similarity(&a, &b);
+    assert!(
+        sim < 1.0,
+        "different texts should have similarity < 1.0, got {}",
+        sim
+    );
+}
+
+#[test]
+fn local_cosine_similarity_mismatched_lengths_returns_zero() {
+    let a = vec![1.0f32, 0.0, 0.0];
+    let b = vec![1.0f32, 0.0];
+    assert_eq!(local_cosine_similarity(&a, &b), 0.0);
+}
+
+#[test]
+fn local_cosine_similarity_zero_vectors_returns_zero() {
+    let a = vec![0.0f32; 10];
+    let b = vec![0.0f32; 10];
+    assert_eq!(local_cosine_similarity(&a, &b), 0.0);
+}
+
+#[test]
+fn local_cosine_similarity_orthogonal_vectors() {
+    let a = vec![1.0f32, 0.0, 0.0];
+    let b = vec![0.0f32, 1.0, 0.0];
+    let sim = local_cosine_similarity(&a, &b);
+    assert!(
+        sim.abs() < 1e-6,
+        "orthogonal vectors should have ~0 similarity, got {}",
+        sim
+    );
+}
+
+#[test]
+fn local_cosine_similarity_opposite_vectors() {
+    let a = vec![1.0f32, 0.0];
+    let b = vec![-1.0f32, 0.0];
+    let sim = local_cosine_similarity(&a, &b);
+    assert!(
+        (sim - (-1.0)).abs() < 1e-6,
+        "opposite vectors should have similarity ~-1.0, got {}",
+        sim
     );
 }

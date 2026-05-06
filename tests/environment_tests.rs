@@ -1,6 +1,4 @@
-use crosstalk::core::environment::NixManager;
-use crosstalk::mcp::bridge::ToolDiscovery;
-use serde_json;
+use crosstalk::core::environment::{NixManager, ToolDiscovery};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
