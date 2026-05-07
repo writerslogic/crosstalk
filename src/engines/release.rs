@@ -249,7 +249,10 @@ impl PluginManager {
             .map(|entry| {
                 (
                     entry.key().clone(),
-                    entry.value().on_quality_check(sigma).unwrap_or(0.0),
+                    entry.value().on_quality_check(sigma).unwrap_or_else(|e| {
+                        tracing::warn!(plugin = %entry.key(), error = %e, "on_quality_check failed; using 0.0 as fallback score");
+                        0.0
+                    }),
                 )
             })
             .collect()

@@ -16,6 +16,35 @@ use std::collections::VecDeque;
 const DEFAULT_CONCESSION_THRESHOLD: f64 = 0.20;
 const DEFAULT_DEADLOCK_THRESHOLD: u32 = 5;
 
+/// Per-turn confidence decay rate applied to agents with no fresh evidence.
+const CONFIDENCE_DECAY_RATE: f64 = 0.02;
+
+/// Cosine similarity threshold above which a turn is considered globally
+/// repetitive (any agent repeated something similar).
+const REPETITION_SIM_GLOBAL: f32 = 0.82;
+
+/// Cosine similarity threshold above which a *same-agent* turn is
+/// considered repetitive.
+const REPETITION_SIM_SAME_AGENT: f32 = 0.75;
+
+/// How many same-agent near-duplicate turns trigger a repetition intervention.
+const REPETITION_SAME_AGENT_COUNT: usize = 3;
+
+/// Sliding window size for semantic embedding history.
+const SEMANTIC_WINDOW: usize = 20;
+
+/// Number of recent intervention history entries checked for dedup.
+const INTERVENTION_DEDUP_WINDOW: usize = 3;
+
+/// Maximum entries retained in the intervention history deque.
+const INTERVENTION_HISTORY_CAP: usize = 50;
+
+/// Cosine similarity threshold for cross-agent assumption defeat.
+const DEFEAT_SIM_THRESHOLD: f32 = 0.75;
+
+/// Minimum fraction of token overlap required before flagging a refutation.
+const REFUTATION_OVERLAP_THRESHOLD: f64 = 0.3;
+
 // =====================================================================
 // EPISTEMIC STATE — what does the agent know that it knows?
 // =====================================================================
@@ -217,9 +246,9 @@ impl MetacognitiveObserver {
             agent_states: FxHashMap::default(),
             elo_ratings: FxHashMap::default(),
             calibration: std::collections::HashMap::new(),
-            intervention_history: VecDeque::with_capacity(50),
+            intervention_history: VecDeque::with_capacity(INTERVENTION_HISTORY_CAP),
             concession_threshold: DEFAULT_CONCESSION_THRESHOLD,
-            semantic_embeddings: VecDeque::with_capacity(20),
+            semantic_embeddings: VecDeque::with_capacity(SEMANTIC_WINDOW),
             turns_since_progress: 0,
             deadlock_threshold: DEFAULT_DEADLOCK_THRESHOLD,
             intervention_outcomes: FxHashMap::default(),
@@ -227,6 +256,8 @@ impl MetacognitiveObserver {
             confidence_accum: FxHashMap::default(),
         }
     }
+
+    // ── Public entry point ────────────────────────────────────────────
 
     /// Analyze a completed turn and produce any necessary interventions.
     /// This is the main entry point called after each agent response.
@@ -238,12 +269,47 @@ impl MetacognitiveObserver {
     ) -> Vec<Intervention> {
         let mut interventions = Vec::new();
 
-        // 1. Extract or update epistemic state
+        // 1. Extract/update epistemic state and running confidence average.
+        let epistemic = self.update_epistemic_state(turn);
+
+        // 2. Confidence decay for agents with no fresh evidence this turn.
+        self.decay_confidence(CONFIDENCE_DECAY_RATE, &FxHashMap::default());
+
+        // 3. Fallacy detection with corrective injection.
+        self.detect_and_inject_fallacy_corrections(turn, &mut interventions);
+
+        // 4. Epistemic collapse detection.
+        self.detect_epistemic_collapse(turn, &epistemic, &mut interventions);
+
+        // 5. Cross-agent assumption defeat.
+        self.defeat_cross_agent_assumptions(turn);
+
+        // 6. Stale repetition detection via cosine similarity.
+        self.detect_stale_repetition(turn, &mut interventions);
+
+        // 7. Surprise-calibrated Elo update.
+        let surprise_val = surprise.compute_surprise(&turn.model_id, turn.outcome);
+        self.update_elo(&turn.model_id, turn.outcome, all_recent_turns, surprise_val);
+
+        // 8. Progress tracking and topology shift recommendation.
+        self.update_progress_and_topology(turn, &mut interventions);
+
+        // Rate-limit: suppress duplicate interventions for the same agent+source
+        // within the last INTERVENTION_DEDUP_WINDOW entries in history.
+        self.dedup_and_record_interventions(&mut interventions);
+
+        interventions
+    }
+
+    // ── Private phase helpers ─────────────────────────────────────────
+
+    /// Phase 1: Extract epistemic state from the turn, update agent map and
+    /// running confidence average.  Returns the freshly-extracted state.
+    fn update_epistemic_state(&mut self, turn: &Turn) -> EpistemicState {
         let epistemic = EpistemicState::extract_from_content(&turn.content);
         self.agent_states
             .insert(turn.model_id.clone(), epistemic.clone());
 
-        // Update running confidence average for metrics.
         let (sum, count) = self
             .confidence_accum
             .entry(turn.model_id.clone())
@@ -254,11 +320,15 @@ impl MetacognitiveObserver {
             .avg_confidence_by_agent
             .insert(turn.model_id.clone(), *sum / *count as f64);
 
-        // 2. Confidence decay: reduce confidence by a fixed rate per turn for
-        //    agents that provided no fresh evidence this turn.
-        self.decay_confidence(0.02, &FxHashMap::default());
+        epistemic
+    }
 
-        // 3. Fallacy detection with corrective injection
+    /// Phase 3: Run fallacy detection and push corrective interventions.
+    fn detect_and_inject_fallacy_corrections(
+        &mut self,
+        turn: &Turn,
+        interventions: &mut Vec<Intervention>,
+    ) {
         let fallacies = FallacyDetector::scan(&turn.content);
         for fallacy in &fallacies {
             if self.intervention_suppressed(&turn.model_id, InterventionSource::FallacyDetection) {
@@ -271,8 +341,15 @@ impl MetacognitiveObserver {
                 source: InterventionSource::FallacyDetection,
             });
         }
+    }
 
-        // 4. Epistemic collapse detection
+    /// Phase 4: Detect epistemic collapse and push mandatory concession directive.
+    fn detect_epistemic_collapse(
+        &mut self,
+        turn: &Turn,
+        epistemic: &EpistemicState,
+        interventions: &mut Vec<Intervention>,
+    ) {
         if epistemic.should_concede(self.concession_threshold)
             && !self.intervention_suppressed(&turn.model_id, InterventionSource::EpistemicCollapse)
         {
@@ -290,11 +367,18 @@ impl MetacognitiveObserver {
             });
             self.metrics.total_concessions_forced += 1;
         }
+    }
 
-        // 5. Cross-agent assumption defeat: check if this turn's content
-        //    directly contradicts another agent's stated assumptions.
+    /// Phase 5: Cross-agent assumption defeat.
+    ///
+    /// If this turn contains negation/refutation keywords AND the turn's
+    /// embedding is semantically close to another agent's assumption, mark
+    /// that assumption defeated.  Embeddings for all live assumptions are
+    /// pre-computed once before the per-agent loop to avoid redundant calls.
+    fn defeat_cross_agent_assumptions(&mut self, turn: &Turn) {
         let defeater_content = turn.content.to_lowercase();
         let defeater_embedding = local_embed_text(&turn.content);
+
         let has_refutation = defeater_content.contains("incorrect")
             || defeater_content.contains("wrong")
             || defeater_content.contains("flawed")
@@ -306,49 +390,84 @@ impl MetacognitiveObserver {
             || defeater_content.contains("isn't")
             || defeater_content.contains("won't")
             || defeater_content.contains("cannot");
-        for (other_id, other_state) in &mut self.agent_states {
+
+        // Pre-compute all assumption claim embeddings per-agent so we
+        // call local_embed_text once per (agent, claim) across the whole
+        // function, not once per assumption per iteration.
+        let mut per_agent_claim_embeddings: FxHashMap<String, Vec<(String, Vec<f32>)>> =
+            FxHashMap::default();
+        for (other_id, other_state) in &self.agent_states {
             if *other_id == turn.model_id {
                 continue;
             }
-            let defeated: Vec<String> = other_state
+            let embeddings: Vec<(String, Vec<f32>)> = other_state
                 .assumptions
                 .iter()
-                .filter(|a| {
-                    if a.confidence <= 0.0 {
-                        return false;
-                    }
-                    let claim_embedding = local_embed_text(&a.claim);
-                    let sim = cosine_sim(&claim_embedding, &defeater_embedding);
-                    sim > 0.75 && (has_refutation || has_negation)
-                })
-                .map(|a| a.claim.clone())
+                .filter(|a| a.confidence > 0.0)
+                .map(|a| (a.claim.clone(), local_embed_text(&a.claim)))
                 .collect();
-            let n = defeated.len() as u64;
-            for claim in &defeated {
-                other_state.defeat_assumption(claim);
+            if !embeddings.is_empty() {
+                per_agent_claim_embeddings.insert(other_id.clone(), embeddings);
             }
-            self.metrics.total_assumptions_defeated += n;
         }
 
-        // 6. Stale repetition detection via cosine similarity on embeddings.
+        // Now evaluate defeats using cached embeddings.
+        for (other_id, claim_embeddings) in &per_agent_claim_embeddings {
+            let defeated: Vec<String> = claim_embeddings
+                .iter()
+                .filter(|(claim, claim_emb)| {
+                    let sim = cosine_sim(claim_emb, &defeater_embedding);
+                    if sim <= DEFEAT_SIM_THRESHOLD {
+                        return false;
+                    }
+                    // Both a semantic hit AND a keyword signal are required.
+                    let keyword_match = has_refutation || has_negation;
+                    if !keyword_match {
+                        return false;
+                    }
+                    // Require token overlap with the turn content to filter
+                    // negations that are unrelated to this specific claim.
+                    token_overlap(claim, &defeater_content) > REFUTATION_OVERLAP_THRESHOLD
+                })
+                .map(|(claim, _)| claim.clone())
+                .collect();
+
+            let n = defeated.len() as u64;
+            if n > 0 {
+                if let Some(other_state) = self.agent_states.get_mut(other_id) {
+                    for claim in &defeated {
+                        other_state.defeat_assumption(claim);
+                    }
+                }
+                self.metrics.total_assumptions_defeated += n;
+            }
+        }
+    }
+
+    /// Phase 6: Detect stale/repetitive turns via cosine similarity on the
+    /// semantic embedding window.
+    fn detect_stale_repetition(&mut self, turn: &Turn, interventions: &mut Vec<Intervention>) {
         let embedding = local_embed_text(&turn.content);
         let is_repetitive = self
             .semantic_embeddings
             .iter()
-            .any(|(_, prev)| cosine_sim(prev, &embedding) > 0.82)
+            .any(|(_, prev)| cosine_sim(prev, &embedding) > REPETITION_SIM_GLOBAL)
             || self
                 .semantic_embeddings
                 .iter()
                 .filter(|(id, prev)| {
-                    id == &turn.model_id && cosine_sim(prev, &embedding) > 0.75
+                    id == &turn.model_id
+                        && cosine_sim(prev, &embedding) > REPETITION_SIM_SAME_AGENT
                 })
                 .count()
-                >= 3;
+                >= REPETITION_SAME_AGENT_COUNT;
+
         self.semantic_embeddings
             .push_back((turn.model_id.clone(), embedding));
-        if self.semantic_embeddings.len() > 20 {
+        if self.semantic_embeddings.len() > SEMANTIC_WINDOW {
             self.semantic_embeddings.pop_front();
         }
+
         if is_repetitive
             && !self.intervention_suppressed(&turn.model_id, InterventionSource::StaleRepetition)
         {
@@ -362,12 +481,10 @@ impl MetacognitiveObserver {
                 source: InterventionSource::StaleRepetition,
             });
         }
+    }
 
-        // 7. Surprise-calibrated Elo update.
-        let surprise_val = surprise.compute_surprise(&turn.model_id, turn.outcome);
-        self.update_elo(&turn.model_id, turn.outcome, all_recent_turns, surprise_val);
-
-        // 8. Progress tracking for topology shift.
+    /// Phase 8: Update progress counter and emit topology shift if deadlocked.
+    fn update_progress_and_topology(&mut self, turn: &Turn, interventions: &mut Vec<Intervention>) {
         let made_progress = matches!(
             turn.outcome,
             TurnOutcome::Compiled | TurnOutcome::TestsPassed | TurnOutcome::AdvancedConvergence
@@ -378,7 +495,6 @@ impl MetacognitiveObserver {
             self.turns_since_progress += 1;
         }
 
-        // 9. Topology shift recommendation.
         if self.turns_since_progress >= self.deadlock_threshold {
             interventions.push(Intervention {
                 target_agent: "System".to_string(),
@@ -394,20 +510,22 @@ impl MetacognitiveObserver {
             self.turns_since_progress = 0;
             self.metrics.total_topology_shifts += 1;
         }
+    }
 
-        // Rate-limit: suppress duplicate interventions for the same agent+source
-        // within the last 3 entries in history.
+    /// Post-processing: remove duplicate interventions (same agent+source seen
+    /// in the last INTERVENTION_DEDUP_WINDOW history entries), record survivors.
+    fn dedup_and_record_interventions(&mut self, interventions: &mut Vec<Intervention>) {
         interventions.retain(|i| {
             let key = (i.target_agent.clone(), i.source);
             let dominated = self
                 .intervention_history
                 .iter()
                 .rev()
-                .take(3)
+                .take(INTERVENTION_DEDUP_WINDOW)
                 .any(|(a, s)| *a == key.0 && *s == key.1);
             if !dominated {
                 self.intervention_history.push_back(key);
-                if self.intervention_history.len() > 50 {
+                if self.intervention_history.len() > INTERVENTION_HISTORY_CAP {
                     self.intervention_history.pop_front();
                 }
                 self.metrics.total_interventions_issued += 1;
@@ -416,9 +534,9 @@ impl MetacognitiveObserver {
                 false
             }
         });
-
-        interventions
     }
+
+    // ── Remaining public / private methods ───────────────────────────
 
     /// Apply a per-turn confidence decay to all agents that provided no fresh
     /// evidence this turn.  Agents with evidence in their current state are
@@ -673,4 +791,30 @@ pub struct ObserverDiagnostics {
     pub turns_since_progress: u32,
     pub total_interventions: usize,
     pub agents_below_concession: usize,
+}
+
+// =====================================================================
+// UTILITY
+// =====================================================================
+
+/// Compute the Jaccard token overlap between two strings.
+///
+/// Tokens are whitespace-split lowercase words.  Returns a value in
+/// [0.0, 1.0] where 1.0 means the two strings share exactly the same
+/// vocabulary.  Used by refutation detection to ensure a negation keyword
+/// is actually about the claim being checked, not about something else.
+fn token_overlap(a: &str, b: &str) -> f64 {
+    use std::collections::HashSet;
+    let tokens_a: HashSet<&str> = a.split_whitespace().collect();
+    let tokens_b: HashSet<&str> = b.split_whitespace().collect();
+    if tokens_a.is_empty() && tokens_b.is_empty() {
+        return 1.0;
+    }
+    let intersection = tokens_a.intersection(&tokens_b).count();
+    let union = tokens_a.union(&tokens_b).count();
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
 }

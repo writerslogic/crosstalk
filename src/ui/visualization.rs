@@ -409,6 +409,13 @@ impl ForceDirectedGraph {
         let k = (area / self.nodes.len() as f32).sqrt();
 
         // 1. Repulsive forces
+        // Node count equals the number of unique agents (typically 2–10), so the
+        // O(n²) all-pairs loop is acceptable in practice.
+        debug_assert!(
+            self.nodes.len() < 100,
+            "force-directed repulsion is O(n²); {} nodes exceeds safe threshold",
+            self.nodes.len()
+        );
         for i in 0..self.nodes.len() {
             self.nodes[i].dx = 0.0;
             self.nodes[i].dy = 0.0;

@@ -13,6 +13,24 @@ use serde::{Deserialize, Serialize};
 
 const MIN_TURNS_BETWEEN_SHIFTS: u32 = 2;
 
+/// Deadlock counter threshold that triggers the first escalation step
+/// (e.g., RoundRobin → Critique).
+const DEADLOCK_ESCALATION_SOFT: u32 = 5;
+
+/// Deadlock counter threshold that triggers the hard escalation to Mediated.
+const DEADLOCK_ESCALATION_HARD: u32 = 8;
+
+/// Minimum number of quality observations required before a topology is
+/// eligible for historical-best selection.
+const MIN_TOPOLOGY_OBSERVATIONS: u32 = 3;
+
+/// Minimum window size for quality trend detection.
+const QUALITY_TREND_MIN_WINDOW: usize = 4;
+
+/// Minimum quality improvement (late half vs early half) to consider the
+/// current topology to be making positive progress.
+const QUALITY_TREND_THRESHOLD: f64 = 0.05;
+
 // =====================================================================
 // TOPOLOGY VARIANTS
 // =====================================================================
@@ -156,9 +174,7 @@ impl TopologyManager {
         }
     }
 
-    // -----------------------------------------------------------------
-    // PUBLIC API
-    // -----------------------------------------------------------------
+    // ── Agent management ──────────────────────────────────────────────
 
     /// Update the number of active agents.  If the count changed, the
     /// topology may need to be re-evaluated.
@@ -175,6 +191,8 @@ impl TopologyManager {
             None
         }
     }
+
+    // ── Turn recording ────────────────────────────────────────────────
 
     /// Record the outcome of a completed turn, updating deadlock tracking
     /// and topology quality scores.
@@ -209,6 +227,8 @@ impl TopologyManager {
         }
     }
 
+    // ── Routing and selection ─────────────────────────────────────────
+
     /// Recommend the best topology given the current debate state.
     ///
     /// This does NOT mutate state — it only advises.  Call `shift_to` to
@@ -217,10 +237,10 @@ impl TopologyManager {
         let n_agents = self.agent_count;
 
         // --- Hard deadlock escalation ladder ---
-        if self.deadlock_counter >= 8 {
+        if self.deadlock_counter >= DEADLOCK_ESCALATION_HARD {
             return DebateTopology::Mediated;
         }
-        if self.deadlock_counter >= 5 {
+        if self.deadlock_counter >= DEADLOCK_ESCALATION_SOFT {
             return match self.current {
                 DebateTopology::RoundRobin => DebateTopology::Critique,
                 DebateTopology::Critique => DebateTopology::TreeOfThoughts,
@@ -277,6 +297,8 @@ impl TopologyManager {
         }
     }
 
+    // ── Shift execution ───────────────────────────────────────────────
+
     /// Execute a topology shift, recording history and returning a directive.
     pub fn shift_to(
         &mut self,
@@ -310,6 +332,8 @@ impl TopologyManager {
         Some(self.shift_to(recommended, turn_idx, reason))
     }
 
+    // ── Directive building ────────────────────────────────────────────
+
     /// Generate `n_branches` variant prompts for Tree-of-Thoughts exploration.
     ///
     /// Each branch receives a distinct epistemic directive so agents explore
@@ -333,10 +357,6 @@ impl TopologyManager {
             .map(|i| format!("<context>\n{}\n</context>\n\n[THOUGHT BRANCH {}]\n{}", base_prompt, i + 1, directives[i]))
             .collect()
     }
-
-    // -----------------------------------------------------------------
-    // PRIVATE HELPERS
-    // -----------------------------------------------------------------
 
     /// Build a `TopologyDirective` for the given topology, populating
     /// reasonable defaults for grouping, prompt modifier, and TTL.
@@ -450,6 +470,8 @@ impl TopologyManager {
         }
     }
 
+    // ── Private helpers ───────────────────────────────────────────────
+
     /// Build a round-robin pairing of `n` agents.
     /// With n=4 this gives (0,1), (2,3); with n=5: (0,1), (2,3), (4,0).
     fn build_pairs(n: usize) -> Vec<(usize, usize)> {
@@ -471,7 +493,7 @@ impl TopologyManager {
 
     /// True if the recent quality window shows a non-trivial upward trend.
     fn quality_is_improving(&self) -> bool {
-        if self.recent_quality.len() < 4 {
+        if self.recent_quality.len() < QUALITY_TREND_MIN_WINDOW {
             return false;
         }
         let half = self.recent_quality.len() / 2;
@@ -479,7 +501,7 @@ impl TopologyManager {
             self.recent_quality.iter().take(half).sum::<f64>() / half as f64;
         let late: f64 =
             self.recent_quality.iter().rev().take(half).sum::<f64>() / half as f64;
-        late > early + 0.05
+        late > early + QUALITY_TREND_THRESHOLD
     }
 
     /// Return the topology with the highest historical mean quality score,
@@ -489,7 +511,7 @@ impl TopologyManager {
         self.topology_scores
             .iter()
             .filter(|(topo, avg)| {
-                avg.count >= 3 && self.agent_count >= topo.minimum_agents()
+                avg.count >= MIN_TOPOLOGY_OBSERVATIONS && self.agent_count >= topo.minimum_agents()
             })
             .max_by(|(_, a), (_, b)| {
                 a.mean
@@ -509,7 +531,7 @@ impl TopologyManager {
 
     /// Classify the reason for an imminent shift given the recommended topology.
     fn classify_reason(&self, recommended: DebateTopology) -> TopologyReason {
-        if self.deadlock_counter >= 5 {
+        if self.deadlock_counter >= DEADLOCK_ESCALATION_SOFT {
             return TopologyReason::Deadlock;
         }
         if recommended == DebateTopology::TreeOfThoughts {

@@ -126,14 +126,6 @@ impl McpGateway {
 
         tracing::info!(model = %model_id, socket = %socket_path.display(), "dispatching sampling/createMessage via local MCP transport");
 
-        let mut stream = UnixStream::connect(&socket_path).await.map_err(|e| {
-            anyhow::anyhow!(
-                "MCP sampling unavailable: could not connect to {} ({}). \
-                 Start the MCP server or wire a remote worker pool.",
-                socket_path.display(), e
-            )
-        })?;
-
         let request = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -144,53 +136,89 @@ impl McpGateway {
                 "maxTokens": 4096
             }
         });
-
         let mut req_bytes = serde_json::to_vec(&request)?;
         req_bytes.push(b'\n');
-        stream.write_all(&req_bytes).await.map_err(|e| {
-            anyhow::anyhow!("failed to write sampling request to MCP socket: {}", e)
-        })?;
 
-        // Read exactly one newline-delimited JSON response, capped at 1 MiB.
-        const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
-        let (reader, _writer) = stream.into_split();
-        let mut lines = BufReader::new(tokio::io::AsyncReadExt::take(reader, MAX_RESPONSE_BYTES)).lines();
-        let line = lines
-            .next_line()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read MCP sampling response: {}", e))?
-            .ok_or_else(|| anyhow::anyhow!("MCP socket closed without a response"))?;
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tracing::warn!(attempt, "MCP socket unavailable; retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(50 * (1u64 << attempt))).await;
+            }
 
-        if line.len() > 512 * 1024 {
-            tracing::warn!(bytes = line.len(), "large MCP sampling response");
+            let mut stream = match UnixStream::connect(&socket_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(anyhow::anyhow!(
+                        "MCP sampling unavailable: could not connect to {} ({}). \
+                         Start the MCP server or wire a remote worker pool.",
+                        socket_path.display(), e
+                    ));
+                    continue;
+                }
+            };
+
+            if let Err(e) = stream.write_all(&req_bytes).await {
+                last_err = Some(anyhow::anyhow!(
+                    "failed to write sampling request to MCP socket: {}", e
+                ));
+                continue;
+            }
+
+            // Read exactly one newline-delimited JSON response, capped at 1 MiB.
+            const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+            let (reader, _writer) = stream.into_split();
+            let mut lines = BufReader::new(tokio::io::AsyncReadExt::take(reader, MAX_RESPONSE_BYTES)).lines();
+            let line = match lines.next_line().await {
+                Ok(Some(l)) => l,
+                Ok(None) => {
+                    last_err = Some(anyhow::anyhow!("MCP socket closed without a response"));
+                    continue;
+                }
+                Err(e) => {
+                    last_err = Some(anyhow::anyhow!("failed to read MCP sampling response: {}", e));
+                    continue;
+                }
+            };
+
+            if line.len() > 512 * 1024 {
+                tracing::warn!(bytes = line.len(), "large MCP sampling response");
+            }
+
+            let response: Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(e) => {
+                    last_err = Some(anyhow::anyhow!("invalid JSON from MCP socket: {}", e));
+                    continue;
+                }
+            };
+
+            // MCP sampling response: result.content[0].text  (or result as a plain string)
+            if let Some(err) = response.get("error") {
+                return Err(anyhow::anyhow!("MCP sampling error: {}", err));
+            }
+
+            let result = response
+                .get("result")
+                .ok_or_else(|| anyhow::anyhow!("MCP response missing 'result' field: {:?}", response))?;
+
+            // Try structured content array first, then fall back to plain string result
+            let text = result
+                .get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|item| item.get("text"))
+                .and_then(|t| t.as_str())
+                .or_else(|| result.as_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("MCP sampling result has no extractable text: {:?}", result)
+                })?;
+
+            tracing::info!(model = %model_id, chars = text.len(), "received MCP sampling response");
+            return Ok(text.to_string());
         }
 
-        let response: Value = serde_json::from_str(&line)
-            .map_err(|e| anyhow::anyhow!("invalid JSON from MCP socket: {}", e))?;
-
-        // MCP sampling response: result.content[0].text  (or result as a plain string)
-        if let Some(err) = response.get("error") {
-            return Err(anyhow::anyhow!("MCP sampling error: {}", err));
-        }
-
-        let result = response
-            .get("result")
-            .ok_or_else(|| anyhow::anyhow!("MCP response missing 'result' field: {:?}", response))?;
-
-        // Try structured content array first, then fall back to plain string result
-        let text = result
-            .get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|item| item.get("text"))
-            .and_then(|t| t.as_str())
-            .or_else(|| result.as_str())
-            .ok_or_else(|| {
-                anyhow::anyhow!("MCP sampling result has no extractable text: {:?}", result)
-            })?;
-
-        tracing::info!(model = %model_id, chars = text.len(), "received MCP sampling response");
-        Ok(text.to_string())
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("MCP sampling failed after 3 attempts")))
     }
 
     /// High-level dispatch by method name (used by tests and internal routing).

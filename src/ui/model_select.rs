@@ -435,12 +435,14 @@ pub async fn run_model_selector() -> Result<Vec<String>> {
         while let Ok((provider, ids)) = rx.try_recv() {
             state
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
+                .map_err(|_| anyhow::anyhow!("model_select state mutex poisoned"))?
                 .add_models(&provider, ids);
         }
 
         {
-            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            let s = state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("model_select state mutex poisoned"))?;
             terminal.draw(|f| draw_selector(f, &s))?;
             if s.done {
                 break if s.confirm { s.selected_ids() } else { vec![] };
@@ -453,7 +455,9 @@ pub async fn run_model_selector() -> Result<Vec<String>> {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+            let mut s = state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("model_select state mutex poisoned"))?;
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') => s.move_up(),
                 KeyCode::Down | KeyCode::Char('j') => s.move_down(),

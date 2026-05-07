@@ -49,12 +49,34 @@ impl McpTransport {
                 }
             };
             let id = request.get("id").cloned();
+            let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
 
-            let response = json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": "Connected to Crosstalk MCP Gateway"
-            });
+            let response = match method {
+                "initialize" => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "serverInfo": { "name": "crosstalk", "version": "0.1.0" }
+                    }
+                }),
+                "ping" => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "pong": true }
+                }),
+                "notifications/initialized" => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "ok": true }
+                }),
+                _ => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32601, "message": "Method not found" }
+                }),
+            };
 
             let mut resp_str = serde_json::to_string(&response)?;
             resp_str.push('\n');

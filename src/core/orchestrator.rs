@@ -76,49 +76,86 @@ struct PreparedArtifactChange {
     skeleton: String,
 }
 
+/// Central orchestrator for the Crosstalk multi-agent swarm.
+///
+/// # Field Organisation
+///
+/// Fields are grouped into five logical categories:
+///
+/// ## Core I/O
+/// Agent list, state manager, event/control channels, file writer, and the
+/// MCP gateway used to dispatch tool calls.
+///
+/// ## Intelligence & Routing
+/// Engines that decide *which* agents run, *how* their outputs are merged, and
+/// *whether* a turn should be retried: `IntelligenceEngine`, `CollectiveIntelligenceEngine`,
+/// `ReasoningEngine`, `TopologyManager`, `SurpriseEngine`, `MetacognitiveObserver`,
+/// `PromptEvolver`, and the template cache.
+///
+/// ## Memory
+/// Persistent and in-session memory: `MemoryStore`, `MemoryBridge`,
+/// `session_memory_map`, and the gold-state snapshot used for regression detection.
+///
+/// ## Observability & Telemetry
+/// Engines that produce signals without mutating core state: `AnalyticsEngine`,
+/// `GodView`, the continuous auditor channel pair, and the `StallDetector`.
+///
+/// ## Concurrency & Session
+/// Per-session bookkeeping that is shared safely across async boundaries:
+/// `completion_probability` (atomic), rate limiter, rollback/skip counters,
+/// verification-failure map, `session_ctx`, and the turn broadcast channel.
 pub struct Orchestrator {
+    // ── Core I/O ─────────────────────────────────────────────────────────────
     agents: Vec<Box<dyn PromptAgent>>,
     state_manager: StateManager,
     event_tx: mpsc::Sender<StreamEvent>,
     control_rx: Mutex<mpsc::Receiver<ControlSignal>>,
     mc_runner: MonteCarloRunner,
     pub mcp_gateway: Mutex<McpGateway>,
-    pub memory_store: Arc<MemoryStore>,
+    pub file_writer: FileWriter,
+    nix_env: Option<HashMap<String, String>>,
+
+    // ── Intelligence & Routing ────────────────────────────────────────────────
     pub intelligence: Mutex<IntelligenceEngine>,
-    pub compute: Mutex<ComputeManager>,
     pub reasoning: ReasoningEngine,
     pub self_improve: SelfImprovementEngine,
     pub swarm: SwarmController,
     pub planning: PlanningEngine,
-    pub signer: TurnSigner,
-    pub analytics: AnalyticsEngine,
     pub collective: Mutex<CollectiveIntelligenceEngine>,
-    pub viz: Mutex<GodView>,
-    pub file_writer: FileWriter,
-    pub auditor_tx: Option<mpsc::Sender<ConversationState>>,
-    pub audit_rx: Mutex<mpsc::UnboundedReceiver<AuditAlert>>,
     pub surprise_engine: Mutex<SurpriseEngine>,
     pub observer: Mutex<MetacognitiveObserver>,
     pub pending_interventions: Mutex<Vec<crate::engines::metacognition::Intervention>>,
     pub prompt_evolver: Mutex<PromptEvolver>,
     pub topology: Mutex<TopologyManager>,
-    pub template_cache: Arc<RwLock<BTreeMap<String, PromptTemplate>>>,
-    pub session_memory_map: Mutex<BTreeMap<String, Arc<MemoryStore>>>,
-    pub memory_bridge: Mutex<MemoryBridge>,
-    pub completion_probability: Arc<AtomicU64>,
     active_topology_directive: Mutex<Option<crate::engines::topology::TopologyDirective>>,
+    pub template_cache: Arc<RwLock<BTreeMap<String, PromptTemplate>>>,
+
+    // ── Memory ────────────────────────────────────────────────────────────────
+    pub memory_store: Arc<MemoryStore>,
+    pub memory_bridge: Mutex<MemoryBridge>,
+    pub session_memory_map: Mutex<BTreeMap<String, Arc<MemoryStore>>>,
+    pub gold_state: Mutex<Option<ConversationState>>,
+
+    // ── Observability & Telemetry ─────────────────────────────────────────────
+    pub analytics: AnalyticsEngine,
+    pub viz: Mutex<GodView>,
+    pub auditor_tx: Option<mpsc::Sender<ConversationState>>,
+    pub audit_rx: Mutex<mpsc::UnboundedReceiver<AuditAlert>>,
+    stall_detector: Mutex<StallDetector>,
+
+    // ── Concurrency & Session ─────────────────────────────────────────────────
+    pub signer: TurnSigner,
+    pub compute: Mutex<ComputeManager>,
+    pub completion_probability: Arc<AtomicU64>,
+    rate_limiter: Arc<RequestRateLimiter>,
+    resource_rx: Mutex<tokio::sync::broadcast::Receiver<crate::engines::compute::ResourceEvent>>,
     session_ctx: Mutex<SessionContext>,
     rollback_counters: Mutex<BTreeMap<String, u32>>,
     skip_until: Mutex<BTreeMap<String, u32>>,
-    rate_limiter: Arc<RequestRateLimiter>,
-    nix_env: Option<HashMap<String, String>>,
-    resource_rx: Mutex<tokio::sync::broadcast::Receiver<crate::engines::compute::ResourceEvent>>,
-    pub gold_state: Mutex<Option<ConversationState>>,
-    /// Broadcast channel: every committed Turn is sent here so swarm nodes can react.
-    turn_tx: tokio::sync::broadcast::Sender<Turn>,
     /// Tracks per-agent verification failure counts for the current task.
     pub verification_failures: Mutex<HashMap<String, u32>>,
-    stall_detector: Mutex<StallDetector>,
+    /// Broadcast channel: every committed Turn is sent here so swarm nodes can react.
+    turn_tx: tokio::sync::broadcast::Sender<Turn>,
 }
 
 fn resolve_memory_store_path() -> Result<String> {
@@ -331,33 +368,33 @@ impl Orchestrator {
         self.turn_tx.subscribe()
     }
 
-    pub async fn run_turn(&self, sigma_lock: Arc<Mutex<ConversationState>>) -> Result<bool> {
-        let (pre_session_id, pre_turn_idx, pre_recent_turns) = {
+    /// Phase 1: Load session metadata, recall memory context, and detect regressions.
+    /// Returns `(session_id, turn_idx, recent_turns, memory_examples, antipatterns, regression_prefix)`.
+    async fn prepare_context_from_memory(
+        &self,
+        sigma_lock: &Arc<Mutex<ConversationState>>,
+    ) -> Result<(String, u32, Vec<Turn>, Vec<String>, Vec<MemoryRecord>, String)> {
+        let (session_id, turn_idx, recent_turns) = {
             let s = sigma_lock.lock().await;
             let recent: Vec<Turn> = s.turns.iter().rev().take(5).cloned().collect();
             (s.session_id.clone(), s.iteration_index, recent)
         };
-        tracing::Span::current().record("session", pre_session_id.as_str());
-        tracing::Span::current().record("turn", pre_turn_idx);
 
-        let mut memory_examples = vec![];
-        let mut antipatterns = vec![];
-        let mut regression_prefix = String::new();
-
-        let recall_query = pre_recent_turns
+        let recall_query = recent_turns
             .first()
             .map(|t| t.content.chars().take(200).collect::<String>())
             .unwrap_or_else(|| "latest turn context".to_string());
 
-        {
+        let (memory_examples, antipatterns) = {
             let mut bridge = self.memory_bridge.lock().await;
-            bridge.open_session(pre_session_id.clone());
-            memory_examples = vec![bridge
-                .recall_relevant_summary(&pre_session_id, &recall_query, 3, pre_turn_idx)
+            bridge.open_session(session_id.clone());
+            let examples = vec![bridge
+                .recall_relevant_summary(&session_id, &recall_query, 3, turn_idx)
                 .await
                 .unwrap_or_default()];
-            antipatterns = bridge.recall_antipatterns(&recall_query, 2).await;
-        }
+            let anti = bridge.recall_antipatterns(&recall_query, 2).await;
+            (examples, anti)
+        };
 
         {
             let mut rx = self.resource_rx.lock().await;
@@ -366,39 +403,50 @@ impl Orchestrator {
                     self.emit(StreamEvent::TokenReceived {
                         agent_id: "System".to_string(),
                         token: format!("[compute] Resource alert: {}\n", alert),
-                    }).await?;
+                    })
+                    .await?;
                 }
             }
         }
 
-        {
+        let regression_prefix = {
             let intell = self.intelligence.lock().await;
-            if let Some(alert) = intell.detect_regression("swarm", &pre_recent_turns) {
-                regression_prefix = RegressionFeedbackHandler::compose_corrective_prompt(
+            if let Some(alert) = intell.detect_regression("swarm", &recent_turns) {
+                RegressionFeedbackHandler::compose_corrective_prompt(
                     &alert,
                     "",
                     &RegressionFeedbackHandler::counter_examples(
-                        &pre_recent_turns,
+                        &recent_turns,
                         TaskCategory::Research,
                     ),
-                );
+                )
+            } else {
+                String::new()
             }
-        }
+        };
 
-        // Apply strategy recommendations from analytics engine
+        Ok((session_id, turn_idx, recent_turns, memory_examples, antipatterns, regression_prefix))
+    }
+
+    /// Phase 2: Apply analytics strategy recommendations and select active agents.
+    /// Returns `(strategy_critique, strategy_reduce_agents, adaptive_selection, state_clone)`.
+    async fn analyze_strategy_and_select_agents(
+        &self,
+        sigma_lock: &Arc<Mutex<ConversationState>>,
+    ) -> Result<(bool, bool, Option<AdaptiveSelection>, ConversationState)> {
         let mut strategy_critique = false;
         let mut strategy_reduce_agents = false;
-        let adaptive_selection: Option<AdaptiveSelection>;
+        let adaptive_selection;
+
         {
             let s = sigma_lock.lock().await;
-
-            // --- Suggestion 5: Autonomous Sub-Swarming ---
             let sub_swarms = crate::engines::planning::SubSwarmGenerator::identify_sub_swarms(&s);
             for task in sub_swarms {
                 self.emit(StreamEvent::TokenReceived {
                     agent_id: "System".to_string(),
                     token: format!("[Swarm] Spawning sub-orchestrator for complex task: {}\n", task.description),
-                }).await?;
+                })
+                .await?;
                 self.swarm.spawn_node(&task.id, self.turn_tx.subscribe());
             }
 
@@ -411,7 +459,8 @@ impl Orchestrator {
                             self.emit(StreamEvent::TokenReceived {
                                 agent_id: "System".to_string(),
                                 token: "Low success rate detected — switching to critique protocol\n".to_string(),
-                            }).await?;
+                            })
+                            .await?;
                         }
                         "reduce_parallel_inference" => {
                             strategy_reduce_agents = true;
@@ -421,281 +470,302 @@ impl Orchestrator {
                 }
             }
 
-            {
+            adaptive_selection = {
                 let obs = self.observer.lock().await;
                 let coll = self.collective.lock().await;
-                adaptive_selection = Some(coll.select_strategy_adaptive(&s, &obs));
-            }
+                Some(coll.select_strategy_adaptive(&s, &obs))
+            };
         }
 
-        let s = {
+        let state_clone = {
             let guard = sigma_lock.lock().await;
             if guard.iteration_index == 0 && guard.turns.is_empty() {
                 self.state_manager.checkpoint(&guard)?;
             }
             guard.clone()
         };
-        let (prompt, history_contents, active_agents, artifacts_snapshot) = {
-            let contents: Vec<String> = s
-                .turns
-                .iter()
-                .rev()
-                .take(10)
-                .map(|t| t.content.clone())
-                .collect();
-            let mut distilled_prompt = self.build_differential_prompt(&s).await;
 
-            if strategy_critique {
-                distilled_prompt.push_str(
-                    "\n\nCRITICAL: Previous attempts had high failure rate. \
-                     Before proposing changes, critique your own approach. \
-                     Identify what could go wrong. Only proceed with the safest path.\n"
+        Ok((strategy_critique, strategy_reduce_agents, adaptive_selection, state_clone))
+    }
+
+    /// Phase 3: Build the final prompt string including memory, metacognition, and topology.
+    /// Returns `(prompt, history_contents, active_agents, artifacts_snapshot)`.
+    async fn build_prompt(
+        &self,
+        s: &ConversationState,
+        strategy_critique: bool,
+        adaptive_selection: &Option<AdaptiveSelection>,
+        memory_examples: &[String],
+        antipatterns: &[MemoryRecord],
+        regression_prefix: &str,
+    ) -> Result<(String, Vec<String>, Vec<(usize, String)>, BTreeMap<String, Arc<Artifact>>)> {
+        let history_contents: Vec<String> = s
+            .turns
+            .iter()
+            .rev()
+            .take(10)
+            .map(|t| t.content.clone())
+            .collect();
+
+        let mut distilled_prompt = self.build_differential_prompt(s).await;
+
+        if strategy_critique {
+            distilled_prompt.push_str(
+                "\n\nCRITICAL: Previous attempts had high failure rate. \
+                 Before proposing changes, critique your own approach. \
+                 Identify what could go wrong. Only proceed with the safest path.\n",
+            );
+        }
+
+        if let Some(sel) = adaptive_selection {
+            match sel.strategy {
+                MetaStrategy::DebateAndCritique => {
+                    distilled_prompt.push_str(
+                        "\n\n[META-STRATEGY: DebateAndCritique] \
+                         High variance in recent certainty scores detected. \
+                         Critically examine all proposals and surface disagreements before converging.\n",
+                    );
+                }
+                MetaStrategy::DirectImplementation => {
+                    if let Some(ref agent) = sel.preferred_agent {
+                        distilled_prompt.push_str(&format!(
+                            "\n\n[META-STRATEGY: DirectImplementation] \
+                             Dominant specialist {} detected (Elo > 1600). \
+                             Prefer this agent's proposal for final synthesis.\n",
+                            agent
+                        ));
+                    }
+                }
+                MetaStrategy::MemoryInjection => {
+                    distilled_prompt.push_str(
+                        "\n\n[META-STRATEGY: MemoryInjection] \
+                         Convergence probability is low after multiple turns. \
+                         Retrieve and apply relevant prior session lessons before proceeding.\n",
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        let mut active = self.select_active_agents(s, adaptive_selection).await;
+
+        // Apply topology-driven agent grouping
+        {
+            use crate::engines::topology::AgentGrouping;
+            let directive = {
+                let stored = self.active_topology_directive.lock().await;
+                match stored.as_ref() {
+                    Some(d) => d.clone(),
+                    None => {
+                        let topo = self.topology.lock().await;
+                        topo.current_directive()
+                    }
+                }
+            };
+            match directive.agent_grouping {
+                AgentGrouping::Single(idx) => {
+                    if idx < active.len() {
+                        active = vec![active[idx].clone()];
+                    }
+                }
+                AgentGrouping::Pairs(ref pairs) => {
+                    if let Some(&(a, b)) = pairs.first() {
+                        let mut subset = Vec::new();
+                        if a < active.len() { subset.push(active[a].clone()); }
+                        if b < active.len() { subset.push(active[b].clone()); }
+                        if !subset.is_empty() { active = subset; }
+                    }
+                }
+                AgentGrouping::Branches(ref branches) => {
+                    let branch_idx = (s.iteration_index as usize) % branches.len().max(1);
+                    if let Some(branch) = branches.get(branch_idx) {
+                        let subset: Vec<_> = branch
+                            .iter()
+                            .filter_map(|&i| active.get(i).cloned())
+                            .collect();
+                        if !subset.is_empty() { active = subset; }
+                    }
+                }
+                AgentGrouping::All => {}
+            }
+            if let Some(modifier) = &directive.prompt_modifier {
+                distilled_prompt.push('\n');
+                distilled_prompt.push_str(modifier);
+                distilled_prompt.push('\n');
+            }
+        }
+
+        let structure = ReasoningEngine::select_structure(TaskCategory::Research, &active[0].1);
+        match structure {
+            TurnStructure::StepByStep => {
+                distilled_prompt.push_str("\nStructure your response with numbered reasoning steps.")
+            }
+            TurnStructure::ProsCons => {
+                distilled_prompt.push_str("\nExplicitly analyze tradeoffs (Pros vs Cons).")
+            }
+            TurnStructure::CodeFirst => {
+                distilled_prompt.push_str("\nProvide the code delta (Δα) before any explanation.")
+            }
+            TurnStructure::Symbolic => distilled_prompt.push_str(
+                "\nUse SSM (Symbolic Swarm Mode): use ∀, ∃, ⊢, ⊥, Δα, σ, μ. Minimize prose.",
+            ),
+            _ => {}
+        }
+
+        if !regression_prefix.is_empty() {
+            distilled_prompt = format!("{regression_prefix}\n{distilled_prompt}");
+        }
+        if !memory_examples.is_empty() {
+            distilled_prompt.push_str("\n\nSuccessful examples from similar tasks:\n");
+            for (i, _ex) in memory_examples.iter().take(5).enumerate() {
+                crate::log_warn!(
+                    writeln!(distilled_prompt, "- [Example {}] (recalled from memory)", i + 1),
+                    "Failed to write example to prompt"
                 );
             }
+        }
+        if !antipatterns.is_empty() {
+            distilled_prompt.push_str("\n\nAntipatterns to AVOID (failed in similar tasks):\n");
+            for ap in antipatterns.iter().take(3) {
+                crate::log_warn!(
+                    writeln!(distilled_prompt, "- [Session {}] {}", ap.session_id, ap.metadata_json),
+                    "Failed to write antipattern to prompt"
+                );
+            }
+        }
 
-            if let Some(ref sel) = adaptive_selection {
-                match sel.strategy {
-                    MetaStrategy::DebateAndCritique => {
-                        distilled_prompt.push_str(
-                            "\n\n[META-STRATEGY: DebateAndCritique] \
-                             High variance in recent certainty scores detected. \
-                             Critically examine all proposals and surface disagreements before converging.\n"
-                        );
-                    }
-                    MetaStrategy::DirectImplementation => {
-                        if let Some(ref agent) = sel.preferred_agent {
-                            distilled_prompt.push_str(&format!(
-                                "\n\n[META-STRATEGY: DirectImplementation] \
-                                 Dominant specialist {} detected (Elo > 1600). \
-                                 Prefer this agent's proposal for final synthesis.\n",
-                                agent
-                            ));
-                        }
-                    }
-                    MetaStrategy::MemoryInjection => {
-                        distilled_prompt.push_str(
-                            "\n\n[META-STRATEGY: MemoryInjection] \
-                             Convergence probability is low after multiple turns. \
-                             Retrieve and apply relevant prior session lessons before proceeding.\n"
-                        );
-                    }
-                    _ => {}
+        // Inject metacognitive observer feedback from prior turn
+        {
+            let obs = self.observer.lock().await;
+            for (_, name) in &active {
+                if let Some(state) = obs.epistemic_state(name)
+                    && state.confidence < 0.5
+                    && !state.defeated.is_empty()
+                {
+                    crate::log_warn!(
+                        writeln!(
+                            distilled_prompt,
+                            "\n[EPISTEMIC UPDATE for {name}] Confidence: {:.0}%. \
+                             Defeated assumptions: {:?}. Adjust your reasoning accordingly.",
+                            state.confidence * 100.0,
+                            state.defeated
+                        ),
+                        "Failed to write epistemic update to prompt"
+                    );
                 }
             }
+        }
 
+        // Inject pending interventions from prior turn's observer
+        {
+            let mut pending = self.pending_interventions.lock().await;
+            if !pending.is_empty() {
+                for (_, name) in &active {
+                    if let Some(block) = MetacognitiveObserver::format_interventions(&pending, name) {
+                        distilled_prompt.push_str(&block);
+                    }
+                }
+                pending.clear();
+            }
+        }
+
+        let artifacts_snapshot = s.artifacts.clone();
+        Ok((distilled_prompt, history_contents, active, artifacts_snapshot))
+    }
+
+    /// Selects and orders the active agent list for a turn.
+    async fn select_active_agents(
+        &self,
+        s: &ConversationState,
+        adaptive_selection: &Option<AdaptiveSelection>,
+    ) -> Vec<(usize, String)> {
+        let mut active = Vec::new();
+        {
             let skips = self.skip_until.lock().await;
-            let mut active = Vec::new();
             for (idx, agent) in self.agents.iter().enumerate() {
                 let until = skips.get(agent.name()).copied().unwrap_or(0);
                 if s.iteration_index >= until {
                     active.push((idx, agent.name().to_string()));
                 }
             }
+        }
+        if active.is_empty() {
+            active.push((0, self.agents[0].name().to_string()));
+        }
+
+        {
+            let vf = self.verification_failures.lock().await;
+            active.retain(|(_, n)| vf.get(n).copied().unwrap_or(0) <= 3);
             if active.is_empty() {
                 active.push((0, self.agents[0].name().to_string()));
             }
+        }
 
+        {
+            let intell = self.intelligence.lock().await;
+            let names: Vec<String> = active.iter().map(|(_, n)| n.clone()).collect();
+            if let Ok(best) = intell.route_task_constrained(
+                TaskCategory::Research,
+                &names,
+                u32::MAX,
+                u64::MAX,
+                &[],
+            ) && let Some(pos) = active.iter().position(|(_, n)| *n == best)
             {
-                let vf = self.verification_failures.lock().await;
-                active.retain(|(_, n)| vf.get(n).copied().unwrap_or(0) <= 3);
-                if active.is_empty() {
-                    active.push((0, self.agents[0].name().to_string()));
-                }
-                drop(vf);
-                let intell = self.intelligence.lock().await;
-                let names: Vec<String> = active.iter().map(|(_, n)| n.clone()).collect();
-                if let Ok(best) = intell.route_task_constrained(
-                    TaskCategory::Research,
-                    &names,
-                    u32::MAX,
-                    u64::MAX,
-                    &[],
-                ) && let Some(pos) = active.iter().position(|(_, n)| *n == best) {
-                    active.swap(0, pos);
-                }
+                active.swap(0, pos);
             }
+        }
 
-            // Elo-based reordering: prefer higher-rated agents
-            {
-                let obs = self.observer.lock().await;
-                let rankings = obs.ranked_agents();
-                if !rankings.is_empty() {
-                    active.sort_by(|a, b| {
-                        let elo_a = rankings.iter().find(|(n, _)| *n == a.1).map(|(_, e)| *e).unwrap_or(1500.0);
-                        let elo_b = rankings.iter().find(|(n, _)| *n == b.1).map(|(_, e)| *e).unwrap_or(1500.0);
-                        elo_b.partial_cmp(&elo_a).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                }
+        {
+            let obs = self.observer.lock().await;
+            let rankings = obs.ranked_agents();
+            if !rankings.is_empty() {
+                active.sort_by(|a, b| {
+                    let elo_a = rankings.iter().find(|(n, _)| *n == a.1).map(|(_, e)| *e).unwrap_or(1500.0);
+                    let elo_b = rankings.iter().find(|(n, _)| *n == b.1).map(|(_, e)| *e).unwrap_or(1500.0);
+                    elo_b.partial_cmp(&elo_a).unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
+        }
 
-            // Adaptive strategy: pin preferred specialist to front when DirectImplementation fires.
-            if let Some(AdaptiveSelection { preferred_agent: Some(ref preferred), .. }) = adaptive_selection
-                && let Some(pos) = active.iter().position(|(_, n)| n == preferred) {
-                    active.swap(0, pos);
-                }
+        if let Some(AdaptiveSelection { preferred_agent: Some(preferred), .. }) = adaptive_selection
+            && let Some(pos) = active.iter().position(|(_, n)| n == preferred)
+        {
+            active.swap(0, pos);
+        }
 
-            // Apply topology-driven agent grouping
-            {
-                use crate::engines::topology::AgentGrouping;
-                let directive = {
-                    let stored = self.active_topology_directive.lock().await;
-                    match stored.as_ref() {
-                        Some(d) => d.clone(),
-                        None => {
-                            let topo = self.topology.lock().await;
-                            topo.current_directive()
-                        }
-                    }
-                };
-                match directive.agent_grouping {
-                    AgentGrouping::Single(idx) => {
-                        if idx < active.len() {
-                            active = vec![active[idx].clone()];
-                        }
-                    }
-                    AgentGrouping::Pairs(ref pairs) => {
-                        if let Some(&(a, b)) = pairs.first() {
-                            let mut subset = Vec::new();
-                            if a < active.len() { subset.push(active[a].clone()); }
-                            if b < active.len() { subset.push(active[b].clone()); }
-                            if !subset.is_empty() { active = subset; }
-                        }
-                    }
-                    AgentGrouping::Branches(ref branches) => {
-                        let branch_idx = (s.iteration_index as usize) % branches.len().max(1);
-                        if let Some(branch) = branches.get(branch_idx) {
-                            let subset: Vec<_> = branch.iter()
-                                .filter_map(|&i| active.get(i).cloned())
-                                .collect();
-                            if !subset.is_empty() { active = subset; }
-                        }
-                    }
-                    AgentGrouping::All => {}
-                }
-                // Inject topology prompt modifier from the same directive
-                if let Some(modifier) = &directive.prompt_modifier {
-                    distilled_prompt.push('\n');
-                    distilled_prompt.push_str(modifier);
-                    distilled_prompt.push('\n');
-                }
-            }
+        active
+    }
 
-            let mut final_prompt = distilled_prompt;
-
-            let structure = ReasoningEngine::select_structure(TaskCategory::Research, &active[0].1);
-            match structure {
-                TurnStructure::StepByStep => final_prompt
-                    .push_str("\nStructure your response with numbered reasoning steps."),
-                TurnStructure::ProsCons => {
-                    final_prompt.push_str("\nExplicitly analyze tradeoffs (Pros vs Cons).")
-                }
-                TurnStructure::CodeFirst => {
-                    final_prompt.push_str("\nProvide the code delta (Δα) before any explanation.")
-                }
-                TurnStructure::Symbolic => final_prompt.push_str(
-                    "\nUse SSM (Symbolic Swarm Mode): use ∀, ∃, ⊢, ⊥, Δα, σ, μ. Minimize prose.",
-                ),
-                _ => {}
-            }
-
-            if !regression_prefix.is_empty() {
-                final_prompt = format!("{regression_prefix}\n{final_prompt}");
-            }
-            if !memory_examples.is_empty() {
-                final_prompt.push_str("\n\nSuccessful examples from similar tasks:\n");
-                for (i, _ex) in memory_examples.iter().take(5).enumerate() {
-                    crate::log_warn!(writeln!(
-                        final_prompt,
-                        "- [Example {}] (recalled from memory)",
-                        i + 1
-                    ), "Failed to write example to prompt");
-                }
-            }
-            if !antipatterns.is_empty() {
-                final_prompt.push_str("\n\nAntipatterns to AVOID (failed in similar tasks):\n");
-                for ap in antipatterns.iter().take(3) {
-                    crate::log_warn!(writeln!(
-                        final_prompt,
-                        "- [Session {}] {}",
-                        ap.session_id, ap.metadata_json
-                    ), "Failed to write antipattern to prompt");
-                }
-            }
-
-            // Inject metacognitive observer feedback from prior turn
-            {
-                let obs = self.observer.lock().await;
-                for (_, name) in &active {
-                    if let Some(state) = obs.epistemic_state(name)
-                        && state.confidence < 0.5 && !state.defeated.is_empty() {
-                            crate::log_warn!(writeln!(
-                                final_prompt,
-                                "\n[EPISTEMIC UPDATE for {name}] Confidence: {:.0}%. \
-                                 Defeated assumptions: {:?}. Adjust your reasoning accordingly.",
-                                state.confidence * 100.0,
-                                state.defeated
-                            ), "Failed to write epistemic update to prompt");
-                        }
-                }
-            }
-
-            // Inject pending interventions from prior turn's observer
-            {
-                let mut pending = self.pending_interventions.lock().await;
-                if !pending.is_empty() {
-                    for (_, name) in &active {
-                        if let Some(block) =
-                            MetacognitiveObserver::format_interventions(&pending, name)
-                        {
-                            final_prompt.push_str(&block);
-                        }
-                    }
-                    pending.clear();
-                }
-            }
-
-            let artifacts_snapshot = s.artifacts.clone();
-            (final_prompt, contents, active, artifacts_snapshot)
-        };
-
-        const PROMPT_CHAR_CAP: usize = 24_000;
-        let prompt = if prompt.len() > PROMPT_CHAR_CAP {
-            self.emit(StreamEvent::TokenReceived {
-                agent_id: "System".to_string(),
-                token: format!(
-                    "[prompt] Truncated to {}K chars (was {} chars)\n",
-                    PROMPT_CHAR_CAP / 1000,
-                    prompt.len()
-                ),
-            })
-            .await?;
-            let mut truncated = prompt[..PROMPT_CHAR_CAP].to_string();
-            truncated.push_str("\n... [truncated]");
-            truncated
-        } else {
-            prompt
-        };
-
-        let start_time = Instant::now();
+    /// Phase 4: Call agents (with caching, rate-limiting, streaming, and control signal handling).
+    /// Returns the collected `(agent_id, response_text)` pairs.
+    async fn call_agents(
+        &self,
+        sigma_lock: &Arc<Mutex<ConversationState>>,
+        prompt: Arc<str>,
+        mut active_agents: Vec<(usize, String)>,
+        strategy_reduce_agents: bool,
+    ) -> Result<Vec<(String, String)>> {
         let (paused_tx, paused_rx) = tokio::sync::watch::channel(false);
 
-        let mut active_agents = active_agents;
         if strategy_reduce_agents && active_agents.len() > 1 {
             active_agents.truncate(1);
             self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
                 token: "Budget burn rate high — reducing to single agent\n".to_string(),
-            }).await?;
+            })
+            .await?;
         }
         {
             let s = sigma_lock.lock().await;
             if s.budget.mode() == BudgetMode::Emergency && active_agents.len() > 1 {
-                active_agents.truncate(1);
                 drop(s);
+                active_agents.truncate(1);
                 self.emit(StreamEvent::TokenReceived {
                     agent_id: "System".to_string(),
                     token: "[compute] Emergency budget mode: single agent only\n".to_string(),
-                }).await?;
+                })
+                .await?;
             }
         }
 
@@ -718,18 +788,19 @@ impl Orchestrator {
                 self.emit(StreamEvent::TokenReceived {
                     agent_id: "System".to_string(),
                     token: format!("\nAsking {} for their take...\n", agent_names.join(" and ")),
-                }).await?;
+                })
+                .await?;
             }
             if !cached_results.is_empty() {
                 let cached_names: Vec<&str> = cached_results.iter().map(|(n, _)| n.as_str()).collect();
                 self.emit(StreamEvent::TokenReceived {
                     agent_id: "System".to_string(),
                     token: format!("Reusing cached response from {}\n", cached_names.join(", ")),
-                }).await?;
+                })
+                .await?;
             }
         }
 
-        let prompt: Arc<str> = Arc::from(prompt);
         let mut tasks = Vec::new();
         for (idx, name) in &uncached_agents {
             let agent = &self.agents[*idx];
@@ -739,10 +810,12 @@ impl Orchestrator {
             let mut p_rx = paused_rx.clone();
             let rate_limiter = Arc::clone(&self.rate_limiter);
 
-            // --- Suggestion 2: Closed-Loop Agent Prompt Evolution ---
             let feedback = {
                 let collective = self.collective.lock().await;
-                collective.profiles.get(&agent_id).and_then(crate::engines::prompt_evolution::ClosedLoopFeedback::generate_corrective_directive)
+                collective
+                    .profiles
+                    .get(&agent_id)
+                    .and_then(crate::engines::prompt_evolution::ClosedLoopFeedback::generate_corrective_directive)
             };
 
             tasks.push(async move {
@@ -762,20 +835,21 @@ impl Orchestrator {
                     let mut stream = match agent.stream_prompt(&agent_prompt).await {
                         Ok(s) => s,
                         Err(e) => {
-                            // --- Suggestion 10: Distributed Compute Fallback ---
                             tracing::info!(agent = %agent_id, "local inference failed, attempting remote MCP fallback");
-                            // Do not hold the mutex across the async socket I/O; dispatch_remote_sampling
-                            // reads no gateway fields so it can be called as a free function.
                             if let Ok(remote_res) = McpGateway::remote_sampling(&agent_prompt, &agent_id).await {
                                 return Ok((agent_id, remote_res));
                             }
-
                             let e = anyhow::anyhow!("Agent {agent_id} failure: {e:?}");
                             if is_fatal_auth_error(&e) {
                                 return Err(e);
                             }
                             if is_rate_limited(&e) && attempt < 3 {
-                                event_tx.send(StreamEvent::TokenReceived { agent_id: agent_id.clone(), token: format!("\n[{agent_id}] rate-limited, retrying in {}s...\n", delay_ms / 1000) }).await?;
+                                event_tx
+                                    .send(StreamEvent::TokenReceived {
+                                        agent_id: agent_id.clone(),
+                                        token: format!("\n[{agent_id}] rate-limited, retrying in {}s...\n", delay_ms / 1000),
+                                    })
+                                    .await?;
                                 continue;
                             }
                             return Err(e);
@@ -785,12 +859,17 @@ impl Orchestrator {
                     let mut response = String::new();
                     let mut hit_rate_limit = false;
                     loop {
-                        if *p_rx.borrow() { crate::log_warn!(p_rx.changed().await, "Failed to wait for pause state change"); continue; }
+                        if *p_rx.borrow() {
+                            crate::log_warn!(p_rx.changed().await, "Failed to wait for pause state change");
+                            continue;
+                        }
                         match tokio::time::timeout(std::time::Duration::from_secs(120), stream.next()).await {
                             Err(_) => return Err(anyhow::anyhow!("Agent {agent_id} timed out waiting for response")),
                             Ok(Some(Ok(chunk))) => {
                                 response.push_str(&chunk);
-                                event_tx.send(StreamEvent::TokenReceived { agent_id: agent_id.clone(), token: chunk }).await?;
+                                event_tx
+                                    .send(StreamEvent::TokenReceived { agent_id: agent_id.clone(), token: chunk })
+                                    .await?;
                             }
                             Ok(Some(Err(e))) => {
                                 let e = anyhow::anyhow!("Agent {agent_id} stream error: {e:?}");
@@ -799,7 +878,12 @@ impl Orchestrator {
                                 }
                                 if is_rate_limited(&e) && attempt < 3 {
                                     hit_rate_limit = true;
-                                    event_tx.send(StreamEvent::TokenReceived { agent_id: agent_id.clone(), token: format!("\n[{agent_id}] rate-limited mid-stream, retrying in {}s...\n", delay_ms / 1000) }).await?;
+                                    event_tx
+                                        .send(StreamEvent::TokenReceived {
+                                            agent_id: agent_id.clone(),
+                                            token: format!("\n[{agent_id}] rate-limited mid-stream, retrying in {}s...\n", delay_ms / 1000),
+                                        })
+                                        .await?;
                                 } else {
                                     return Err(e);
                                 }
@@ -829,9 +913,7 @@ impl Orchestrator {
                             Ok(val) => final_results.push(val),
                             Err(e) => {
                                 let msg = e.to_string();
-                                if msg.contains("credit balance is too low")
-                                    || msg.contains("invalid_request_error")
-                                {
+                                if msg.contains("credit balance is too low") || msg.contains("invalid_request_error") {
                                     return Err(e);
                                 }
                                 self.emit(StreamEvent::Error(format!("Agent dropped: {}", e))).await?;
@@ -852,9 +934,9 @@ impl Orchestrator {
                 }
                 signal = ctrl_guard.recv(), if ctrl_open => {
                     match signal {
-                        Some(ControlSignal::Pause) => { crate::log_warn!(paused_tx.send(true), "Failed to send pause signal"); },
-                        Some(ControlSignal::Resume) => { crate::log_warn!(paused_tx.send(false), "Failed to send resume signal"); },
-                        Some(ControlSignal::Shutdown) => return Ok(false),
+                        Some(ControlSignal::Pause) => { crate::log_warn!(paused_tx.send(true), "Failed to send pause signal"); }
+                        Some(ControlSignal::Resume) => { crate::log_warn!(paused_tx.send(false), "Failed to send resume signal"); }
+                        Some(ControlSignal::Shutdown) => return Ok(vec![]),
                         Some(ControlSignal::LockCode(name)) => {
                             let mut sigma = sigma_lock.lock().await;
                             if let Some(r) = sigma.goal_tree.root.as_mut() {
@@ -876,10 +958,7 @@ impl Orchestrator {
                             self.emit(StreamEvent::TokenReceived { agent_id: "System".to_string(), token: format!("[Steer] Dampened swarm by factor: {:.2}\n", factor) }).await?;
                         }
                         Some(ControlSignal::Inject(text)) => {
-                            // --- Track 04-B: Neural Intercept (Manual Steering) ---
-                            self.emit(StreamEvent::TokenReceived { agent_id: "User".to_string(), token: format!("
-[Neural Intercept] Injecting: {}
-", text) }).await?;
+                            self.emit(StreamEvent::TokenReceived { agent_id: "User".to_string(), token: format!("\n[Neural Intercept] Injecting: {}\n", text) }).await?;
                             let mut sigma = sigma_lock.lock().await;
                             let user_turn = Turn {
                                 index: sigma.iteration_index,
@@ -898,26 +977,33 @@ impl Orchestrator {
                             };
                             sigma.turns.push(user_turn);
                             sigma.iteration_index += 1;
-                            // Returning false will restart the turn with the new sigma context
-                            return Ok(false);
+                            return Ok(vec![]);
                         }
                         Some(ControlSignal::Rewind(index)) => {
                             if let Ok(Some(restored)) = self.state_manager.restore_async(index).await {
                                 let mut s = sigma_lock.lock().await;
                                 *s = restored;
                                 self.emit(StreamEvent::TokenReceived { agent_id: "System".to_string(), token: format!("\n[Rewound to iteration {}]\n", index) }).await?;
-                                return Ok(true);
+                                return Ok(vec![]);
                             }
                         }
-                        None => { ctrl_open = false; },
+                        None => { ctrl_open = false; }
                     }
                 }
             }
         }
 
-        let weights =
-            crate::engines::consensus::InfluenceWeightManager::calculate_weights_with_recency(&*sigma_lock.lock().await, 0.9);
+        Ok(final_results)
+    }
 
+    /// Phase 5: Synthesise raw agent responses into a single text + artifact block.
+    /// Returns `(response, nash_weight_updates, stall_risk)`.
+    async fn synthesize_responses(
+        &self,
+        final_results: &[(String, String)],
+        artifacts_snapshot: &BTreeMap<String, Arc<Artifact>>,
+        weights: &BTreeMap<String, f64>,
+    ) -> Result<(String, BTreeMap<String, f64>, f64)> {
         // Outlier detection: compute pairwise word-overlap similarity
         let mut outlier_penalty: HashMap<&str, f64> = HashMap::new();
         if final_results.len() >= 2 {
@@ -929,35 +1015,27 @@ impl Orchestrator {
                 let mut sim_sum = 0.0;
                 let mut count = 0;
                 for (j, (_, set_j)) in word_sets.iter().enumerate() {
-                    if i == j {
-                        continue;
-                    }
+                    if i == j { continue; }
                     let intersection = set_i.intersection(set_j).count() as f64;
                     let union = set_i.union(set_j).count().max(1) as f64;
                     sim_sum += intersection / union;
                     count += 1;
                 }
-                let mean_sim = if count > 0 {
-                    sim_sum / count as f64
-                } else {
-                    1.0
-                };
+                let mean_sim = if count > 0 { sim_sum / count as f64 } else { 1.0 };
                 if mean_sim < 0.3 {
                     outlier_penalty.insert(id, 0.1);
                 }
             }
 
-            // --- Track 04-C: Entropy Mapping (Disagreement Heatmap) ---
+            // Entropy mapping (disagreement heatmap)
             let mut entropy_entries = Vec::new();
-            // We can approximate disagreement per artifact by comparing what each agent proposed.
-            // But since final_results is just the full text, we must parse artifacts first.
-            let mut agent_artifact_proposals: std::collections::HashMap<String, std::collections::HashMap<String, String>> = std::collections::HashMap::new();
-            for (id, text) in &final_results {
+            let mut agent_artifact_proposals: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+                std::collections::HashMap::new();
+            for (id, text) in final_results {
                 for (art_name, (_, content)) in Self::parse_artifacts(text) {
                     agent_artifact_proposals.entry(art_name).or_default().insert(id.clone(), content);
                 }
             }
-
             for (art_name, proposals) in agent_artifact_proposals {
                 let mut scores = Vec::new();
                 let agents: Vec<(&String, &String)> = proposals.iter().collect();
@@ -973,10 +1051,7 @@ impl Orchestrator {
                     let score: f64 = if count > 0 { (dist_sum / (count as f32).max(1.0)) as f64 } else { 0.0 };
                     scores.push(((*id_i).clone(), score));
                 }
-                entropy_entries.push(crate::types::events::EntropyEntry {
-                    artifact_name: art_name,
-                    scores,
-                });
+                entropy_entries.push(crate::types::events::EntropyEntry { artifact_name: art_name, scores });
             }
             self.emit(crate::types::events::StreamEvent::EntropyUpdated(entropy_entries)).await?;
         }
@@ -986,38 +1061,35 @@ impl Orchestrator {
             if outlier_names.is_empty() {
                 self.emit(StreamEvent::TokenReceived {
                     agent_id: "System".to_string(),
-                    token: format!(
-                        "All {} agents broadly agree. Merging into consensus...\n",
-                        final_results.len()
-                    ),
-                }).await?;
+                    token: format!("All {} agents broadly agree. Merging into consensus...\n", final_results.len()),
+                })
+                .await?;
             } else {
                 self.emit(StreamEvent::TokenReceived {
                     agent_id: "System".to_string(),
-                    token: format!(
-                        "{} diverged from the group — downweighting outlier during synthesis\n",
-                        outlier_names.join(", ")
-                    ),
-                }).await?;
+                    token: format!("{} diverged from the group — downweighting outlier during synthesis\n", outlier_names.join(", ")),
+                })
+                .await?;
             }
         }
 
-        // 1. Collective Text Synthesis (surprise + certainty + outlier calibrated)
-        let se = self.surprise_engine.lock().await;
-        let text_proposals: Vec<(String, String, f64)> = final_results
-            .iter()
-            .map(|(id, text)| {
-                let base_w = weights.get(id).copied().unwrap_or(1.0);
-                let surprise_w = se.calibrate_weight(id, base_w);
-                let certainty = CertaintyAnalyzer::compute(text, 0.1);
-                let outlier_w = outlier_penalty.get(id.as_str()).copied().unwrap_or(1.0);
-                (id.clone(), text.clone(), surprise_w * certainty * outlier_w)
-            })
-            .collect();
-        drop(se);
-        let synthesized_text = EnsembleEngine::merge_proposals(text_proposals, TaskCategory::Research, "");
+        // Collective text synthesis (surprise + certainty + outlier calibrated)
+        let synthesized_text = {
+            let se = self.surprise_engine.lock().await;
+            let text_proposals: Vec<(String, String, f64)> = final_results
+                .iter()
+                .map(|(id, text)| {
+                    let base_w = weights.get(id).copied().unwrap_or(1.0);
+                    let surprise_w = se.calibrate_weight(id, base_w);
+                    let certainty = CertaintyAnalyzer::compute(text, 0.1);
+                    let outlier_w = outlier_penalty.get(id.as_str()).copied().unwrap_or(1.0);
+                    (id.clone(), text.clone(), surprise_w * certainty * outlier_w)
+                })
+                .collect();
+            EnsembleEngine::merge_proposals(text_proposals, TaskCategory::Research, "")
+        };
 
-                         // 2. Collective Artifact Synthesis (Nash Equilibrium Resolution)
+        // Collective artifact synthesis (Nash equilibrium resolution)
         let mut synthesized_artifacts = String::new();
         let mut nash_score_acc: std::collections::BTreeMap<String, (f64, u32)> = std::collections::BTreeMap::new();
         let artifact_proposals = Self::parse_artifacts(&synthesized_text);
@@ -1025,7 +1097,7 @@ impl Orchestrator {
             let default_art = Arc::new(Artifact::default());
             let current = artifacts_snapshot.get(&name).unwrap_or(&default_art);
             let mut proposals_for_nash = Vec::new();
-            for (agent_id, text) in &final_results {
+            for (agent_id, text) in final_results {
                 let parsed = Self::parse_artifacts(text);
                 if let Some((_, proposal_content)) = parsed.get(&name) {
                     let mut temp_art = (**current).clone();
@@ -1034,23 +1106,26 @@ impl Orchestrator {
                 }
             }
             if proposals_for_nash.is_empty() { continue; }
-            let nash_refs: Vec<(&str, &Artifact, TurnOutcome)> = proposals_for_nash.iter().map(|(id, art, out)| (*id, art, *out)).collect();
+            let nash_refs: Vec<(&str, &Artifact, TurnOutcome)> =
+                proposals_for_nash.iter().map(|(id, art, out)| (*id, art, *out)).collect();
             for (agent_id, score) in crate::engines::consensus::NashSolver::compute_nash_scores(&nash_refs) {
                 let e = nash_score_acc.entry(agent_id).or_insert((0.0_f64, 0_u32));
                 e.0 += score;
                 e.1 += 1;
             }
             let winning_content = crate::engines::consensus::NashSolver::resolve_with_synthesis(&nash_refs, current);
-            crate::log_warn!(writeln!(synthesized_artifacts, "\n```{}:{}\n{}\n```", lang, name, winning_content), "Failed to write synthesized artifact");
+            crate::log_warn!(
+                writeln!(synthesized_artifacts, "\n```{}:{}\n{}\n```", lang, name, winning_content),
+                "Failed to write synthesized artifact"
+            );
         }
 
-        // Improvement #2: average Nash scores across artifacts for EMA weight update.
         let nash_weight_updates: std::collections::BTreeMap<String, f64> = nash_score_acc
             .into_iter()
             .map(|(id, (sum, count))| (id, if count > 0 { sum / count as f64 } else { 0.5 }))
             .collect();
 
-        // Improvement #4: stall detection.
+        // Stall detection
         let stall_risk = {
             let proposals_map: HashMap<String, String> = final_results.iter().map(|(id, text)| {
                 use std::hash::{Hash, Hasher};
@@ -1059,9 +1134,8 @@ impl Orchestrator {
                 (id.clone(), format!("{:x}", h.finish()))
             }).collect();
             let turn_entropy = if final_results.len() >= 2 {
-                let word_sets: Vec<std::collections::HashSet<&str>> = final_results.iter()
-                    .map(|(_, t)| t.split_whitespace().collect())
-                    .collect();
+                let word_sets: Vec<std::collections::HashSet<&str>> =
+                    final_results.iter().map(|(_, t)| t.split_whitespace().collect()).collect();
                 let union_size = word_sets.iter().flat_map(|s| s.iter()).collect::<std::collections::HashSet<_>>().len();
                 let avg_size: f64 = word_sets.iter().map(|s| s.len() as f64).sum::<f64>() / word_sets.len() as f64;
                 if union_size > 0 { 1.0 - avg_size / union_size as f64 } else { 0.0 }
@@ -1080,11 +1154,17 @@ impl Orchestrator {
         }
 
         let response = format!("{}\n{}", synthesized_text, synthesized_artifacts);
-        let winner_id = "Collective Swarm".to_string();
+        Ok((response, nash_weight_updates, stall_risk))
+    }
 
-        let latency_ms = start_time.elapsed().as_millis() as u64;
-
-        let secrets = SecretScanner::scan(&response);
+    /// Phase 6: Run security, tautology, and fallacy filters on the synthesised response.
+    /// Returns `Ok(false)` when the response must be dropped, `Ok(true)` when it passes.
+    async fn filter_response(
+        &self,
+        response: &str,
+        history_contents: &[String],
+    ) -> Result<bool> {
+        let secrets = SecretScanner::scan(response);
         if !secrets.is_empty() {
             self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
@@ -1094,7 +1174,7 @@ impl Orchestrator {
             return Ok(false);
         }
 
-        if TautologyFilter::is_tautological(&response, &history_contents) {
+        if TautologyFilter::is_tautological(response, history_contents) {
             self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
                 token: "\n[Pruned: Tautology]\n".to_string(),
@@ -1103,7 +1183,7 @@ impl Orchestrator {
             return Ok(false);
         }
 
-        let fallacies = FallacyDetector::scan(&response);
+        let fallacies = FallacyDetector::scan(response);
         if !fallacies.is_empty() {
             self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
@@ -1112,18 +1192,32 @@ impl Orchestrator {
             .await?;
         }
 
-        // Phase 4: Validate and prepare artifact changes — no lock held.
-        let mut retry_count = 0;
+        Ok(true)
+    }
+
+    /// Phase 7: Validate artifacts, self-heal up to 3 times, then reward/penalise agents.
+    /// Returns `Some((changes, turn_outcome, final_response))` on success, `None` on total failure.
+    #[allow(clippy::too_many_arguments)]
+    async fn validate_and_heal(
+        &self,
+        sigma_lock: &Arc<Mutex<ConversationState>>,
+        response: String,
+        artifacts_snapshot: &BTreeMap<String, Arc<Artifact>>,
+        active_agents: &[(usize, String)],
+        weights: &BTreeMap<String, f64>,
+        final_results: &[(String, String)],
+        prompt: &Arc<str>,
+        pre_turn_idx: u32,
+        paused_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Option<(Vec<PreparedArtifactChange>, TurnOutcome, String)>> {
+        let mut retry_count = 0u32;
         let mut current_response = response;
         let mut final_prepared = None;
         let mut last_failure_regressive = false;
 
         while retry_count < 3 {
             let proposed_artifacts = Self::parse_artifacts(&current_response);
-            match self
-                .process_proposed_artifacts(proposed_artifacts, &artifacts_snapshot)
-                .await?
-            {
+            match self.process_proposed_artifacts(proposed_artifacts, artifacts_snapshot).await? {
                 ArtifactProcessOutcome::Ready(changes, turn_outcome) => {
                     final_prepared = Some((changes, turn_outcome, current_response));
                     break;
@@ -1133,10 +1227,13 @@ impl Orchestrator {
                     retry_count += 1;
                     self.emit(StreamEvent::TokenReceived {
                         agent_id: "System".to_string(),
-                        token: format!("\n[Self-Healing] Synthesis failed validation. Attempting hot-patch cycle {}/3...\n", retry_count)
-                    }).await?;
+                        token: format!(
+                            "\n[Self-Healing] Synthesis failed validation. Attempting hot-patch cycle {}/3...\n",
+                            retry_count
+                        ),
+                    })
+                    .await?;
 
-                    // Escalate topology after 2 failed attempts
                     if retry_count == 2 {
                         let sigma = sigma_lock.lock().await;
                         let mut topo = self.topology.lock().await;
@@ -1151,14 +1248,13 @@ impl Orchestrator {
                         }
                     }
 
-                    // Re-dispatch to swarm with error context
                     let corrective_prompt = format!(
                         "{}\n\n[CRITICAL: Validation Failed]\nThe previous collective synthesis failed quality/safety gates. Re-implement the code blocks ensuring strict adherence to Rust safety and project invariants.",
                         prompt
                     );
 
                     let mut tasks = Vec::new();
-                    for (idx, name) in &active_agents {
+                    for (idx, name) in active_agents {
                         let agent = &self.agents[*idx];
                         let agent_id = name.clone();
                         let p = corrective_prompt.clone();
@@ -1182,10 +1278,7 @@ impl Orchestrator {
                                     Ok(Some(Ok(chunk))) => {
                                         resp.push_str(&chunk);
                                         event_tx
-                                            .send(StreamEvent::TokenReceived {
-                                                agent_id: agent_id.clone(),
-                                                token: chunk,
-                                            })
+                                            .send(StreamEvent::TokenReceived { agent_id: agent_id.clone(), token: chunk })
                                             .await?;
                                     }
                                     Err(_) => return Err(anyhow::anyhow!("Agent {agent_id} timed out waiting for response")),
@@ -1195,11 +1288,9 @@ impl Orchestrator {
                             Ok::<(String, String), anyhow::Error>((agent_id, resp))
                         });
                     }
-                    let results = futures::future::join_all(tasks).await;
-                    let mut new_proposals = Vec::new();
-                    for res in results.into_iter().flatten() {
-                        new_proposals.push(res);
-                    }
+
+                    let new_proposals: Vec<(String, String)> =
+                        futures::future::join_all(tasks).await.into_iter().flatten().collect();
 
                     if new_proposals.is_empty() {
                         break;
@@ -1207,37 +1298,32 @@ impl Orchestrator {
 
                     let text_proposals: Vec<(String, String, f64)> = new_proposals
                         .iter()
-                        .map(|(id, text)| {
-                            (
-                                id.clone(),
-                                text.clone(),
-                                weights.get(id).copied().unwrap_or(1.0),
-                            )
-                        })
+                        .map(|(id, text)| (id.clone(), text.clone(), weights.get(id).copied().unwrap_or(1.0)))
                         .collect();
                     let syn_text = EnsembleEngine::merge_proposals(text_proposals, TaskCategory::Research, "");
 
-                    let mut art_proposals: BTreeMap<String, (String, Vec<ArtifactDiff>)> =
-                        BTreeMap::new();
+                    let mut art_proposals: BTreeMap<String, (String, Vec<ArtifactDiff>)> = BTreeMap::new();
                     for (_id, text) in &new_proposals {
                         for (name, (lang, content)) in Self::parse_artifacts(text) {
                             let default_art = Arc::new(Artifact::default());
                             let current = artifacts_snapshot.get(&name).unwrap_or(&default_art);
                             let entry = art_proposals.entry(name).or_insert((lang, vec![]));
-                            entry.1.push(DiffEngine::generate_delta(
-                                &current.content,
-                                &content,
-                                current.version,
-                            ));
+                            entry.1.push(DiffEngine::generate_delta(&current.content, &content, current.version));
                         }
                     }
                     let mut syn_arts = String::new();
                     for (name, (lang, diffs)) in art_proposals {
                         let default_art = Arc::new(Artifact::default());
                         let current = artifacts_snapshot.get(&name).unwrap_or(&default_art);
-                        if let Some(merged) = SynthesisEngine::merge(&current.content, diffs.into_iter().map(|d| ("Anonymous".to_string(), d)).collect(), &lang)
-                        {
-                            crate::log_warn!(writeln!(syn_arts, "\n```{}:{}\n{}\n```", lang, name, merged), "Failed to write merged artifact");
+                        if let Some(merged) = SynthesisEngine::merge(
+                            &current.content,
+                            diffs.into_iter().map(|d| ("Anonymous".to_string(), d)).collect(),
+                            &lang,
+                        ) {
+                            crate::log_warn!(
+                                writeln!(syn_arts, "\n```{}:{}\n{}\n```", lang, name, merged),
+                                "Failed to write merged artifact"
+                            );
                         }
                     }
                     current_response = format!("{}\n{}", syn_text, syn_arts);
@@ -1245,41 +1331,50 @@ impl Orchestrator {
             }
         }
 
-        let Some((changes, turn_outcome, final_response)) = final_prepared else {
-            // All retry attempts failed: penalise every participating agent.
+        if final_prepared.is_none() {
             {
                 let intell = self.intelligence.lock().await;
-                for (id, _) in &final_results {
+                for (id, _) in final_results {
                     intell.update_diff_quality(id, false, last_failure_regressive);
                 }
             }
             self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
-                token: "\n[Self-Healing Failed] Could not converge on a valid synthesis after 3 attempts. Aborting turn.\n".to_string()
-            }).await?;
-            return Ok(false);
-        };
+                token: "\n[Self-Healing Failed] Could not converge on a valid synthesis after 3 attempts. Aborting turn.\n".to_string(),
+            })
+            .await?;
+        }
 
-        // Diffs passed all quality gates: reward each participating agent.
+        Ok(final_prepared)
+    }
+
+    /// Phase 8: Update agent intelligence profiles and metacognitive state after a successful turn.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_agent_profiles(
+        &self,
+        sigma_lock: &Arc<Mutex<ConversationState>>,
+        final_results: &[(String, String)],
+        winner_id: &str,
+        turn_outcome: TurnOutcome,
+        final_response: &str,
+        pre_turn_idx: u32,
+        pre_recent_turns: &[Turn],
+        latency_ms: u64,
+    ) -> Result<()> {
+        // Reward agents that produced good diffs
         {
             let intell = self.intelligence.lock().await;
-            for (id, _) in &final_results {
+            for (id, _) in final_results {
                 intell.update_diff_quality(id, true, false);
             }
         }
 
-        if !changes.is_empty() {
-            let names: Vec<&str> = changes.iter().map(|c| c.name.as_str()).collect();
-            self.emit(StreamEvent::TokenReceived {
-                agent_id: "System".to_string(),
-                token: format!("Writing changes to {}\n", names.join(", ")),
-            }).await?;
-        }
-        // Phase 5: Profile updates + commit under lock.
-        {
+        if !final_results.is_empty() {
+            let names: Vec<&str> = final_results.iter().map(|(id, _)| id.as_str()).collect();
+            // Notify which artifacts will be written — done upstream, so just profile updates here.
             let sigma = sigma_lock.lock().await;
             let intell = self.intelligence.lock().await;
-            for (id, text) in &final_results {
+            for (id, text) in final_results {
                 let p_turn = Turn {
                     index: sigma.iteration_index,
                     model_id: id.clone(),
@@ -1287,11 +1382,7 @@ impl Orchestrator {
                     timestamp: ConversationState::now(),
                     diffs: vec![],
                     certainty: Some(CertaintyAnalyzer::compute(text, 0.1)),
-                    outcome: if id == &winner_id {
-                        turn_outcome
-                    } else {
-                        TurnOutcome::Unknown
-                    },
+                    outcome: if id == winner_id { turn_outcome } else { TurnOutcome::Unknown },
                     task_category: Some(TaskCategory::Research),
                     structure: Some(TurnStructure::FreeForm),
                     signature: vec![],
@@ -1301,14 +1392,17 @@ impl Orchestrator {
                 };
                 intell.update_profile_with_latency(&p_turn, 0.7, latency_ms);
             }
+            drop(intell);
+            drop(sigma);
+            let _ = names; // consumed above
         }
 
-        // Metacognitive observation: observe ALL agent turns
+        // Metacognitive observation
         {
             let mut obs = self.observer.lock().await;
             let mut surprise = self.surprise_engine.lock().await;
             let mut interventions = Vec::new();
-            for (agent_id_obs, response_text) in &final_results {
+            for (agent_id_obs, response_text) in final_results {
                 let agent_turn = Turn {
                     index: pre_turn_idx,
                     model_id: agent_id_obs.clone(),
@@ -1316,7 +1410,7 @@ impl Orchestrator {
                     timestamp: ConversationState::now(),
                     diffs: vec![],
                     certainty: Some(CertaintyAnalyzer::compute(response_text, 0.1)),
-                    outcome: if agent_id_obs == &winner_id { turn_outcome } else { TurnOutcome::Unknown },
+                    outcome: if agent_id_obs == winner_id { turn_outcome } else { TurnOutcome::Unknown },
                     task_category: Some(TaskCategory::Research),
                     structure: None,
                     signature: vec![],
@@ -1324,7 +1418,7 @@ impl Orchestrator {
                     consistency_score: None,
                     diff_quality_score: None,
                 };
-                let agent_interventions = obs.observe_turn(&agent_turn, &pre_recent_turns, &mut surprise);
+                let agent_interventions = obs.observe_turn(&agent_turn, pre_recent_turns, &mut surprise);
                 interventions.extend(agent_interventions);
             }
             drop(surprise);
@@ -1341,14 +1435,13 @@ impl Orchestrator {
                 }
             }
 
-            // Record intervention effectiveness before overwriting pending list
             let winner_turn = Turn {
                 index: pre_turn_idx,
-                model_id: winner_id.clone(),
-                content: final_response.clone(),
+                model_id: winner_id.to_string(),
+                content: final_response.to_string(),
                 timestamp: ConversationState::now(),
                 diffs: vec![],
-                certainty: Some(CertaintyAnalyzer::compute(&final_response, 0.1)),
+                certainty: Some(CertaintyAnalyzer::compute(final_response, 0.1)),
                 outcome: turn_outcome,
                 task_category: Some(TaskCategory::Research),
                 structure: None,
@@ -1363,23 +1456,22 @@ impl Orchestrator {
             {
                 let pending = self.pending_interventions.lock().await;
                 for intervention in pending.iter().filter(|i| i.target_agent == winner_id) {
-                    obs.record_intervention_outcome(&winner_id, intervention.source, improved);
+                    obs.record_intervention_outcome(winner_id, intervention.source, improved);
                 }
             }
-
             if !interventions.is_empty() {
                 let mut pending = self.pending_interventions.lock().await;
                 *pending = interventions;
             }
 
-            // Check agent elimination based on Elo
-            if obs.should_eliminate(&winner_id, 10) {
+            if obs.should_eliminate(winner_id, 10) {
                 let mut skips = self.skip_until.lock().await;
-                skips.insert(winner_id.clone(), pre_turn_idx + 100);
+                skips.insert(winner_id.to_string(), pre_turn_idx + 100);
                 self.emit(StreamEvent::TokenReceived {
                     agent_id: "Observer".to_string(),
                     token: format!("[ELIMINATION] Agent {} removed from pool (Elo < 1200)\n", winner_id),
-                }).await?;
+                })
+                .await?;
             }
         }
 
@@ -1388,8 +1480,8 @@ impl Orchestrator {
             let sigma = sigma_lock.lock().await;
             let quality = crate::engines::intelligence::QualityScorer::score(&Turn {
                 index: pre_turn_idx,
-                model_id: winner_id.clone(),
-                content: final_response.clone(),
+                model_id: winner_id.to_string(),
+                content: final_response.to_string(),
                 timestamp: ConversationState::now(),
                 diffs: vec![],
                 certainty: None,
@@ -1416,13 +1508,132 @@ impl Orchestrator {
             }
         }
 
+        Ok(())
+    }
+
+    #[instrument(skip_all, fields(session, turn))]
+    pub async fn run_turn(&self, sigma_lock: Arc<Mutex<ConversationState>>) -> Result<bool> {
+        // Phase 1: load memory context and detect prior regressions.
+        let (pre_session_id, pre_turn_idx, pre_recent_turns, memory_examples, antipatterns, regression_prefix) =
+            self.prepare_context_from_memory(&sigma_lock).await?;
+        tracing::Span::current().record("session", pre_session_id.as_str());
+        tracing::Span::current().record("turn", pre_turn_idx);
+
+        // Phase 2: analytics strategy + adaptive agent selection.
+        let (strategy_critique, strategy_reduce_agents, adaptive_selection, s) =
+            self.analyze_strategy_and_select_agents(&sigma_lock).await?;
+
+        // Phase 3: build final prompt.
+        let (raw_prompt, history_contents, active_agents, artifacts_snapshot) = self
+            .build_prompt(
+                &s,
+                strategy_critique,
+                &adaptive_selection,
+                &memory_examples,
+                &antipatterns,
+                &regression_prefix,
+            )
+            .await?;
+
+        const PROMPT_CHAR_CAP: usize = 24_000;
+        let prompt_str = if raw_prompt.len() > PROMPT_CHAR_CAP {
+            self.emit(StreamEvent::TokenReceived {
+                agent_id: "System".to_string(),
+                token: format!(
+                    "[prompt] Truncated to {}K chars (was {} chars)\n",
+                    PROMPT_CHAR_CAP / 1000,
+                    raw_prompt.len()
+                ),
+            })
+            .await?;
+            let mut truncated = raw_prompt[..PROMPT_CHAR_CAP].to_string();
+            truncated.push_str("\n... [truncated]");
+            truncated
+        } else {
+            raw_prompt
+        };
+
+        let start_time = Instant::now();
+        let prompt_arc: Arc<str> = Arc::from(prompt_str);
+
+        // Phase 4: call agents (streaming, caching, control signal handling).
+        let final_results = self
+            .call_agents(&sigma_lock, Arc::clone(&prompt_arc), active_agents.clone(), strategy_reduce_agents)
+            .await?;
+
+        // An empty result vec signals a control-signal early exit (Shutdown/Inject/Rewind).
+        if final_results.is_empty() {
+            // Determine the correct return value from the current state.
+            let s = sigma_lock.lock().await;
+            return Ok(s.iteration_index > pre_turn_idx);
+        }
+
+        let weights = crate::engines::consensus::InfluenceWeightManager::calculate_weights_with_recency(
+            &*sigma_lock.lock().await,
+            0.9,
+        );
+
+        // Phase 5: synthesise responses into a single text + artifact block.
+        let (response, nash_weight_updates, stall_risk) =
+            self.synthesize_responses(&final_results, &artifacts_snapshot, &weights).await?;
+
+        let latency_ms = start_time.elapsed().as_millis() as u64;
+        let winner_id = "Collective Swarm".to_string();
+
+        // Phase 6: security / tautology / fallacy filters.
+        if !self.filter_response(&response, &history_contents).await? {
+            return Ok(false);
+        }
+
+        // Phase 7: artifact validation with self-healing retry loop.
+        let (_paused_tx, paused_rx) = tokio::sync::watch::channel(false);
+        let Some((changes, turn_outcome, final_response)) = self
+            .validate_and_heal(
+                &sigma_lock,
+                response,
+                &artifacts_snapshot,
+                &active_agents,
+                &weights,
+                &final_results,
+                &prompt_arc,
+                pre_turn_idx,
+                paused_rx,
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+
+        if !changes.is_empty() {
+            let names: Vec<&str> = changes.iter().map(|c| c.name.as_str()).collect();
+            self.emit(StreamEvent::TokenReceived {
+                agent_id: "System".to_string(),
+                token: format!("Writing changes to {}\n", names.join(", ")),
+            })
+            .await?;
+        }
+
+        // Phase 8: update agent profiles and metacognitive state.
+        self.update_agent_profiles(
+            &sigma_lock,
+            &final_results,
+            &winner_id,
+            turn_outcome,
+            &final_response,
+            pre_turn_idx,
+            &pre_recent_turns,
+            latency_ms,
+        )
+        .await?;
+
+        // Final: commit the turn under the sigma lock.
         self.commit_turn(
             &sigma_lock,
             changes,
             turn_outcome,
             &winner_id,
             &final_response,
-            &prompt,
+            &prompt_arc,
             latency_ms,
             nash_weight_updates,
             stall_risk,
@@ -1655,9 +1866,11 @@ impl Orchestrator {
         Ok(ArtifactProcessOutcome::Ready(changes, turn_outcome))
     }
 
+    /// Sub-phase of `commit_turn`: apply artifact changes to sigma, build the Turn, run quality
+    /// scoring and memory feedback, then advance the turn counter.
+    /// Returns `(turn, quality_score, certainty, surprise, current_i, artifact_snapshot)`.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip_all, fields(agent = %agent_id))]
-    async fn commit_turn(
+    async fn apply_turn_to_state(
         &self,
         sigma_lock: &Mutex<ConversationState>,
         changes: Vec<PreparedArtifactChange>,
@@ -1666,9 +1879,9 @@ impl Orchestrator {
         response: &str,
         prompt: &str,
         latency_ms: u64,
-        nash_weight_updates: std::collections::BTreeMap<String, f64>,
+        nash_weight_updates: &BTreeMap<String, f64>,
         stall_risk: f64,
-    ) -> Result<bool> {
+    ) -> Result<Option<(Turn, f64, f64, f64, u32, BTreeMap<String, Arc<Artifact>>)>> {
         if turn_outcome == TurnOutcome::VerificationFailed {
             let mut failures = self.verification_failures.lock().await;
             let count = failures.entry(agent_id.to_string()).or_insert(0);
@@ -1686,25 +1899,20 @@ impl Orchestrator {
 
         let mut turn_diffs = Vec::new();
         for change in changes {
-            let artifact_arc = sigma
-                .artifacts
-                .entry(change.name.clone())
-                .or_insert_with(|| {
-                    Arc::new(Artifact {
-                        name: change.name.clone(),
-                        language: change.lang.clone(),
-                        content: String::new(),
-                        version: 0,
-                        history: vec![],
-                        ast_versions: BTreeMap::new(),
-                        proof_attachments: vec![],
-                        metrics: ArtifactMetrics::default(),
-                        skeleton: String::new(),
-                    })
-                });
-
+            let artifact_arc = sigma.artifacts.entry(change.name.clone()).or_insert_with(|| {
+                Arc::new(Artifact {
+                    name: change.name.clone(),
+                    language: change.lang.clone(),
+                    content: String::new(),
+                    version: 0,
+                    history: vec![],
+                    ast_versions: BTreeMap::new(),
+                    proof_attachments: vec![],
+                    metrics: ArtifactMetrics::default(),
+                    skeleton: String::new(),
+                })
+            });
             let mut artifact = (**artifact_arc).clone();
-
             artifact.history.push(change.delta.clone());
             artifact.content = change.new_content;
             artifact.version += 1;
@@ -1712,36 +1920,26 @@ impl Orchestrator {
             artifact.metrics = change.new_metrics;
             artifact.skeleton = change.skeleton;
             artifact.proof_attachments.push(change.proof);
-
             for (node_id, content) in &change.node_updates {
-                artifact
-                    .ast_versions
-                    .entry(node_id.clone())
-                    .or_default()
-                    .push((current_i, content.clone()));
+                artifact.ast_versions.entry(node_id.clone()).or_default().push((current_i, content.clone()));
             }
-
             *artifact_arc = Arc::new(artifact);
-
             for (node_id, _) in &change.node_updates {
                 let node_p = sigma.node_consensus.entry(node_id.clone()).or_insert(0.1);
                 let mut kalman = KalmanConvergence::new(*node_p);
                 *node_p = kalman.update_adaptive(0.8, 1.0);
             }
-
             turn_diffs.push((change.name, change.delta));
         }
 
-        let volatility = 0.1;
-        let certainty = CertaintyAnalyzer::compute(response, volatility);
+        let certainty = CertaintyAnalyzer::compute(response, 0.1);
 
         let surprise = {
             let mut se = self.surprise_engine.lock().await;
             se.record_prediction(agent_id, certainty);
             let s = se.compute_surprise(agent_id, turn_outcome);
             let current_w = sigma.agent_weights.get(agent_id).copied().unwrap_or(1.0);
-            let new_w = se.calibrate_weight(agent_id, current_w);
-            sigma.agent_weights.insert(agent_id.to_string(), new_w);
+            sigma.agent_weights.insert(agent_id.to_string(), se.calibrate_weight(agent_id, current_w));
             s
         };
         if surprise > 0.5 && sigma.turns.len() >= 2 {
@@ -1752,17 +1950,9 @@ impl Orchestrator {
             .await?;
         }
 
-        let combined_diff_text: String = turn_diffs
-            .iter()
-            .map(|(_, d)| d.diff_text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let combined_diff_text: String = turn_diffs.iter().map(|(_, d)| d.diff_text.as_str()).collect::<Vec<_>>().join("\n");
         let consistency_score = Some(ConsistencyScorer::score(response, &combined_diff_text));
-
-        let dq_score = {
-            let intell = self.intelligence.lock().await;
-            intell.diff_quality_score(agent_id)
-        };
+        let dq_score = { let intell = self.intelligence.lock().await; intell.diff_quality_score(agent_id) };
 
         let mut turn = Turn {
             index: sigma.iteration_index,
@@ -1773,16 +1963,12 @@ impl Orchestrator {
             certainty: Some(certainty),
             outcome: turn_outcome,
             task_category: Some(TaskCategory::Research),
-            structure: Some(ReasoningEngine::select_structure(
-                TaskCategory::Research,
-                agent_id,
-            )),
+            structure: Some(ReasoningEngine::select_structure(TaskCategory::Research, agent_id)),
             signature: vec![],
             surprise_signal: Some(surprise),
             consistency_score,
             diff_quality_score: Some(dq_score),
         };
-
         let serialized = serde_json::to_vec(&turn)?;
         turn.signature = self.signer.sign(&serialized);
 
@@ -1793,46 +1979,30 @@ impl Orchestrator {
             };
             let surprise_penalty = (surprise - 0.5).max(0.0) * 0.6;
             let artifact_health = if !sigma.artifacts.is_empty() {
-                sigma
-                    .artifacts
-                    .values()
-                    .map(|a| a.metrics.health_score)
-                    .sum::<f64>()
-                    / sigma.artifacts.len() as f64
+                sigma.artifacts.values().map(|a| a.metrics.health_score).sum::<f64>() / sigma.artifacts.len() as f64
             } else {
                 1.0
             };
             ((base - surprise_penalty) * artifact_health).max(0.0)
         };
+
         {
-            // Memory feedback loop: compare this turn's quality to running average
             let avg_quality = if !sigma.turns.is_empty() {
-                let sum: f64 = sigma.turns.iter()
-                    .filter_map(|t| t.certainty)
-                    .sum();
+                let sum: f64 = sigma.turns.iter().filter_map(|t| t.certainty).sum();
                 let count = sigma.turns.iter().filter(|t| t.certainty.is_some()).count().max(1);
                 sum / count as f64
             } else {
                 0.5
             };
-            let delta = quality_score - avg_quality;
             let mut bridge = self.memory_bridge.lock().await;
-            bridge.record_recall_feedback(current_i, delta);
+            bridge.record_recall_feedback(current_i, quality_score - avg_quality);
             bridge.update_ranker(turn_outcome);
         }
+
         {
             let alert_info = {
                 let intell = self.intelligence.lock().await;
-                let recent_turns: Vec<Turn> = sigma
-                    .turns
-                    .iter()
-                    .rev()
-                    .take(5)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect();
+                let recent_turns: Vec<Turn> = sigma.turns.iter().rev().take(5).cloned().collect::<Vec<_>>().into_iter().rev().collect();
                 intell.detect_regression(agent_id, &recent_turns)
             };
             if let Some(alert) = alert_info {
@@ -1856,12 +2026,9 @@ impl Orchestrator {
             }
         }
 
-        {
-            let mut coll = self.collective.lock().await;
-            coll.update_specialization(&turn);
-        }
+        { let mut coll = self.collective.lock().await; coll.update_specialization(&turn); }
 
-        let cost_entry = CostEntry {
+        ComputeManager::manage_budget(&mut sigma, CostEntry {
             turn_id: turn.index,
             model_id: agent_id.to_string(),
             usage: TokenUsage {
@@ -1872,21 +2039,16 @@ impl Orchestrator {
             cost_usd: 0.01,
             latency_ms,
             timestamp: turn.timestamp,
-        };
-        ComputeManager::manage_budget(&mut sigma, cost_entry);
+        });
 
         if sigma.turns.len() >= MAX_SESSION_TURNS {
-            return Err(anyhow::anyhow!(
-                "Session turn limit ({}) exceeded",
-                MAX_SESSION_TURNS
-            ));
+            return Err(anyhow::anyhow!("Session turn limit ({}) exceeded", MAX_SESSION_TURNS));
         }
 
         sigma.turns.push(turn.clone());
         let _ = self.turn_tx.send(turn.clone());
         sigma.iteration_index += 1;
 
-        // Feed turn quality into prompt evolution system
         {
             let quality = QualityScorer::score(&turn);
             let mut evolver = self.prompt_evolver.lock().await;
@@ -1900,7 +2062,6 @@ impl Orchestrator {
             }
         }
 
-        // Trigger self-improvement on successful outcomes
         if matches!(turn_outcome, TurnOutcome::TestsPassed | TurnOutcome::Compiled) {
             for (name, artifact) in &sigma.artifacts {
                 if let Ok(improved) = crate::engines::self_improvement::SelfCodeModifier::propose_improvement(name, &artifact.content)
@@ -1921,12 +2082,10 @@ impl Orchestrator {
         .into_iter()
         .collect();
 
-        // Improvement #2: EMA blend of InfluenceWeight with Nash score.
-        for (id, nash_score) in &nash_weight_updates {
+        for (id, nash_score) in nash_weight_updates {
             let w = sigma.agent_weights.entry(id.clone()).or_insert(0.5);
             *w = *w * 0.9 + nash_score * 0.1;
         }
-        // Exclude low-weight agents for the next 2 turns.
         {
             let current_turn = sigma.iteration_index;
             let mut skips = self.skip_until.lock().await;
@@ -1938,52 +2097,35 @@ impl Orchestrator {
             }
         }
 
-        // Improvement #4: stall_risk > 0.6 → switch to DebateAndCritique if in DirectImplementation.
         if stall_risk > 0.6 {
             let mut coll = self.collective.lock().await;
-            let current_strategy = coll.meta_optimizer.select_best(TaskCategory::Research);
-            if current_strategy == MetaStrategy::DirectImplementation {
+            if coll.meta_optimizer.select_best(TaskCategory::Research) == MetaStrategy::DirectImplementation {
                 coll.meta_optimizer.record(MetaStrategy::DebateAndCritique, 0.6);
                 tracing::info!(stall_risk, "stall detected: switching meta-strategy to DebateAndCritique");
             }
         }
 
         let current_p = f64::from_bits(self.completion_probability.load(Ordering::Acquire));
-        let mut kalman = KalmanConvergence::new(current_p);
-        let measurement = if response.contains("OPTIMAL") || response.contains("CONVERGED") {
-            1.0
-        } else {
-            certainty * 0.8
-        };
-        let next_p = kalman.update_adaptive(measurement, certainty);
-        self.completion_probability
-            .store(next_p.to_bits(), Ordering::Release);
+        let measurement = if response.contains("OPTIMAL") || response.contains("CONVERGED") { 1.0 } else { certainty * 0.8 };
+        let next_p = KalmanConvergence::new(current_p).update_adaptive(measurement, certainty);
+        self.completion_probability.store(next_p.to_bits(), Ordering::Release);
         sigma.completion_probability = next_p;
-        let weights_vec: Vec<(String, f64)> = sigma
-            .agent_weights
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
         self.emit(StreamEvent::ConvergenceUpdated {
             p: next_p,
             certainty,
-            agent_weights: weights_vec,
+            agent_weights: sigma.agent_weights.iter().map(|(k, v)| (k.clone(), *v)).collect(),
         })
         .await?;
 
         if let Err(e) = InvariantChecker::check_all(&sigma) {
             sigma.artifacts = artifact_snapshot;
-            if let Some(t) = sigma.turns.last_mut() {
-                t.outcome = TurnOutcome::RolledBack;
-            }
+            if let Some(t) = sigma.turns.last_mut() { t.outcome = TurnOutcome::RolledBack; }
             let should_skip = {
                 let mut counters = self.rollback_counters.lock().await;
                 let count = counters.entry(agent_id.to_string()).or_insert(0);
                 *count += 1;
                 let exceeded = *count >= 3;
-                if exceeded {
-                    *count = 0;
-                }
+                if exceeded { *count = 0; }
                 exceeded
             };
             self.emit(StreamEvent::TokenReceived {
@@ -2001,32 +2143,42 @@ impl Orchestrator {
                 skips.insert(agent_id.to_string(), sigma.iteration_index + 1);
             }
             turn.outcome = TurnOutcome::RolledBack;
-            {
-                let intell = self.intelligence.lock().await;
-                intell.update_profile_with_latency(&turn, 0.0, latency_ms);
-            }
-            {
-                let mut ctx = self.session_ctx.lock().await;
-                ctx.record_turn(TurnOutcome::RolledBack);
-            }
-            return Ok(false);
+            { let intell = self.intelligence.lock().await; intell.update_profile_with_latency(&turn, 0.0, latency_ms); }
+            { let mut ctx = self.session_ctx.lock().await; ctx.record_turn(TurnOutcome::RolledBack); }
+            return Ok(None);
         }
-        {
-            let mut counters = self.rollback_counters.lock().await;
-            counters.insert(agent_id.to_string(), 0);
-        }
+        { let mut counters = self.rollback_counters.lock().await; counters.insert(agent_id.to_string(), 0); }
         self.state_manager.checkpoint_async(&sigma).await?;
         self.emit(StreamEvent::CheckpointWritten(current_i)).await?;
 
-        // Snapshot data needed for I/O, then release the lock for file writing + verification.
-        let io_artifacts: Vec<(String, Arc<Artifact>)> = turn
-            .diffs
-            .iter()
-            .filter_map(|(name, _)| sigma.artifacts.get(name).map(|a| (name.clone(), Arc::clone(a))))
-            .collect();
-        let all_artifacts = sigma.artifacts.clone();
-        let turn_diffs = turn.diffs.clone();
-        drop(sigma);
+        Ok(Some((turn, quality_score, certainty, surprise, current_i, artifact_snapshot)))
+    }
+
+    /// Sub-phase of `commit_turn`: file I/O, verification, post-commit state updates, and
+    /// convergence reporting. `sigma` must NOT be held by the caller on entry.
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_committed_turn(
+        &self,
+        sigma_lock: &Mutex<ConversationState>,
+        mut turn: Turn,
+        quality_score: f64,
+        next_p: f64,
+        agent_id: &str,
+        response: &str,
+        latency_ms: u64,
+    ) -> Result<bool> {
+        // Snapshot what we need for I/O from sigma, then drop lock.
+        let (io_artifacts, all_artifacts, turn_diffs) = {
+            let sigma = sigma_lock.lock().await;
+            let io: Vec<(String, Arc<Artifact>)> = turn
+                .diffs
+                .iter()
+                .filter_map(|(name, _)| sigma.artifacts.get(name).map(|a| (name.clone(), Arc::clone(a))))
+                .collect();
+            let all = sigma.artifacts.clone();
+            let diffs = turn.diffs.clone();
+            (io, all, diffs)
+        };
 
         for (name, artifact) in &io_artifacts {
             match self.file_writer.write_artifact_with_proof(artifact).await {
@@ -2041,9 +2193,7 @@ impl Orchestrator {
                 Ok(WriteOutcome::VerificationFailed(stderr)) => {
                     self.emit(StreamEvent::TokenReceived {
                         agent_id: "System".to_string(),
-                        token: format!(
-                            "[write] {name}: verification failed, original restored\n{stderr}"
-                        ),
+                        token: format!("[write] {name}: verification failed, original restored\n{stderr}"),
                     })
                     .await?;
                 }
@@ -2064,19 +2214,16 @@ impl Orchestrator {
         };
         for (tool_name, output, passed) in &verification_results {
             let status = if *passed { "PASS" } else { "FAIL" };
-            let snippet = &output[..output.len().min(500)];
             self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
-                token: format!("[verify] {} [{}]\n{}\n", tool_name, status, snippet),
-            }).await?;
+                token: format!("[verify] {} [{}]\n{}\n", tool_name, status, &output[..output.len().min(500)]),
+            })
+            .await?;
         }
-        if !verification_results.is_empty()
-            && verification_results.iter().all(|(_, _, passed)| *passed)
-        {
+        if !verification_results.is_empty() && verification_results.iter().all(|(_, _, p)| *p) {
             turn.outcome = TurnOutcome::TestsPassed;
             let current_p = f64::from_bits(self.completion_probability.load(Ordering::Acquire));
-            let boosted = (current_p + 0.15).min(1.0);
-            self.completion_probability.store(boosted.to_bits(), Ordering::Release);
+            self.completion_probability.store((current_p + 0.15).min(1.0).to_bits(), Ordering::Release);
         }
 
         // Re-acquire lock for remaining state updates.
@@ -2084,19 +2231,10 @@ impl Orchestrator {
         sigma.last_verification = verification_results.iter()
             .map(|(name, output, passed)| (name.clone(), output.clone(), *passed))
             .collect();
-
-        {
-            let intell = self.intelligence.lock().await;
-            intell.update_profile_with_latency(&turn, quality_score, latency_ms);
-        }
-        {
-            let mut ctx = self.session_ctx.lock().await;
-            ctx.record_turn(turn.outcome);
-        }
+        { let intell = self.intelligence.lock().await; intell.update_profile_with_latency(&turn, quality_score, latency_ms); }
+        { let mut ctx = self.session_ctx.lock().await; ctx.record_turn(turn.outcome); }
         self.swarm.broadcast_turn(turn.clone())?;
 
-        // Recompute state_hash over the fully-committed state (agent_weights,
-        // last_verification, etc. all mutated after the mid-turn hash at line ~1905).
         {
             let prev = sigma.state_hash;
             sigma.state_hash = HashChain::compute(&sigma, &prev)?;
@@ -2106,10 +2244,7 @@ impl Orchestrator {
             && !auditor_tx.is_closed()
             && let Err(e) = auditor_tx.send(sigma.clone()).await
         {
-            self.emit(StreamEvent::Error(format!(
-                "auditor send failed, auditor task dead: {e}"
-            )))
-            .await?;
+            self.emit(StreamEvent::Error(format!("auditor send failed, auditor task dead: {e}"))).await?;
         }
 
         if let Some(ref mut root) = sigma.goal_tree.root {
@@ -2125,48 +2260,37 @@ impl Orchestrator {
                 avg_certainty: metrics.avg_certainty,
                 avg_surprise: metrics.avg_surprise,
                 agent_count: metrics.agent_count,
-            }).await?;
+            })
+            .await?;
         }
 
-        let artifact_snapshot: Vec<crate::types::events::ArtifactSnapshot> = sigma
-            .artifacts
-            .iter()
-            .map(|(name, a)| crate::types::events::ArtifactSnapshot {
+        self.emit(StreamEvent::ArtifactsUpdated(
+            sigma.artifacts.iter().map(|(name, a)| crate::types::events::ArtifactSnapshot {
                 name: name.clone(),
                 skeleton: a.skeleton.clone(),
                 version: a.version,
                 diff_count: a.history.len(),
-            })
-            .collect();
-        self.emit(StreamEvent::ArtifactsUpdated(artifact_snapshot))
-            .await?;
+            }).collect()
+        ))
+        .await?;
 
         self.emit(StreamEvent::TokenReceived {
             agent_id: "System".to_string(),
-            token: format!(
-                "\n[Turn Complete | P(C): {:.2} | Hash: {:02x?}]\n",
-                next_p,
-                &sigma.state_hash[..4]
-            ),
+            token: format!("\n[Turn Complete | P(C): {:.2} | Hash: {:02x?}]\n", next_p, &sigma.state_hash[..4]),
         })
         .await?;
         self.emit(StreamEvent::TurnComplete(turn.clone())).await?;
 
         {
-            let mut audit_rx: MutexGuard<'_, mpsc::UnboundedReceiver<AuditAlert>> =
-                self.audit_rx.lock().await;
+            let mut audit_rx: MutexGuard<'_, mpsc::UnboundedReceiver<AuditAlert>> = self.audit_rx.lock().await;
             while let Ok(alert) = audit_rx.try_recv() {
-                // Only act on alerts for the current iteration; stale alerts from
-                // prior turns fire because state was mutated after the mid-turn hash
-                // and are not indicative of tampering.
+                // Only act on alerts for the current iteration; stale alerts are not indicative of tampering.
                 if alert.iteration_index == sigma.iteration_index {
                     self.emit(StreamEvent::TokenReceived {
                         agent_id: "System".to_string(),
                         token: format!(
                             "[audit] Hash mismatch at iteration {}: expected {:02x?}, got {:02x?}\n",
-                            alert.iteration_index,
-                            &alert.expected_hash[..4],
-                            &alert.actual_hash[..4]
+                            alert.iteration_index, &alert.expected_hash[..4], &alert.actual_hash[..4]
                         ),
                     })
                     .await?;
@@ -2176,21 +2300,10 @@ impl Orchestrator {
 
         {
             let session_id = sigma.session_id.clone();
-            let compiled = matches!(
-                turn.outcome,
-                TurnOutcome::Compiled | TurnOutcome::TestsPassed | TurnOutcome::AdvancedConvergence
-            );
-            let tests_passed = turn.outcome == TurnOutcome::TestsPassed;
-            let convergence_contribution = next_p;
+            let compiled = matches!(turn.outcome, TurnOutcome::Compiled | TurnOutcome::TestsPassed | TurnOutcome::AdvancedConvergence);
             let content_key = response[..response.len().min(500)].to_string();
             let preview = response[..response.len().min(200)].to_string();
-            let outcome_str = format!("{:?}", turn.outcome);
-            let metadata = serde_json::json!({
-                "content": preview,
-                "outcome": outcome_str,
-                "agent": agent_id,
-            })
-            .to_string();
+            let metadata = serde_json::json!({"content": preview, "outcome": format!("{:?}", turn.outcome), "agent": agent_id}).to_string();
             let record = MemoryRecord {
                 turn_id: turn.index,
                 session_id: session_id.clone(),
@@ -2200,10 +2313,10 @@ impl Orchestrator {
                 metadata_json: metadata,
                 outcome: Some(OutcomeRecord {
                     compiled,
-                    tests_passed,
+                    tests_passed: turn.outcome == TurnOutcome::TestsPassed,
                     quality_delta: 0.0,
                     was_rolled_back: false,
-                    convergence_contribution,
+                    convergence_contribution: next_p,
                 }),
                 is_negative: false,
             };
@@ -2215,9 +2328,7 @@ impl Orchestrator {
         if next_p > 0.70 && next_p <= 0.85 {
             self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
-                token: format!(
-                    "[convergence] p={next_p:.2}, moderate confidence, continuing refinement"
-                ),
+                token: format!("[convergence] p={next_p:.2}, moderate confidence, continuing refinement"),
             })
             .await?;
         } else if next_p > 0.85 && next_p <= 0.95 {
@@ -2235,32 +2346,67 @@ impl Orchestrator {
             let exec_summary = ConvergenceReport::generate(&sigma);
             self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
-                token: format!(
-                    "[self-improve] {:?} | [analytics] {:?} | [release] {}",
-                    eval, report, exec_summary
-                ),
+                token: format!("[self-improve] {:?} | [analytics] {:?} | [release] {}", eval, report, exec_summary),
             })
             .await?;
-
             if let Some(mortem) = PostMortemGenerator::generate(&sigma) {
                 let bridge = self.memory_bridge.lock().await;
                 if let Err(e) = bridge.store_failure_lesson_async(&sigma.session_id, &mortem).await {
                     warn!(session = %sigma.session_id, error = %e, "failed to store post-mortem");
                 }
             }
-
-            let mut session_store = MemoryStore::new(&format!(
-                "/tmp/crosstalk-{}",
-                sigma.session_id
-            ));
+            let mut session_store = MemoryStore::new(&format!("/tmp/crosstalk-{}", sigma.session_id));
             session_store.init().await?;
-            self.session_memory_map.lock().await.insert(
-                sigma.session_id.clone(),
-                Arc::new(session_store),
-            );
+            self.session_memory_map.lock().await.insert(sigma.session_id.clone(), Arc::new(session_store));
         }
 
         Ok(is_converged)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all, fields(agent = %agent_id))]
+    async fn commit_turn(
+        &self,
+        sigma_lock: &Mutex<ConversationState>,
+        changes: Vec<PreparedArtifactChange>,
+        turn_outcome: TurnOutcome,
+        agent_id: &str,
+        response: &str,
+        prompt: &str,
+        latency_ms: u64,
+        nash_weight_updates: BTreeMap<String, f64>,
+        stall_risk: f64,
+    ) -> Result<bool> {
+        let Some((turn, quality_score, _certainty, _surprise, _current_i, _artifact_snapshot)) =
+            self.apply_turn_to_state(
+                sigma_lock,
+                changes,
+                turn_outcome,
+                agent_id,
+                response,
+                prompt,
+                latency_ms,
+                &nash_weight_updates,
+                stall_risk,
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+
+        // next_p was stored atomically in apply_turn_to_state; read it back.
+        let next_p = f64::from_bits(self.completion_probability.load(Ordering::Acquire));
+
+        self.finalize_committed_turn(
+            sigma_lock,
+            turn,
+            quality_score,
+            next_p,
+            agent_id,
+            response,
+            latency_ms,
+        )
+        .await
     }
 
     async fn run_verification(&self, artifacts: &BTreeMap<String, Arc<Artifact>>, diffs: &[(String, crate::types::artifact::ArtifactDiff)]) -> Vec<(String, String, bool)> {
@@ -2746,8 +2892,10 @@ impl Orchestrator {
 
         {
             let intell = self.intelligence.lock().await;
-            let mut templates = intell.templates.write().await;
-            let mut calibration = intell.calibration.write().await;
+            let templates_arc = intell.templates();
+            let calibration_arc = intell.calibration();
+            let mut templates = templates_arc.write().await;
+            let mut calibration = calibration_arc.write().await;
             let mut learner = crate::engines::self_improvement::ContinuousLearner {
                 prompt_library: &mut templates,
                 calibration: &mut calibration,

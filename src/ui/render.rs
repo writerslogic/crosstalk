@@ -313,10 +313,19 @@ fn draw_entropy_heatmap(
     frame.render_widget(table, area);
 }
 
+/// Entropy score above which agents are considered in conflict (heatmap red).
+const HEATMAP_CONFLICT_THRESHOLD: f64 = 0.7;
+/// Entropy score above which agents show moderate disagreement (heatmap yellow).
+const HEATMAP_WARN_THRESHOLD: f64 = 0.3;
+/// Gauge ratio above which the metric is considered healthy (green).
+const GAUGE_HEALTHY_THRESHOLD: f64 = 0.8;
+/// Gauge ratio above which the metric is considered acceptable (yellow).
+const GAUGE_WARN_THRESHOLD: f64 = 0.5;
+
 fn heatmap_color(score: f64) -> Color {
-    if score > 0.7 {
+    if score > HEATMAP_CONFLICT_THRESHOLD {
         Color::Red
-    } else if score > 0.3 {
+    } else if score > HEATMAP_WARN_THRESHOLD {
         Color::Yellow
     } else {
         Color::Green
@@ -324,9 +333,9 @@ fn heatmap_color(score: f64) -> Color {
 }
 
 fn gauge_color(ratio: f64) -> Color {
-    if ratio > 0.8 {
+    if ratio > GAUGE_HEALTHY_THRESHOLD {
         Color::Green
-    } else if ratio > 0.5 {
+    } else if ratio > GAUGE_WARN_THRESHOLD {
         Color::Yellow
     } else {
         Color::Red

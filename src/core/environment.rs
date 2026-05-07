@@ -6,6 +6,10 @@ use std::path::PathBuf;
 use std::process::Command;
 use serde_json::json;
 
+fn is_valid_nix_dep_name(s: &str) -> bool {
+    s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 pub struct NixManager {
     pub dependencies: Vec<String>,
     pub cache_dir: PathBuf,
@@ -25,7 +29,7 @@ impl NixManager {
 
     pub fn generate_flake_static(dependencies: &[String]) -> String {
         let deps = dependencies.iter()
-            .filter(|d| d.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.'))
+            .filter(|d| is_valid_nix_dep_name(d))
             .map(|d| format!("pkgs.{d}"))
             .collect::<Vec<_>>().join(" ");
         format!(r#"{{
@@ -115,7 +119,7 @@ impl NixManager {
     pub fn validate_environment(dependencies: &[String]) -> Result<Vec<String>> {
         let mut missing = Vec::new();
         for dep in dependencies {
-            if !dep.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            if !is_valid_nix_dep_name(dep) {
                 missing.push(dep.clone());
                 continue;
             }

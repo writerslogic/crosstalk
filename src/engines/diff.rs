@@ -21,7 +21,8 @@ impl DiffEngine {
                 ChangeTag::Insert => "+",
                 ChangeTag::Equal => " ",
             };
-            crate::log_warn!(write!(diff_text, "{}{}", sign, change), "Failed to write diff line");
+            // SAFETY: write! to a String is infallible; String's fmt::Write never returns Err
+            write!(diff_text, "{}{}", sign, change).unwrap();
         }
         ArtifactDiff {
             original_version: version,

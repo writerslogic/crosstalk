@@ -172,4 +172,66 @@ impl GoalTree {
     pub fn completion_ratio(&self) -> f64 {
         self.analyze().completion_ratio
     }
+
+    /// Walk the dependency ID graph and return `Err` if a cycle is detected.
+    ///
+    /// The tree structure (`children`) cannot form cycles because nodes are
+    /// owned values.  However, `GoalNode::dependencies` holds String IDs that
+    /// CAN reference ancestors, creating a logical cycle.  This method builds
+    /// the dependency graph from all nodes in the tree and runs a DFS to detect
+    /// back-edges.
+    pub fn validate_acyclic(&self) -> Result<(), String> {
+        // Collect all node IDs and their dependency edges.
+        let mut dep_graph: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        if let Some(root) = &self.root {
+            Self::collect_dep_graph(root, &mut dep_graph);
+        }
+        // DFS cycle detection using a visited set and a per-path stack set.
+        let mut visited = std::collections::HashSet::new();
+        let mut in_stack = std::collections::HashSet::new();
+        for id in dep_graph.keys().cloned().collect::<Vec<_>>() {
+            if Self::dfs_cycle(&id, &dep_graph, &mut visited, &mut in_stack) {
+                return Err(format!(
+                    "dependency cycle detected involving goal '{id}'"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_dep_graph(
+        node: &GoalNode,
+        graph: &mut std::collections::HashMap<String, Vec<String>>,
+    ) {
+        graph.insert(node.id.clone(), node.dependencies.clone());
+        for child in &node.children {
+            Self::collect_dep_graph(child, graph);
+        }
+    }
+
+    fn dfs_cycle(
+        id: &str,
+        graph: &std::collections::HashMap<String, Vec<String>>,
+        visited: &mut std::collections::HashSet<String>,
+        in_stack: &mut std::collections::HashSet<String>,
+    ) -> bool {
+        if in_stack.contains(id) {
+            return true;
+        }
+        if visited.contains(id) {
+            return false;
+        }
+        visited.insert(id.to_string());
+        in_stack.insert(id.to_string());
+        if let Some(deps) = graph.get(id) {
+            for dep in deps.clone() {
+                if Self::dfs_cycle(&dep, graph, visited, in_stack) {
+                    return true;
+                }
+            }
+        }
+        in_stack.remove(id);
+        false
+    }
 }

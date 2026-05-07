@@ -40,11 +40,12 @@ impl CheckpointService {
                             .iter()
                             .map(|entry| (entry.key().clone(), entry.value().clone()))
                             .collect();
-                        let templates_snapshot = templates.read().await.clone();
+                        let templates_guard = templates.read().await;
                         let data = serde_json::json!({
                             "profiles": profiles_map,
-                            "templates": templates_snapshot,
+                            "templates": &*templates_guard,
                         });
+                        drop(templates_guard);
                         if let Ok(content) = serde_json::to_string_pretty(&data) {
                             let temp_path = format!("{}.tmp", path);
                             if fs::write(&temp_path, &content).await.is_ok()
@@ -84,13 +85,15 @@ impl CheckpointService {
 }
 
 pub struct IntelligenceEngine {
-    pub profiles: Arc<DashMap<String, ModelProfile>>,
-    pub templates: Arc<RwLock<Vec<PromptTemplate>>>,
-    pub calibration: Arc<RwLock<Vec<CalibrationRecord>>>,
-    pub storage_path: Option<String>,
-    pub latency_predictor: LatencyPredictor,
-    pub failures: Arc<FailurePatternStore>,
-    pub learner: StrategyLearner,
+    profiles: Arc<DashMap<String, ModelProfile>>,
+    templates: Arc<RwLock<Vec<PromptTemplate>>>,
+    calibration: Arc<RwLock<Vec<CalibrationRecord>>>,
+    storage_path: Option<String>,
+    latency_predictor: LatencyPredictor,
+    #[allow(dead_code)]
+    failures: Arc<FailurePatternStore>,
+    #[allow(dead_code)]
+    learner: StrategyLearner,
     checkpoint: CheckpointService,
     /// Per-agent diff quality score (default 1.0 for unknown agents).
     /// Clean diffs raise it; regressive or conflicted diffs lower it.
@@ -255,6 +258,16 @@ impl IntelligenceEngine {
         self.checkpoint.save_all()
     }
 
+    /// Returns a shared handle to the templates store (Arc clone, not a data copy).
+    pub fn templates(&self) -> Arc<RwLock<Vec<PromptTemplate>>> {
+        Arc::clone(&self.templates)
+    }
+
+    /// Returns a shared handle to the calibration store (Arc clone, not a data copy).
+    pub fn calibration(&self) -> Arc<RwLock<Vec<CalibrationRecord>>> {
+        Arc::clone(&self.calibration)
+    }
+
     /// Update the diff quality score for `agent_id` based on the outcome of its
     /// most recent artifact change.
     ///
@@ -347,65 +360,7 @@ impl IntelligenceEngine {
         latency_ms: u64,
         blacklist: &[String],
     ) -> Result<String, String> {
-        let estimated_tokens = Self::estimate_tokens(category);
-        if estimated_tokens > budget {
-            return Err(format!(
-                "Estimated tokens {} exceeds budget {}",
-                estimated_tokens, budget
-            ));
-        }
-
-        let blacklist_set: HashSet<&str> = blacklist.iter().map(|s| s.as_str()).collect();
-        let mut best_candidate: Option<&String> = None;
-        let mut highest_sample = -1.0;
-
-        for model_id in available_models {
-            if blacklist_set.contains(model_id.as_str()) {
-                continue;
-            }
-
-            if let Some(profile) = self.profiles.get(model_id) {
-                let predicted = self.latency_predictor.predict_latency(model_id);
-                let effective_latency = if predicted > 0 {
-                    predicted as f64
-                } else {
-                    profile.latency_ms.mean
-                };
-                if effective_latency > latency_ms as f64 {
-                    continue;
-                }
-
-                let mean = profile.task_scores.get(&category).map_or(0.5, |ra| ra.mean);
-                let n = profile.task_scores.get(&category).map_or(1, |ra| ra.count);
-
-                // Beta distribution parameters from observed mean and sample count.
-                // More observations → tighter distribution (less exploration).
-                // Fewer observations → wider (more exploration of unknown agents).
-                let alpha = mean * n as f64 + 1.0;
-                let beta = (1.0 - mean) * n as f64 + 1.0;
-                let sample = Self::beta_sample(alpha, beta)
-                    * self.diff_quality_score(model_id);
-
-                if sample > highest_sample {
-                    highest_sample = sample;
-                    best_candidate = Some(model_id);
-                }
-            }
-        }
-
-        match best_candidate {
-            Some(model) => Ok(model.clone()),
-            None => {
-                let diag = self.generate_routing_diagnostics(
-                    category,
-                    available_models,
-                    budget,
-                    latency_ms,
-                    blacklist,
-                );
-                Err(format!("No models satisfy constraints. {}", diag))
-            }
-        }
+        self.route_task_internal(category, available_models, Some((budget, latency_ms, blacklist)))
     }
 
     /// Sample from Beta(alpha, beta) using the Joehnk method.
@@ -464,28 +419,103 @@ impl IntelligenceEngine {
         }
     }
 
-    pub fn route_task(&self, category: TaskCategory, available_models: &[String]) -> String {
+    /// Shared routing logic used by both `route_task` and `route_task_constrained`.
+    ///
+    /// When `constraints` is `None`, all models are eligible and Thompson Sampling
+    /// is replaced by plain mean-score selection (deterministic, no budget check).
+    /// When `constraints` is `Some((budget, latency_ms, blacklist))`, the full
+    /// constrained Thompson-Sampling path runs.
+    fn route_task_internal(
+        &self,
+        category: TaskCategory,
+        available_models: &[String],
+        constraints: Option<(u32, u64, &[String])>,
+    ) -> Result<String, String> {
         if available_models.is_empty() {
-            return String::new();
+            return Ok(String::new());
         }
-        let mut best_model = available_models[0].clone();
-        let mut best_score = -1.0;
 
-        for model_id in available_models {
-            if let Some(profile) = self.profiles.get(model_id) {
-                let score = profile
-                    .task_scores
-                    .get(&category)
-                    .map(|ra| ra.mean)
-                    .unwrap_or(0.5)
-                    * self.diff_quality_score(model_id);
-                if score > best_score {
-                    best_score = score;
-                    best_model = model_id.clone();
+        if let Some((budget, latency_ms, blacklist)) = constraints {
+            let estimated_tokens = Self::estimate_tokens(category);
+            if estimated_tokens > budget {
+                return Err(format!(
+                    "Estimated tokens {} exceeds budget {}",
+                    estimated_tokens, budget
+                ));
+            }
+
+            let blacklist_set: HashSet<&str> = blacklist.iter().map(|s| s.as_str()).collect();
+            let mut best_candidate: Option<&String> = None;
+            let mut highest_sample = -1.0_f64;
+
+            for model_id in available_models {
+                if blacklist_set.contains(model_id.as_str()) {
+                    continue;
+                }
+                if let Some(profile) = self.profiles.get(model_id) {
+                    let predicted = self.latency_predictor.predict_latency(model_id);
+                    let effective_latency = if predicted > 0 {
+                        predicted as f64
+                    } else {
+                        profile.latency_ms.mean
+                    };
+                    if effective_latency > latency_ms as f64 {
+                        continue;
+                    }
+                    let mean = profile.task_scores.get(&category).map_or(0.5, |ra| ra.mean);
+                    let n = profile.task_scores.get(&category).map_or(1, |ra| ra.count);
+                    // Beta distribution parameters from observed mean and sample count.
+                    // More observations → tighter distribution (less exploration).
+                    // Fewer observations → wider (more exploration of unknown agents).
+                    let alpha = mean * n as f64 + 1.0;
+                    let beta = (1.0 - mean) * n as f64 + 1.0;
+                    let sample = Self::beta_sample(alpha, beta) * self.diff_quality_score(model_id);
+                    if sample > highest_sample {
+                        highest_sample = sample;
+                        best_candidate = Some(model_id);
+                    }
                 }
             }
+
+            match best_candidate {
+                Some(model) => Ok(model.clone()),
+                None => {
+                    let diag = self.generate_routing_diagnostics(
+                        category,
+                        available_models,
+                        budget,
+                        latency_ms,
+                        blacklist,
+                    );
+                    Err(format!("No models satisfy constraints. {}", diag))
+                }
+            }
+        } else {
+            // Unconstrained: pick the highest mean score weighted by diff quality.
+            let mut best_model = available_models[0].clone();
+            let mut best_score = -1.0_f64;
+            for model_id in available_models {
+                if let Some(profile) = self.profiles.get(model_id) {
+                    let score = profile
+                        .task_scores
+                        .get(&category)
+                        .map(|ra| ra.mean)
+                        .unwrap_or(0.5)
+                        * self.diff_quality_score(model_id);
+                    if score > best_score {
+                        best_score = score;
+                        best_model = model_id.clone();
+                    }
+                }
+            }
+            Ok(best_model)
         }
-        best_model
+    }
+
+    pub fn route_task(&self, category: TaskCategory, available_models: &[String]) -> String {
+        // Unconstrained routing never errors; unwrap is safe.
+        self.route_task_internal(category, available_models, None)
+            .unwrap_or_default()
     }
 
     pub async fn evolve_prompts(&self, category: TaskCategory) -> Result<()> {
@@ -1085,6 +1115,9 @@ pub struct ParetoOptimizer;
 impl ParetoOptimizer {
     /// Returns the non-dominated subset: no other point has both higher quality
     /// and lower (or equal) cost. Result is sorted by quality descending.
+    ///
+    /// O(n²) dominance check is intentional and acceptable: the input set is
+    /// bounded by the number of active model endpoints (always <100 in practice).
     #[must_use]
     pub fn compute_frontier(points: Vec<ParetoPoint>) -> Vec<ParetoPoint> {
         let mut frontier: Vec<ParetoPoint> = points

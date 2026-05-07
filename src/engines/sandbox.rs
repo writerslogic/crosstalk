@@ -8,6 +8,10 @@ use std::time::Instant;
 
 /// Default execution timeout in seconds for sandbox operations.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// Number of epoch ticks allowed before the sandbox execution is interrupted.
+/// One tick fires per second (see the background incrementer in `SandboxManager::new`),
+/// so this acts as a coarse 1-second interrupt deadline independent of fuel.
+const EPOCH_DEADLINE_TICKS: u64 = 1;
 
 #[derive(Debug, Clone)]
 pub struct SandboxConfig {
@@ -85,7 +89,7 @@ impl SandboxManager {
         let mut store = Store::new(&self.engine, SandboxState { wasi, limits });
         store.limiter(|state| &mut state.limits);
         store.set_fuel(self.config.cpu_fuel_limit)?;
-        store.set_epoch_deadline(1); // Trap after 1 epoch tick if not finished
+        store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
 
         let module = Module::from_binary(&self.engine, wasm_bytes)
             .context("failed to compile WASM module from provided bytes")?;

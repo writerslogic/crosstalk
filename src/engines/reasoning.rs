@@ -766,7 +766,7 @@ impl SynthesisEngine {
         }
 
         // Append additions without duplicating.
-        let mut added_set = base_line_set.clone();
+        let mut added_set = base_line_set;
         for line in additions {
             let normalized = line.trim().to_string();
             if added_set.insert(normalized) {
@@ -904,7 +904,63 @@ struct AstBlock {
     content: String,
 }
 
-pub struct SynthesisEngine;
+// =====================================================================
+// SYNTHESIS STRATEGY (pluggable consensus)
+// =====================================================================
+
+pub trait SynthesisStrategy: Send + Sync {
+    fn synthesize(&self, proposals: &[(String, String)]) -> String;
+}
+
+pub struct DefaultSynthesis;
+
+impl SynthesisStrategy for DefaultSynthesis {
+    fn synthesize(&self, proposals: &[(String, String)]) -> String {
+        SynthesisEngine::synthesize_proposals(proposals)
+    }
+}
+
+pub struct MajorityVote;
+
+impl SynthesisStrategy for MajorityVote {
+    fn synthesize(&self, proposals: &[(String, String)]) -> String {
+        if proposals.is_empty() {
+            return String::new();
+        }
+        let mut freq: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (_, content) in proposals {
+            *freq.entry(content.as_str()).or_insert(0) += 1;
+        }
+        freq.into_iter()
+            .max_by_key(|&(_, count)| count)
+            .map(|(content, _)| content.to_string())
+            .unwrap_or_else(|| proposals[0].1.clone())
+    }
+}
+
+pub struct SynthesisEngine {
+    pub strategy: Box<dyn SynthesisStrategy>,
+}
+
+impl SynthesisEngine {
+    pub fn new() -> Self {
+        Self { strategy: Box::new(DefaultSynthesis) }
+    }
+
+    pub fn with_strategy(s: Box<dyn SynthesisStrategy>) -> Self {
+        Self { strategy: s }
+    }
+
+    pub fn synthesize(&self, proposals: &[(String, String)]) -> String {
+        self.strategy.synthesize(proposals)
+    }
+}
+
+impl Default for SynthesisEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl SynthesisEngine {
     #[must_use]

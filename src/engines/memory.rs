@@ -232,7 +232,7 @@ impl MemoryBridge {
                 feature_sums[1] += (-0.01 * age_hours).exp();
                 feature_sums[2] += rec.outcome.as_ref()
                     .map_or(0.0, |o| if o.tests_passed { 1.0 } else { 0.0 });
-                feature_sums[3] += 0.0; // surprise_signal not on MemoryRecord
+                feature_sums[3] += 0.0; // surprise_signal: MemoryRecord has no such field
                 count += 1;
             }
         }
@@ -662,12 +662,26 @@ impl MemoryStore {
             let contents = batch.column_by_name("content")
                 .ok_or_else(|| anyhow::anyhow!("missing 'content' column in memory table"))?
                 .as_string::<i32>();
+            // Extract stored embedding vector from the "vector" column when available.
+            let vector_col = batch.column_by_name("vector");
             for i in 0..batch.num_rows() {
+                // Reconstruct the embedding from the stored FixedSizeList column so
+                // callers receive a populated embedding field (H-007).
+                let embedding = if let Some(col) = vector_col {
+                    use arrow_array::cast::AsArray;
+                    let list = col.as_fixed_size_list();
+                    let values = list.value(i);
+                    let floats = values.as_primitive::<arrow_array::types::Float32Type>();
+                    floats.values().to_vec()
+                } else {
+                    // Fall back to re-embedding the content hash when the column is absent.
+                    embed_text(contents.value(i))
+                };
                 records.push((MemoryRecord {
                     turn_id: ids.value(i),
                     session_id: sids.value(i).to_string(),
                     content_hash: contents.value(i).to_string(),
-                    embedding: vec![],
+                    embedding,
                     outcome: None,
                     timestamp: 0,
                     is_negative: false,
@@ -913,6 +927,12 @@ impl Default for DecayCalibrator {
 }
 
 // ── Tiered memory ────────────────────────────────────────────────────────────
+//
+// Architectural note: TieredMemoryManager provides in-memory tiered caching;
+// MemoryBridge owns persistence. These are complementary layers, not duplicates.
+// TieredMemoryManager (hot VecDeque + warm HashMap + cold LanceDB) is the
+// hot-path cache layer. MemoryBridge is the persistence/session layer that
+// optionally delegates to MemoryStore (LanceDB) for durable storage.
 
 pub struct TieredConfig;
 pub struct TieredMemoryManager {
@@ -937,6 +957,21 @@ fn hash_to_u64(s: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
+}
+
+/// Score a single record against a query embedding using the four-feature linear ranker.
+///
+/// Features: cosine similarity, recency decay, outcome boost, surprise signal.
+/// `MemoryRecord` carries no `surprise_signal` field, so that feature is always 0.0;
+/// the weight slot is reserved for future extension.
+fn score_record(rec: &MemoryRecord, query_emb: &[f32], now_secs: u64, w: [f64; 4]) -> f64 {
+    let sim = local_cosine_similarity(query_emb, &rec.embedding) as f64;
+    let age_hours = now_secs.saturating_sub(rec.timestamp) as f64 / 3600.0;
+    let decay = (-0.01 * age_hours).exp();
+    let outcome_boost = rec.outcome.as_ref()
+        .map_or(0.0, |o| if o.tests_passed { 1.0 } else { 0.0 });
+    w[0] * sim + w[1] * decay + w[2] * outcome_boost
+    // w[3] (surprise_signal) is omitted: MemoryRecord has no such field.
 }
 
 impl TieredMemoryManager {
@@ -980,7 +1015,7 @@ impl TieredMemoryManager {
 
         let w = self.ranker_weights;
 
-        // Each entry: (score, fingerprint, record)
+        // Each entry: (score, fingerprint, record).
         let mut seen: HashSet<String> = HashSet::new();
         let mut scored: Vec<(f64, u64, MemoryRecord)> = Vec::new();
 
@@ -989,13 +1024,7 @@ impl TieredMemoryManager {
             if seen.contains(&rec.content_hash) {
                 continue;
             }
-            let sim = local_cosine_similarity(&query_emb, &rec.embedding) as f64;
-            let age_hours = now.saturating_sub(rec.timestamp) as f64 / 3600.0;
-            let decay = (-0.01 * age_hours).exp();
-            let outcome_boost = rec.outcome.as_ref()
-                .map_or(0.0, |o| if o.tests_passed { 1.0 } else { 0.0 });
-            let surprise = 0.0_f64; // MemoryRecord has no surprise_signal field
-            let score = w[0] * sim + w[1] * decay + w[2] * outcome_boost + w[3] * surprise;
+            let score = score_record(rec, &query_emb, now, w);
             let fp = hash_to_u64(&rec.content_hash);
             seen.insert(rec.content_hash.clone());
             scored.push((score, fp, rec.clone()));
@@ -1006,13 +1035,7 @@ impl TieredMemoryManager {
             if seen.contains(hash) {
                 continue;
             }
-            let sim = local_cosine_similarity(&query_emb, &rec.embedding) as f64;
-            let age_hours = now.saturating_sub(rec.timestamp) as f64 / 3600.0;
-            let decay = (-0.01 * age_hours).exp();
-            let outcome_boost = rec.outcome.as_ref()
-                .map_or(0.0, |o| if o.tests_passed { 1.0 } else { 0.0 });
-            let surprise = 0.0_f64;
-            let score = w[0] * sim + w[1] * decay + w[2] * outcome_boost + w[3] * surprise;
+            let score = score_record(rec, &query_emb, now, w);
             let fp = hash_to_u64(hash);
             seen.insert(hash.clone());
             scored.push((score, fp, rec.clone()));
@@ -1027,13 +1050,7 @@ impl TieredMemoryManager {
                     if seen.contains(&rec.content_hash) {
                         continue;
                     }
-                    let sim = local_cosine_similarity(&query_emb, &rec.embedding) as f64;
-                    let age_hours = now.saturating_sub(rec.timestamp) as f64 / 3600.0;
-                    let decay = (-0.01 * age_hours).exp();
-                    let outcome_boost = rec.outcome.as_ref()
-                        .map_or(0.0, |o| if o.tests_passed { 1.0 } else { 0.0 });
-                    let surprise = 0.0_f64;
-                    let score = w[0] * sim + w[1] * decay + w[2] * outcome_boost + w[3] * surprise;
+                    let score = score_record(&rec, &query_emb, now, w);
                     let fp = hash_to_u64(&rec.content_hash);
                     seen.insert(rec.content_hash.clone());
                     scored.push((score, fp, rec));
@@ -1045,9 +1062,8 @@ impl TieredMemoryManager {
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let top_k: Vec<(f64, u64, MemoryRecord)> = scored.into_iter().take(k).collect();
 
-        // Record which hashes and similarity scores were returned so update_ranker can use them.
         self.recalled_hashes_last = top_k.iter().map(|(_, fp, _)| *fp).collect();
-        self.recalled_scores_last = top_k.iter().map(|(score, _, _)| *score).collect();
+        self.recalled_scores_last = top_k.iter().map(|(s, _, _)| *s).collect();
 
         Ok(top_k.into_iter().map(|(_, _, r)| r).collect())
     }

@@ -12,6 +12,12 @@ use tokio::sync::{Semaphore, broadcast};
 /// Memory usage threshold above which a "Memory Critical" alert is emitted.
 const MEMORY_CRITICAL_MB: u64 = 16_000;
 
+/// CPU load percentage above which a "CPU Critical" alert is emitted.
+const CPU_CRITICAL_THRESHOLD: f32 = 90.0;
+
+/// Divisor to convert bytes (u64) to gibibytes (GiB).
+const BYTES_TO_GIB: u64 = 1024 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct ResourceEvent {
     pub rss_mb: u64,
@@ -37,6 +43,22 @@ impl Drop for ResourceMonitorActor {
     }
 }
 
+/// Sums available space across all disks and converts to GiB.
+fn disk_free_gib(disks: &Disks) -> u64 {
+    disks.iter().map(|d| d.available_space()).sum::<u64>() / BYTES_TO_GIB
+}
+
+/// Returns an alert string when CPU or memory exceeds critical thresholds.
+fn resource_alert(cpu_load: f32, rss_mb: u64) -> Option<String> {
+    if cpu_load > CPU_CRITICAL_THRESHOLD {
+        Some("CPU Critical".to_string())
+    } else if rss_mb > MEMORY_CRITICAL_MB {
+        Some("Memory Critical".to_string())
+    } else {
+        None
+    }
+}
+
 impl ResourceMonitorActor {
     fn spawn(tx: broadcast::Sender<ResourceEvent>, interval_secs: u64) -> Self {
         let handle = tokio::spawn(async move {
@@ -49,15 +71,8 @@ impl ResourceMonitorActor {
                 disks.refresh(false);
                 let rss_mb = sys.used_memory() / 1024 / 1024;
                 let cpu_load = sys.global_cpu_usage();
-                let disk_free_gb =
-                    disks.iter().map(|d| d.available_space()).sum::<u64>() / 1024 / 1024 / 1024;
-                let alert = if cpu_load > 90.0 {
-                    Some("CPU Critical".to_string())
-                } else if rss_mb > MEMORY_CRITICAL_MB {
-                    Some("Memory Critical".to_string())
-                } else {
-                    None
-                };
+                let disk_free_gb = disk_free_gib(&disks);
+                let alert = resource_alert(cpu_load, rss_mb);
                 if tx.send(ResourceEvent {
                     rss_mb,
                     cpu_load,
@@ -110,16 +125,8 @@ impl ComputeManager {
         let rss_mb = self.sys.used_memory() / 1024 / 1024;
         let cpu_load = self.sys.global_cpu_usage();
         let disks = Disks::new_with_refreshed_list();
-        let disk_free_gb =
-            disks.iter().map(|d| d.available_space()).sum::<u64>() / 1024 / 1024 / 1024;
-
-        let alert = if cpu_load > 90.0 {
-            Some("CPU Critical".to_string())
-        } else if rss_mb > MEMORY_CRITICAL_MB {
-            Some("Memory Critical".to_string())
-        } else {
-            None
-        };
+        let disk_free_gb = disk_free_gib(&disks);
+        let alert = resource_alert(cpu_load, rss_mb);
 
         let event = ResourceEvent {
             rss_mb,
@@ -235,6 +242,14 @@ impl InferenceCache {
     }
 }
 
+thread_local! {
+    static RNG: std::cell::RefCell<rand::rngs::ThreadRng> = std::cell::RefCell::new(rand::rng());
+}
+
+fn thread_local_jitter() -> f64 {
+    RNG.with(|r| r.borrow_mut().random_range(-0.25..=0.25))
+}
+
 #[derive(Default)]
 pub struct RateLimitManager {
     pub backoffs: HashMap<String, u32>,
@@ -251,7 +266,7 @@ impl RateLimitManager {
             return Duration::ZERO;
         }
         let base_secs = 2u64.saturating_pow(attempts).min(60) as f64;
-        let jitter: f64 = rand::rng().random_range(-0.25..=0.25);
+        let jitter: f64 = thread_local_jitter();
         let secs = (base_secs * (1.0 + jitter)).max(0.1);
         Duration::from_secs_f64(secs)
     }

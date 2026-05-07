@@ -9,6 +9,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Row, Table, Wrap},
 };
 use std::io;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,15 +28,46 @@ pub enum UIMode {
     Intercept,
 }
 
+/// CrosstalkUI is the **rendering layer** for the Crosstalk terminal interface.
+///
+/// Responsibilities of CrosstalkUI:
+/// - Owns the `ratatui` terminal and drives the render/event loop.
+/// - Holds transient, TUI-only input state (`ghost_stream_buffer`, `input_buffer`,
+///   `mode`, `active_pane`, etc.) that has no meaning outside the render loop.
+/// - Receives [`StreamEvent`]s from the orchestrator and forwards [`ControlSignal`]s back.
+///
+/// What CrosstalkUI is NOT:
+/// - It is not a duplicate of [`crate::ui::app::App`].  `App` owns the structured
+///   conversation model (`streaming_buffer`, `artifacts`, `entropy_scores`, agent
+///   weights, FPS tracking, etc.) and is designed to be shared across multiple
+///   rendering back-ends (TUI, headless, GodView).  `CrosstalkUI` reads from
+///   [`ConversationState`] directly for its simpler, legacy rendering path.
+///
+/// If you need richer state (entropy heatmap, scroll offsets, FPS), wire in an
+/// `App` instance instead of duplicating its fields here.
 pub struct CrosstalkUI {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     event_rx: mpsc::Receiver<StreamEvent>,
     control_tx: mpsc::Sender<ControlSignal>,
-    ghost_stream_buffer: String,
+    /// Accumulates streamed tokens between turns; cleared on `TurnComplete`.
+    /// TUI-only: not persisted in `ConversationState` or `App`.
+    /// Stored as `Arc<String>` so render can clone the Arc (pointer copy) instead
+    /// of copying the full buffer each frame.
+    ghost_stream_buffer: Arc<String>,
+    /// Current interaction mode (Normal / Insert / Playback / etc.).
+    /// TUI-only: drives keybinding dispatch and status bar display.
     mode: UIMode,
+    /// Characters typed by the user during `UIMode::Insert`.
+    /// TUI-only: flushed as a `ControlSignal::Inject` on Enter.
     input_buffer: String,
+    /// Which pane currently has visual focus for Tab cycling.
+    /// TUI-only: affects border highlight color only.
     active_pane: FocusedPane,
+    /// Iteration index shown during `UIMode::Playback`.
+    /// TUI-only: mirrors `ConversationState::iteration_index` during scrubbing.
     playback_index: u32,
+    /// Row selection cursor used in `UIMode::Intercept`.
+    /// TUI-only: indexes into artifact/agent lists for Lock/Mute actions.
     selection_index: usize,
 }
 
@@ -51,7 +83,7 @@ impl CrosstalkUI {
             terminal,
             event_rx,
             control_tx,
-            ghost_stream_buffer: String::new(),
+            ghost_stream_buffer: Arc::new(String::new()),
             mode: UIMode::Normal,
             input_buffer: String::new(),
             active_pane: FocusedPane::GhostStream,
@@ -71,15 +103,15 @@ impl CrosstalkUI {
                 while let Ok(event) = self.event_rx.try_recv() {
                     match event {
                         StreamEvent::TokenReceived { agent_id: _, token } => {
-                            self.ghost_stream_buffer.push_str(&token);
+                            Arc::make_mut(&mut self.ghost_stream_buffer).push_str(&token);
                         }
                         StreamEvent::TurnComplete(turn) => {
                             sigma.turns.push(turn);
                             sigma.iteration_index += 1;
-                            self.ghost_stream_buffer.clear();
+                            Arc::make_mut(&mut self.ghost_stream_buffer).clear();
                         }
                         StreamEvent::Error(err) => {
-                            self.ghost_stream_buffer
+                            Arc::make_mut(&mut self.ghost_stream_buffer)
                                 .push_str(&format!("\n[ERROR] {}\n", err));
                         }
                         _ => {}
@@ -218,7 +250,7 @@ impl CrosstalkUI {
 
     /// Renders the current state σ to the terminal.
     pub fn render(&mut self, sigma: &ConversationState) -> Result<(), io::Error> {
-        let ghost_stream_content = self.ghost_stream_buffer.clone();
+        let ghost_stream_content = Arc::clone(&self.ghost_stream_buffer);
         let mode = self.mode;
         let playback_index = self.playback_index;
         let active_pane = self.active_pane;
@@ -281,7 +313,7 @@ impl CrosstalkUI {
             let display_text = if mode == UIMode::Playback {
                 Text::from(format!("[Playback of iteration i_{}]", playback_index))
             } else {
-                render_heatmap_content(&ghost_stream_content)
+                render_heatmap_content(ghost_stream_content.as_str())
             };
 
             let ghost = Paragraph::new(display_text)

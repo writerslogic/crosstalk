@@ -16,6 +16,10 @@ const DEFAULT_TOURNAMENT_SIZE: usize = 3;
 const DEFAULT_MUTATION_RATE: f64 = 0.3;
 /// Default number of elite templates preserved unchanged per generation.
 const DEFAULT_ELITE_COUNT: usize = 2;
+/// Numerator of the trim-mutation length fraction (keeps `TRIM_RATIO_NUM / TRIM_RATIO_DEN`
+/// of the template's character count, i.e. 80%).
+const TRIM_RATIO_NUM: usize = 4;
+const TRIM_RATIO_DEN: usize = 5;
 /// Default population cap.
 const DEFAULT_MAX_POPULATION: usize = 20;
 
@@ -166,7 +170,7 @@ impl PromptEvolver {
             2 => MutationStrategy::InjectExamples,
             _ => {
                 let len = template.template_text.chars().count();
-                let trimmed = (len * 4 / 5).max(1);
+                let trimmed = (len * TRIM_RATIO_NUM / TRIM_RATIO_DEN).max(1);
                 MutationStrategy::Trim(trimmed)
             }
         };
