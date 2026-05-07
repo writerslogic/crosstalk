@@ -63,6 +63,7 @@ impl NashSolver {
         }
 
         Self::find_nash_equilibrium(&n_matrix).unwrap_or_else(|| {
+            tracing::warn!("no Nash equilibrium found; falling back to argmax");
             (0..proposals.len()).max_by(|&a, &b| {
                 let wa: f64 = matrix.iter().map(|row| row[a]).sum();
                 let wb: f64 = matrix.iter().map(|row| row[b]).sum();

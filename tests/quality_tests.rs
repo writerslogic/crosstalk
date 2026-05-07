@@ -31,6 +31,7 @@ fn artifact_with(name: &str, content: &str) -> Artifact {
             comment_density: 0.1,
             line_count: content.lines().count() as u32,
             health_score: 0.9,
+            visual_fidelity: 0.0,
         },
         skeleton: String::new(),
     }
@@ -314,6 +315,7 @@ fn regression_detector_identical_metrics_not_regressive() {
         comment_density: 0.25,
         line_count: 200,
         health_score: 0.85,
+        visual_fidelity: 0.0,
     };
     assert!(!RegressionDetector::is_regressive(&m, &m));
 }

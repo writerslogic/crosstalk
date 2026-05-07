@@ -325,22 +325,21 @@ fn timeline_step_through_all_100_iterations() {
 
 #[test]
 fn latent_mapper_empty_embedding_returns_origin() {
-    let coords = LatentMapper::project_to_3d(&[]);
+    let coords = LatentMapper::project_to_3d("");
     assert_eq!(coords, [0.0, 0.0, 0.0]);
 }
 
 #[test]
 fn latent_mapper_produces_3d_coords() {
-    let embedding: Vec<f32> = (0..16).map(|i| i as f32 * 0.1).collect();
-    let coords = LatentMapper::project_to_3d(&embedding);
+    let coords = LatentMapper::project_to_3d("hello world from the latent mapper test");
     assert_eq!(coords.len(), 3);
 }
 
 #[test]
 fn latent_mapper_deterministic() {
-    let embedding: Vec<f32> = vec![1.0, 0.5, 0.25, 0.1];
-    let a = LatentMapper::project_to_3d(&embedding);
-    let b = LatentMapper::project_to_3d(&embedding);
+    let content = "deterministic projection test content";
+    let a = LatentMapper::project_to_3d(content);
+    let b = LatentMapper::project_to_3d(content);
     assert_eq!(a, b, "projection must be deterministic");
 }
 

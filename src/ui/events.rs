@@ -2,9 +2,24 @@ use crate::types::events::{ControlSignal, StreamEvent};
 use crate::ui::app::{App, AppMode};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{BufWriter, Write};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+static LOG_FILE: OnceLock<Mutex<BufWriter<std::fs::File>>> = OnceLock::new();
+
+fn log_file() -> Option<std::sync::MutexGuard<'static, BufWriter<std::fs::File>>> {
+    let m = LOG_FILE.get_or_init(|| {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/crosstalk.log")
+            .expect("cannot open /tmp/crosstalk.log");
+        Mutex::new(BufWriter::new(f))
+    });
+    m.lock().ok()
+}
 
 pub enum Action {
     None,
@@ -35,16 +50,15 @@ fn log_event(ev: &StreamEvent) {
             }
             out
         });
-        if !lines.is_empty()
-            && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/crosstalk.log") {
-                for line in lines {
-                    crate::log_warn!(writeln!(f, "{line}"), "failed to write log event");
-                }
+        if !lines.is_empty() && let Some(mut f) = log_file() {
+            for line in lines {
+                crate::log_warn!(writeln!(f, "{line}"), "failed to write log event");
             }
+        }
         return;
     }
 
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/crosstalk.log") {
+    if let Some(mut f) = log_file() {
         match ev {
             StreamEvent::TokenReceived { .. } => unreachable!(),
             StreamEvent::TurnComplete(turn) => {

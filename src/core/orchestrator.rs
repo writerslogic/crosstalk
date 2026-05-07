@@ -428,11 +428,14 @@ impl Orchestrator {
             }
         }
 
-        let (prompt, history_contents, active_agents, artifacts_snapshot) = {
-            let s = sigma_lock.lock().await;
-            if s.iteration_index == 0 && s.turns.is_empty() {
-                self.state_manager.checkpoint(&s)?;
+        let s = {
+            let guard = sigma_lock.lock().await;
+            if guard.iteration_index == 0 && guard.turns.is_empty() {
+                self.state_manager.checkpoint(&guard)?;
             }
+            guard.clone()
+        };
+        let (prompt, history_contents, active_agents, artifacts_snapshot) = {
             let contents: Vec<String> = s
                 .turns
                 .iter()
@@ -761,8 +764,9 @@ impl Orchestrator {
                         Err(e) => {
                             // --- Suggestion 10: Distributed Compute Fallback ---
                             tracing::info!(agent = %agent_id, "local inference failed, attempting remote MCP fallback");
-                            let gateway = self.mcp_gateway.lock().await;
-                            if let Ok(remote_res) = gateway.dispatch_remote_sampling(&agent_prompt, &agent_id).await {
+                            // Do not hold the mutex across the async socket I/O; dispatch_remote_sampling
+                            // reads no gateway fields so it can be called as a free function.
+                            if let Ok(remote_res) = McpGateway::remote_sampling(&agent_prompt, &agent_id).await {
                                 return Ok((agent_id, remote_res));
                             }
 

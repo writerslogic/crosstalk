@@ -19,6 +19,8 @@ fn make_turn(index: u32, outcome: TurnOutcome) -> Turn {
         structure: Some(TurnStructure::FreeForm),
         signature: vec![],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     }
 }
 

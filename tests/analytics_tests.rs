@@ -35,6 +35,8 @@ fn make_state(session_id: &str, turns: u32, prob: f64) -> ConversationState {
             structure: None,
             signature: vec![],
             surprise_signal: None,
+            consistency_score: None,
+            diff_quality_score: None,
         });
     }
     s
@@ -186,6 +188,8 @@ fn agent_success_rate_matches_known_outcomes() {
             structure: None,
             signature: vec![],
             surprise_signal: None,
+            consistency_score: None,
+            diff_quality_score: None,
         });
     }
     let report = AnalyticsEngine::generate_report(&sigma);
@@ -228,6 +232,8 @@ fn convergence_diagnostics_detects_conflicting_proposals() {
             structure: None,
             signature: vec![],
             surprise_signal: None,
+            consistency_score: None,
+            diff_quality_score: None,
         });
     }
     let report = AnalyticsEngine::generate_report(&sigma);
@@ -257,6 +263,8 @@ fn convergence_diagnostics_detects_capability_mismatch() {
             structure: None,
             signature: vec![],
             surprise_signal: None,
+            consistency_score: None,
+            diff_quality_score: None,
         });
     }
     // One control turn from a different agent
@@ -272,6 +280,8 @@ fn convergence_diagnostics_detects_capability_mismatch() {
         structure: None,
         signature: vec![],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     });
     let report = AnalyticsEngine::generate_report(&sigma);
     assert!(
@@ -390,6 +400,8 @@ fn is_mandate_active_false_for_old_session() {
         structure: None,
         signature: vec![],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     });
     assert!(
         !ReleaseManager::is_mandate_active(&sigma),
@@ -549,8 +561,7 @@ fn svg_exporter_heatmap_produces_valid_svg() {
 
 #[test]
 fn latent_mapper_returns_3d_point() {
-    let embedding: Vec<f32> = (0..384).map(|i| i as f32 / 384.0).collect();
-    let point = LatentMapper::project_to_3d(&embedding);
+    let point = LatentMapper::project_to_3d("latent mapper test content for projection");
     assert_eq!(point.len(), 3);
     assert!(point.iter().all(|v| v.is_finite()));
 }

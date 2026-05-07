@@ -11,6 +11,8 @@ use crate::types::intelligence::RunningAverage;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
+const MIN_TURNS_BETWEEN_SHIFTS: u32 = 2;
+
 // =====================================================================
 // TOPOLOGY VARIANTS
 // =====================================================================
@@ -297,7 +299,7 @@ impl TopologyManager {
         sigma: &ConversationState,
         turn_idx: u32,
     ) -> Option<TopologyDirective> {
-        if turn_idx.saturating_sub(self.last_shift_turn) < 2 {
+        if turn_idx.saturating_sub(self.last_shift_turn) < MIN_TURNS_BETWEEN_SHIFTS {
             return None;
         }
         let recommended = self.recommend_topology(sigma);

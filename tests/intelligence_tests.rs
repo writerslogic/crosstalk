@@ -58,6 +58,8 @@ fn test_quality_scorer_handles_certainty() {
         structure: None,
         signature: vec![],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     };
     let s1 = QualityScorer::score(&turn);
     turn.certainty = Some(0.1);
@@ -80,6 +82,8 @@ async fn test_intelligence_update_profile() {
         structure: None,
         signature: vec![],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     };
     engine.update_profile(&turn, 0.9);
     let p = engine.profiles.get("m1").unwrap();
@@ -102,6 +106,7 @@ fn test_template_rendering_with_btreemap() {
         task_category: TaskCategory::CodeGeneration,
         variables: vec!["task".to_string()],
         performance_history: vec![],
+        tags: vec![],
     };
     let mut vars = BTreeMap::new();
     vars.insert("task".to_string(), "coding".to_string());

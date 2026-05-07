@@ -55,6 +55,8 @@ fn test_quality_scorer_penalizes_failure() {
         structure: None,
         signature: vec![],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     };
     let turn_pass = Turn {
         index: 1,
@@ -68,6 +70,8 @@ fn test_quality_scorer_penalizes_failure() {
         structure: None,
         signature: vec![],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     };
 
     assert!(QualityScorer::score(&turn_pass) > QualityScorer::score(&turn_fail));
@@ -87,6 +91,8 @@ fn test_reasoning_scorer_detects_evidence() {
         structure: None,
         signature: vec![],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     };
     let score = ReasoningScorer::score(&turn);
     assert!(score > 0.5);

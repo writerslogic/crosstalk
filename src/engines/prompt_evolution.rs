@@ -96,9 +96,7 @@ impl PromptEvolver {
         // and return the global best directly (avoids with-replacement misses).
         if k >= self.population.len() {
             return self.population.iter().max_by(|a, b| {
-                a.mean_performance()
-                    .partial_cmp(&b.mean_performance())
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                a.mean_performance().total_cmp(&b.mean_performance())
             });
         }
         let mut rng = rand::rng();
@@ -191,9 +189,7 @@ impl PromptEvolver {
         }
 
         self.population.sort_by(|a, b| {
-            b.mean_performance()
-                .partial_cmp(&a.mean_performance())
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.mean_performance().total_cmp(&a.mean_performance())
         });
 
         let elite_n = self.elite_count.min(self.population.len());
@@ -262,9 +258,7 @@ impl PromptEvolver {
         self.population.iter().max_by(|a, b| {
             let score_a = a.mean_performance() * (1.0 + elo_norm);
             let score_b = b.mean_performance() * (1.0 + elo_norm);
-            score_a
-                .partial_cmp(&score_b)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            score_a.total_cmp(&score_b)
         })
     }
 
@@ -287,9 +281,7 @@ impl PromptEvolver {
             return;
         }
         self.population.sort_by(|a, b| {
-            b.mean_performance()
-                .partial_cmp(&a.mean_performance())
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.mean_performance().total_cmp(&a.mean_performance())
         });
 
         let elite_n = self.elite_count.min(self.population.len());

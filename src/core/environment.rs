@@ -119,14 +119,8 @@ impl NixManager {
                 missing.push(dep.clone());
                 continue;
             }
-            match Command::new("which")
-                .arg(dep)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-            {
-                Ok(s) if s.success() => {}
-                _ => missing.push(dep.clone()),
+            if which::which(dep).is_err() {
+                missing.push(dep.clone());
             }
         }
         Ok(missing)

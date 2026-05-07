@@ -341,7 +341,7 @@ impl MemoryBridge {
             turn_id: turn.index,
             session_id: sid.to_string(),
             content_hash: hash,
-            embedding: embed_text(&turn.content),
+            embedding: embed_text(turn.content.get(..10_240).unwrap_or(&turn.content)),
             outcome,
             timestamp: ConversationState::now(),
             is_negative,

@@ -368,6 +368,8 @@ fn test_lesson_extraction() {
         signature: vec![],
 
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     };
 
     let lessons = LessonExtractor::extract(&[turn]);
@@ -410,6 +412,8 @@ fn test_lesson_extraction_filters_failed_turns() {
             signature: vec![],
 
             surprise_signal: None,
+            consistency_score: None,
+            diff_quality_score: None,
         },
         Turn {
             index: 2,
@@ -424,6 +428,8 @@ fn test_lesson_extraction_filters_failed_turns() {
             signature: vec![],
 
             surprise_signal: None,
+            consistency_score: None,
+            diff_quality_score: None,
         },
         Turn {
             index: 3,
@@ -438,6 +444,8 @@ fn test_lesson_extraction_filters_failed_turns() {
             signature: vec![],
 
             surprise_signal: None,
+            consistency_score: None,
+            diff_quality_score: None,
         },
     ];
 
@@ -472,6 +480,8 @@ fn test_context_distiller_outcome_weighting() {
         signature: vec![],
 
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     });
 
     state.turns.push(Turn {
@@ -487,6 +497,8 @@ fn test_context_distiller_outcome_weighting() {
         signature: vec![],
 
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     });
 
     let distilled = ContextDistiller::distill(&state, 2000);
@@ -692,6 +704,8 @@ fn make_turn(index: u32, content: &str, outcome: TurnOutcome) -> Turn {
         signature: vec![],
 
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     }
 }
 

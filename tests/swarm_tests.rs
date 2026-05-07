@@ -299,6 +299,8 @@ async fn broadcast_turn_succeeds() {
         structure: None,
         signature: vec![],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     };
     let result = ctrl.broadcast_turn(turn);
     assert!(result.is_ok(), "broadcast_turn should succeed");

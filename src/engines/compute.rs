@@ -3,11 +3,14 @@ use crate::types::conversation::ConversationState;
 use anyhow::Result;
 use rand::Rng;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use sysinfo::System;
+use sysinfo::{Disks, System};
 use tokio::sync::{Semaphore, broadcast};
+
+/// Memory usage threshold above which a "Memory Critical" alert is emitted.
+const MEMORY_CRITICAL_MB: u64 = 16_000;
 
 #[derive(Debug, Clone)]
 pub struct ResourceEvent {
@@ -39,17 +42,18 @@ impl ResourceMonitorActor {
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
             let mut sys = System::new_all();
+            let mut disks = Disks::new_with_refreshed_list();
             loop {
                 ticker.tick().await;
                 sys.refresh_all();
+                disks.refresh(false);
                 let rss_mb = sys.used_memory() / 1024 / 1024;
                 let cpu_load = sys.global_cpu_usage();
-                let disks = sysinfo::Disks::new_with_refreshed_list();
                 let disk_free_gb =
                     disks.iter().map(|d| d.available_space()).sum::<u64>() / 1024 / 1024 / 1024;
                 let alert = if cpu_load > 90.0 {
                     Some("CPU Critical".to_string())
-                } else if rss_mb > 56_000 {
+                } else if rss_mb > MEMORY_CRITICAL_MB {
                     Some("Memory Critical".to_string())
                 } else {
                     None
@@ -105,13 +109,13 @@ impl ComputeManager {
         self.sys.refresh_all();
         let rss_mb = self.sys.used_memory() / 1024 / 1024;
         let cpu_load = self.sys.global_cpu_usage();
-        let disks = sysinfo::Disks::new_with_refreshed_list();
+        let disks = Disks::new_with_refreshed_list();
         let disk_free_gb =
             disks.iter().map(|d| d.available_space()).sum::<u64>() / 1024 / 1024 / 1024;
 
         let alert = if cpu_load > 90.0 {
             Some("CPU Critical".to_string())
-        } else if rss_mb > 16000 {
+        } else if rss_mb > MEMORY_CRITICAL_MB {
             Some("Memory Critical".to_string())
         } else {
             None
@@ -333,7 +337,7 @@ impl BatchScheduler {
 
 pub struct RequestRateLimiter {
     requests_per_minute: u32,
-    timestamps: tokio::sync::Mutex<HashMap<String, Vec<Instant>>>,
+    timestamps: tokio::sync::Mutex<HashMap<String, VecDeque<Instant>>>,
 }
 
 impl RequestRateLimiter {
@@ -350,14 +354,16 @@ impl RequestRateLimiter {
             let mut guard = self.timestamps.lock().await;
             let entries = guard.entry(model_id.to_string()).or_default();
             let now = Instant::now();
-            entries.retain(|t| now.duration_since(*t) < window);
+            while entries.front().is_some_and(|t| now.duration_since(*t) >= window) {
+                entries.pop_front();
+            }
             if entries.len() >= self.requests_per_minute as usize {
                 entries
-                    .first()
+                    .front()
                     .map(|t| window.saturating_sub(now.duration_since(*t)))
                     .unwrap_or(Duration::ZERO)
             } else {
-                entries.push(now);
+                entries.push_back(now);
                 Duration::ZERO
             }
         };
@@ -366,8 +372,10 @@ impl RequestRateLimiter {
             let mut guard = self.timestamps.lock().await;
             let entries = guard.entry(model_id.to_string()).or_default();
             let now = Instant::now();
-            entries.retain(|t| now.duration_since(*t) < window);
-            entries.push(now);
+            while entries.front().is_some_and(|t| now.duration_since(*t) >= window) {
+                entries.pop_front();
+            }
+            entries.push_back(now);
         }
     }
 }

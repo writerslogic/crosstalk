@@ -205,6 +205,8 @@ fn distill_output_respects_budget_with_many_artifacts() {
             structure: None,
             signature: vec![],
             surprise_signal: None,
+            consistency_score: None,
+            diff_quality_score: None,
         });
     }
 
@@ -248,6 +250,8 @@ fn distill_small_state_includes_all_turns() {
         structure: None,
         signature: vec![],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     });
 
     let output = ContextDistiller::distill(&sigma, 50000);

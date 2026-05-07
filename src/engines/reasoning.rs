@@ -987,7 +987,7 @@ impl SynthesisEngine {
                 *frequency.entry(change).or_insert(0) += 1;
             }
             let (winning_content, winning_count) =
-                frequency.into_iter().max_by_key(|&(_, count)| count).unwrap();
+                frequency.into_iter().max_by_key(|&(_, count)| count)?;
 
             // If majority says delete (empty content proposed), or if winning content is different
             if winning_count > threshold && *winning_content != base_block.content {

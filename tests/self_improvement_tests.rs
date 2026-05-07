@@ -29,6 +29,8 @@ fn evaluate_session_computes_basic_metrics() {
         structure: None,
         signature: vec![],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     });
 
     let eval = SelfImprovementEngine::evaluate_session(&sigma);
@@ -150,6 +152,8 @@ fn post_mortem_generated_on_high_failure_rate() {
             structure: None,
             signature: vec![],
             surprise_signal: None,
+            consistency_score: None,
+            diff_quality_score: None,
         });
     }
     let pm = PostMortemGenerator::generate(&sigma).expect("mortem should be generated");
@@ -205,6 +209,8 @@ fn progress_reporter_estimates_remaining_turns() {
         structure: None,
         signature: vec![],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     });
     sigma.turns.push(Turn {
         index: 1,
@@ -218,6 +224,8 @@ fn progress_reporter_estimates_remaining_turns() {
         structure: None,
         signature: vec![],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     });
 
     let report = ProgressReporter::report(&sigma, 10);

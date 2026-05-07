@@ -41,6 +41,8 @@ fn test_turn_serialization_roundtrip() {
         structure: Some(TurnStructure::StepByStep),
         signature: vec![1, 2, 3],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     };
 
     let serialized = serde_json::to_string(&turn).unwrap();

@@ -62,7 +62,7 @@ async fn make_orchestrator(
     let (event_tx, mut event_rx) = mpsc::channel::<StreamEvent>(1000);
     let (_control_tx, control_rx) = mpsc::channel::<ControlSignal>(100);
     tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
-    Orchestrator::new(manager, agents, event_tx, control_rx)
+    Orchestrator::new(manager, agents, event_tx, control_rx, None)
         .await
         .expect("Failed to create orchestrator")
 }
@@ -288,8 +288,9 @@ async fn test_audit_alert_on_hash_mismatch() {
         task_category: None,
         structure: None,
         signature: vec![],
-
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     });
     // Correct hash from zero prev
     state.state_hash = HashChain::compute(&state, &[0u8; 32]).expect("hash");
@@ -530,6 +531,8 @@ fn make_turn_with_outcome(
         structure: None,
         signature: vec![],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     }
 }
 
@@ -542,6 +545,7 @@ fn test_prompt_composer_base_pass_through() {
         task_category: TaskCategory::CodeGeneration,
         variables: vec!["task".to_string()],
         performance_history: vec![],
+        tags: vec![],
     };
     let profile = make_profile("m", TaskCategory::CodeGeneration, 0.5, 0);
     let result = PromptComposer::compose(&template, "prompt", &[], &profile).unwrap();
@@ -557,6 +561,7 @@ fn test_prompt_composer_injects_profile_context() {
         task_category: TaskCategory::CodeGeneration,
         variables: vec!["profile_summary".to_string()],
         performance_history: vec![],
+        tags: vec![],
     };
     let profile = make_profile("gpt4", TaskCategory::CodeGeneration, 0.85, 10);
     let result = PromptComposer::compose(&template, "task", &[], &profile).unwrap();
@@ -573,6 +578,7 @@ fn test_prompt_composer_appends_examples() {
         task_category: TaskCategory::Debugging,
         variables: vec!["context".to_string()],
         performance_history: vec![],
+        tags: vec![],
     };
     let profile = make_profile("m", TaskCategory::Debugging, 0.5, 0);
     let t1 = make_turn_with_outcome(0, TurnOutcome::Compiled, None);
@@ -591,6 +597,7 @@ fn test_prompt_composer_examples_capped_at_3() {
         task_category: TaskCategory::Debugging,
         variables: vec!["context".to_string()],
         performance_history: vec![],
+        tags: vec![],
     };
     let profile = make_profile("m", TaskCategory::Debugging, 0.5, 0);
     let turns: Vec<Turn> = (0..5)

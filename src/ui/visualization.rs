@@ -1,6 +1,7 @@
 use crate::types::conversation::ConversationState;
 use anyhow::Result;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 fn xml_escape(s: &str) -> String {
@@ -42,6 +43,8 @@ pub struct GodView {
     device: Option<wgpu::Device>,
     queue: Option<wgpu::Queue>,
     render_pipeline: Option<wgpu::RenderPipeline>,
+    /// Kept alive to guarantee the surface's backing window outlives the surface.
+    _window: Option<std::sync::Arc<winit::window::Window>>,
 }
 
 impl Default for GodView {
@@ -59,6 +62,7 @@ impl GodView {
             device: None,
             queue: None,
             render_pipeline: None,
+            _window: None,
         }
     }
 
@@ -67,7 +71,7 @@ impl GodView {
             backends: wgpu::Backends::all(), // Supports Metal, Vulkan, DX12, etc.
             ..Default::default()
         });
-        let surface = instance.create_surface(window)?;
+        let surface = instance.create_surface(Arc::clone(&window))?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance, // Prefers Metal/GPU on Mac
@@ -128,6 +132,7 @@ impl GodView {
         self.device = Some(device);
         self.queue = Some(queue);
         self.render_pipeline = Some(render_pipeline);
+        self._window = Some(window);
 
         Ok(())
     }

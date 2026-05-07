@@ -15,6 +15,7 @@ fn make_node(id: &str, title: &str, status: GoalStatus) -> GoalNode {
         assigned_turn: None,
         deadline: None,
         dependencies: vec![],
+        difficulty_score: None,
     }
 }
 
@@ -31,6 +32,8 @@ fn make_turn(index: u32, outcome: TurnOutcome) -> Turn {
         structure: None,
         signature: vec![],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     }
 }
 

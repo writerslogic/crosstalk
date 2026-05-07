@@ -331,9 +331,16 @@ async fn main() -> anyhow::Result<()> {
             };
 
             a.tick_fps();
-            terminal.draw(|f| render::draw(f, &a))?;
             action
         };
+
+        {
+            let a = app.lock().await;
+            if a.shutdown {
+                break;
+            }
+            terminal.draw(|f| render::draw(f, &a))?;
+        }
 
         match action {
             Action::Shutdown => {
@@ -341,11 +348,18 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
             Action::Send(sig) => {
-                log_warn!(ctrl_tx.send(sig).await, "failed to send control signal");
+                if ctrl_tx.send(sig).await.is_err() {
+                    tracing::warn!("failed to send control signal; shutting down");
+                    app.lock().await.shutdown = true;
+                    break;
+                }
             }
             Action::SendTwo(s1, s2) => {
-                log_warn!(ctrl_tx.send(s1).await, "failed to send control signal 1");
-                log_warn!(ctrl_tx.send(s2).await, "failed to send control signal 2");
+                if ctrl_tx.send(s1).await.is_err() || ctrl_tx.send(s2).await.is_err() {
+                    tracing::warn!("failed to send control signal; shutting down");
+                    app.lock().await.shutdown = true;
+                    break;
+                }
             }
             Action::None => {}
         }

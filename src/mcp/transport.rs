@@ -5,6 +5,8 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 
+const MAX_CONSECUTIVE_PARSE_ERRORS: u32 = 10;
+
 pub struct McpTransport {
     pub socket_path: String,
 }
@@ -40,7 +42,7 @@ impl McpTransport {
                     let mut s = serde_json::to_string(&err_resp)?;
                     s.push('\n');
                     writer.write_all(s.as_bytes()).await?;
-                    if consecutive_errors >= 10 {
+                    if consecutive_errors >= MAX_CONSECUTIVE_PARSE_ERRORS {
                         break;
                     }
                     continue;

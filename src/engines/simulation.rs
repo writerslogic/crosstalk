@@ -45,12 +45,13 @@ impl MonteCarloRunner {
 
     pub async fn predict(&self, artifact: &Artifact, diff: &ArtifactDiff, trials: usize) -> Result<(f64, f64)> {
         let mut tasks = Vec::new();
-        let artifact_base = artifact.content.clone();
+        let artifact_base: Arc<str> = artifact.content.as_str().into();
+        let diff_arc = Arc::new(diff.clone());
 
         for _ in 0..trials {
             let sandbox = Arc::clone(&self.sandbox);
-            let content = artifact_base.clone();
-            let diff_clone = diff.clone();
+            let content = Arc::clone(&artifact_base);
+            let diff_clone = Arc::clone(&diff_arc);
 
                         tasks.push(task::spawn(async move {
                 // 1. Apply Patch

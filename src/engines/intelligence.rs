@@ -40,9 +40,10 @@ impl CheckpointService {
                             .iter()
                             .map(|entry| (entry.key().clone(), entry.value().clone()))
                             .collect();
+                        let templates_snapshot = templates.read().await.clone();
                         let data = serde_json::json!({
                             "profiles": profiles_map,
-                            "templates": &*templates.read().await,
+                            "templates": templates_snapshot,
                         });
                         if let Ok(content) = serde_json::to_string_pretty(&data) {
                             let temp_path = format!("{}.tmp", path);
@@ -1038,8 +1039,8 @@ impl ConvergenceVelocityTracker {
         }
         let mut it = self.velocity_history.iter().rev();
         let latest = *it.next().unwrap();
-        let prior = *it.next().unwrap();
-        latest - prior
+        let Some(prior) = it.next() else { return 0.0 };
+        latest - *prior
     }
 
     #[must_use]
@@ -1153,7 +1154,14 @@ impl FailurePatternStore {
     }
 
     pub fn ephemeral() -> Self {
-        let db = sled::Config::new().temporary(true).open().expect("in-memory sled");
+        let db = sled::Config::new()
+            .temporary(true)
+            .open()
+            .unwrap_or_else(|e| {
+                tracing::warn!(err = ?e, "failure pattern store unavailable, retrying with default config");
+                sled::open(std::env::temp_dir().join("crosstalk_failures_fallback"))
+                    .expect("cannot open any sled db")
+            });
         Self { db: Arc::new(db) }
     }
 

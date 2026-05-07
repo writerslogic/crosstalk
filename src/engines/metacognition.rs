@@ -13,6 +13,9 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
+const DEFAULT_CONCESSION_THRESHOLD: f64 = 0.20;
+const DEFAULT_DEADLOCK_THRESHOLD: u32 = 5;
+
 // =====================================================================
 // EPISTEMIC STATE — what does the agent know that it knows?
 // =====================================================================
@@ -215,10 +218,10 @@ impl MetacognitiveObserver {
             elo_ratings: FxHashMap::default(),
             calibration: std::collections::HashMap::new(),
             intervention_history: VecDeque::with_capacity(50),
-            concession_threshold: 0.20,
+            concession_threshold: DEFAULT_CONCESSION_THRESHOLD,
             semantic_embeddings: VecDeque::with_capacity(20),
             turns_since_progress: 0,
-            deadlock_threshold: 5,
+            deadlock_threshold: DEFAULT_DEADLOCK_THRESHOLD,
             intervention_outcomes: FxHashMap::default(),
             metrics: ObserverMetrics::default(),
             confidence_accum: FxHashMap::default(),

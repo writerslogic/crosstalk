@@ -189,27 +189,30 @@ impl EnsembleEngine {
 
         // Fallback to paragraph-level selection for Research/Reasoning
         let best_idx = proposals.iter().enumerate().max_by(|(_, a), (_, b)| a.2.total_cmp(&b.2)).map(|(i, _)| i).unwrap_or(0);
-        let base_paragraphs: Vec<&str> = proposals[best_idx].1.split("
-
-").collect();
+        let base_paragraphs: Vec<&str> = proposals[best_idx].1.split("\n\n").collect();
         let mut merged = String::with_capacity(proposals[best_idx].1.len());
 
-        for para in &base_paragraphs {
-            let mut best_para = (*para, proposals[best_idx].2);
-            for (_, content, score) in &proposals {
-                for candidate in content.split("
+        // Pre-flatten all (candidate, score) pairs once to avoid O(n²) re-splitting.
+        let all_candidates: Vec<(&str, f64)> = proposals
+            .iter()
+            .flat_map(|(_, content, score)| content.split("\n\n").map(move |c| (c, *score)))
+            .collect();
 
-") {
-                    let overlap = para.split_whitespace().filter(|w| candidate.contains(*w)).count();
-                    let total = para.split_whitespace().count().max(1);
-                    if overlap as f64 / total as f64 > 0.6 && *score > best_para.1 {
-                        best_para = (candidate, *score);
-                    }
+        for para in &base_paragraphs {
+            // Pre-build word set for this paragraph: O(words) lookup instead of O(words × len).
+            let para_words: std::collections::HashSet<&str> = para.split_whitespace().collect();
+            let total = para_words.len().max(1);
+            let mut best_para = (*para, proposals[best_idx].2);
+            for &(candidate, score) in &all_candidates {
+                let cand_words: std::collections::HashSet<&str> = candidate.split_whitespace().collect();
+                let overlap = para_words.intersection(&cand_words).count();
+                if overlap as f64 / total as f64 > 0.6 && score > best_para.1 {
+                    best_para = (candidate, score);
                 }
             }
-            if !merged.is_empty() { merged.push_str("
-
-"); }
+            if !merged.is_empty() {
+                merged.push_str("\n\n");
+            }
             merged.push_str(best_para.0);
         }
         merged

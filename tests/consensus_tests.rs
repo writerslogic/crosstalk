@@ -233,6 +233,8 @@ fn make_turn(model: &str, outcome: TurnOutcome, certainty: f64) -> Turn {
         structure: None,
         signature: vec![],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     }
 }
 

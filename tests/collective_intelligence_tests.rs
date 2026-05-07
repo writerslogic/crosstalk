@@ -22,6 +22,8 @@ fn make_turn(model_id: &str, outcome: TurnOutcome, category: Option<TaskCategory
         structure: None,
         signature: vec![],
         surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
     }
 }
 

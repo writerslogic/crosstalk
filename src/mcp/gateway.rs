@@ -88,24 +88,49 @@ impl McpGateway {
 
     /// Dispatch a sampling request through the local MCP Unix-socket transport.
     ///
-    /// Connects to `/tmp/crosstalk-mcp.sock`, sends a `sampling/createMessage`
-    /// JSON-RPC request, and returns the first text content block from the response.
+    /// Connects to `$XDG_RUNTIME_DIR/crosstalk-mcp.sock` (falling back to
+    /// `/tmp/crosstalk-mcp.sock`), sends a `sampling/createMessage` JSON-RPC request,
+    /// and returns the first text content block from the response.
     /// To wire a real remote worker pool, replace the `UnixStream::connect` call with
     /// pool selection (round-robin or random) against registered worker endpoints.
-    pub async fn dispatch_remote_sampling(&self, prompt: &str, model_id: &str) -> Result<String> {
+    pub async fn remote_sampling(prompt: &str, model_id: &str) -> Result<String> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixStream;
 
-        // Remote pool connection point: replace with worker endpoint selection when available.
-        const LOCAL_SOCKET: &str = "/tmp/crosstalk-mcp.sock";
+        // Prefer XDG_RUNTIME_DIR (user-private, mode 0700) over /tmp.
+        let socket_path = std::env::var("XDG_RUNTIME_DIR")
+            .map(|d| std::path::PathBuf::from(d).join("crosstalk-mcp.sock"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/crosstalk-mcp.sock"));
 
-        tracing::info!(model = %model_id, socket = LOCAL_SOCKET, "dispatching sampling/createMessage via local MCP transport");
+        // Validate that the socket is owned by the current user before connecting,
+        // preventing an attacker from pre-creating the socket path.
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(&socket_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "MCP sampling unavailable: socket not found at {} ({}). \
+                     Start the MCP server or wire a remote worker pool.",
+                    socket_path.display(), e
+                )
+            })?;
+            unsafe extern "C" { fn getuid() -> u32; }
+            let current_uid = unsafe { getuid() };
+            if meta.uid() != current_uid {
+                return Err(anyhow::anyhow!(
+                    "MCP socket at {} is not owned by the current user (owner uid={}, current uid={}); \
+                     refusing to connect",
+                    socket_path.display(), meta.uid(), current_uid
+                ));
+            }
+        }
 
-        let mut stream = UnixStream::connect(LOCAL_SOCKET).await.map_err(|e| {
+        tracing::info!(model = %model_id, socket = %socket_path.display(), "dispatching sampling/createMessage via local MCP transport");
+
+        let mut stream = UnixStream::connect(&socket_path).await.map_err(|e| {
             anyhow::anyhow!(
                 "MCP sampling unavailable: could not connect to {} ({}). \
                  Start the MCP server or wire a remote worker pool.",
-                LOCAL_SOCKET, e
+                socket_path.display(), e
             )
         })?;
 
@@ -126,17 +151,22 @@ impl McpGateway {
             anyhow::anyhow!("failed to write sampling request to MCP socket: {}", e)
         })?;
 
-        // Read exactly one newline-delimited JSON response
+        // Read exactly one newline-delimited JSON response, capped at 1 MiB.
+        const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
         let (reader, _writer) = stream.into_split();
-        let mut lines = BufReader::new(reader).lines();
+        let mut lines = BufReader::new(tokio::io::AsyncReadExt::take(reader, MAX_RESPONSE_BYTES)).lines();
         let line = lines
             .next_line()
             .await
             .map_err(|e| anyhow::anyhow!("failed to read MCP sampling response: {}", e))?
             .ok_or_else(|| anyhow::anyhow!("MCP socket closed without a response"))?;
 
+        if line.len() > 512 * 1024 {
+            tracing::warn!(bytes = line.len(), "large MCP sampling response");
+        }
+
         let response: Value = serde_json::from_str(&line)
-            .map_err(|e| anyhow::anyhow!("invalid JSON from MCP socket: {}: {:?}", e, line))?;
+            .map_err(|e| anyhow::anyhow!("invalid JSON from MCP socket: {}", e))?;
 
         // MCP sampling response: result.content[0].text  (or result as a plain string)
         if let Some(err) = response.get("error") {

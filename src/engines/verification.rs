@@ -74,6 +74,10 @@ impl InvariantChecker {
     /// This executes 'verus' on the specification files in the verus/ directory.
     /// Returns Ok(()) if verification passes, or an error with Verus output if it fails.
     pub async fn verify_all_with_verus() -> Result<()> {
+        // Resolve verus to an absolute path at call time to prevent PATH manipulation attacks.
+        let verus_bin = which::which("verus")
+            .context("verus binary not found in PATH; install verus to enable formal verification")?;
+
         let proof_files = [
             "verus/state.rs",
             "verus/hash_chain.rs",
@@ -85,7 +89,7 @@ impl InvariantChecker {
                 return Err(anyhow!("Verus proof file not found: {}", file));
             }
 
-            let output = tokio::process::Command::new("verus")
+            let output = tokio::process::Command::new(&verus_bin)
                 .arg(file)
                 .output()
                 .await
@@ -112,12 +116,25 @@ impl InvariantChecker {
             return Ok(Ok(())); // No formal specs to verify
         }
 
+        let verus_bin = which::which("verus")
+            .context("verus binary not found in PATH; install verus to enable formal verification")?;
+
         let temp_dir = std::env::temp_dir().join("crosstalk-verus");
         tokio::fs::create_dir_all(&temp_dir).await?;
+
+        // Restrict directory to owner-only to prevent symlink/TOCTOU attacks.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o700);
+            std::fs::set_permissions(&temp_dir, perms)
+                .context("failed to restrict permissions on verus temp dir")?;
+        }
+
         let temp_file = temp_dir.join(format!("verify_{}.rs", artifact.name.replace('/', "_")));
         tokio::fs::write(&temp_file, &artifact.content).await?;
 
-        let output = tokio::process::Command::new("verus")
+        let output = tokio::process::Command::new(&verus_bin)
             .arg(&temp_file)
             .output()
             .await
