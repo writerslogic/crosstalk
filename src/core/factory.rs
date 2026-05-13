@@ -4,7 +4,7 @@ use rig::client::CompletionClient;
 use std::time::Duration;
 
 pub async fn validate_agent(agent: &dyn PromptAgent) -> bool {
-    match tokio::time::timeout(Duration::from_secs(10), agent.prompt("ping")).await {
+    match tokio::time::timeout(Duration::from_secs(30), agent.prompt("ping")).await {
         Ok(Ok(_)) => true,
         Ok(Err(e)) => {
             tracing::warn!(agent = %agent.name(), err = %e, "agent validation prompt failed");

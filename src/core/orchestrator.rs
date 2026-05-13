@@ -1083,6 +1083,15 @@ impl Orchestrator {
                         match r {
                             Ok(val) => final_results.push(val),
                             Err(e) => {
+                                let msg = e.to_string();
+                                if msg.contains("timed out") {
+                                    if let Some(name) = msg.strip_prefix("Agent ").and_then(|s| s.split_whitespace().next()) {
+                                        let turn = sigma_lock.lock().await.iteration_index;
+                                        self.skip_until.lock().await.insert(name.to_string(), turn + 3);
+                                        self.emit(StreamEvent::Error(format!("Agent {} timed out, skipping for 3 turns", name))).await?;
+                                        continue;
+                                    }
+                                }
                                 self.emit(StreamEvent::Error(format!("Agent dropped: {}", e))).await?;
                             }
                         }
@@ -3126,6 +3135,21 @@ impl Orchestrator {
         if p.is_empty() {
             p.push_str(&format!("Project Context: {}\n\n", sigma.session_id));
         }
+
+        if let Some(last_turn) = sigma.turns.last().filter(|t| t.model_id != "User") {
+            crate::log_warn!(
+                writeln!(
+                    p,
+                    "[ITERATION {}/prior] Prior consensus (turn {}, convergence {:.0}%):\n{}\n\nBuild on this analysis. Add depth, fix gaps, and refine. Do NOT repeat the same points verbatim.\n",
+                    sigma.iteration_index,
+                    last_turn.index,
+                    sigma.completion_probability * 100.0,
+                    Self::truncate_str(&last_turn.content, 2000),
+                ),
+                "Failed to write prior turn summary"
+            );
+        }
+
         p.push_str("Artifacts (Semantic Skeleton + Active Nodes):\n");
 
         let total_budget: usize = 30_000;
