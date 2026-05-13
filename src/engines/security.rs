@@ -1,4 +1,5 @@
 use crate::types::conversation::Turn;
+use crate::types::fiduciary::PersonaDisclosure;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::Rng;
 use regex::Regex;
@@ -198,14 +199,27 @@ impl TurnSigner {
         self.signing_key.sign(data).to_bytes().to_vec()
     }
 
-    pub fn verify_turn(&self, turn: &Turn) -> bool {
+    pub fn sign_persona_disclosure(&self, disclosure: &mut PersonaDisclosure) {
+        let mut payload = disclosure.clone();
+        payload.signature = vec![];
+        if let Ok(data) = serde_json::to_vec(&payload) {
+            disclosure.signature = self.sign(&data);
+        }
+    }
+
+    pub fn verify_turn(&self, turn: &Turn) -> Result<bool, anyhow::Error> {
         let mut clean = turn.clone();
         clean.signature = vec![];
-        let Ok(data) = serde_json::to_vec(&clean) else { return false; };
-        let Ok(sig_bytes) = turn.signature.as_slice().try_into() else { return false; };
+        let data = serde_json::to_vec(&clean)
+            .map_err(|e| anyhow::anyhow!("failed to serialize turn for verification: {e}"))?;
+        let sig_bytes: &[u8; 64] = turn.signature.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!(
+                "invalid signature length: expected 64 bytes, got {}",
+                turn.signature.len()
+            ))?;
         let sig = Signature::from_bytes(sig_bytes);
         let verifying_key: VerifyingKey = (&self.signing_key).into();
-        verifying_key.verify(&data, &sig).is_ok()
+        Ok(verifying_key.verify(&data, &sig).is_ok())
     }
 }
 
@@ -276,6 +290,7 @@ impl AuditLogger {
         entry.signature = self.signer.sign(&data);
         let tree = self.db.open_tree("audit_log")?;
         tree.insert(timestamp.to_be_bytes(), serde_json::to_vec(&entry)?)?;
+        tree.flush()?;
         Ok(())
     }
 

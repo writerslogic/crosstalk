@@ -7,6 +7,37 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use tree_sitter::{Node, Parser};
 
+/// Max length for evidence spans embedded in fallacy reports and directives.
+const MAX_EVIDENCE_SPAN: usize = 200;
+
+/// Sanitize a string intended for embedding in directives or reports.
+/// Strips control characters and prompt injection delimiters, truncates to
+/// `MAX_EVIDENCE_SPAN` at a char boundary.
+pub fn sanitize_directive_content(raw: &str) -> String {
+    const STRIP_PATTERNS: &[&str] = &[
+        "[INST]", "[/INST]", "<<SYS>>", "<</SYS>>",
+        "###", "<|im_start|>", "<|im_end|>",
+        "<|system|>", "<|user|>", "<|assistant|>",
+    ];
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control() || *c == ' ')
+        .collect();
+    let mut out = if cleaned.len() > MAX_EVIDENCE_SPAN {
+        let mut end = MAX_EVIDENCE_SPAN;
+        while !cleaned.is_char_boundary(end) {
+            end -= 1;
+        }
+        cleaned[..end].to_string()
+    } else {
+        cleaned
+    };
+    for pat in STRIP_PATTERNS {
+        out = out.replace(pat, "");
+    }
+    out
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ExtractedSignals {
     pub decisions: Vec<String>,
@@ -47,23 +78,29 @@ impl ReasoningEngine {
 
             // 1. Check for Code References
             for artifact in sigma.artifacts.values() {
-                if claim.contains(&artifact.name) {
-                    anchors.push(EvidenceAnchor::CodeRef { 
-                        file: artifact.name.clone(), 
-                        line: 0 
+                // Validate artifact.name is basename-only to prevent path traversal
+                // in evidence anchors sourced from AI output.
+                let basename = std::path::Path::new(&artifact.name)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&artifact.name);
+                if claim.contains(basename) && !basename.is_empty() {
+                    anchors.push(EvidenceAnchor::CodeRef {
+                        file: basename.to_string(),
+                        line: 0
                     });
-                    confidence += 0.4;
+                    confidence = (confidence + 0.4).min(1.0);
                 }
             }
 
             // 2. Check for Turn Citations
             for turn in &sigma.turns {
                 if claim.contains(&format!("i_{}", turn.index)) {
-                    anchors.push(EvidenceAnchor::Citation { 
-                        source: turn.model_id.clone(), 
-                        quote: String::new() 
+                    anchors.push(EvidenceAnchor::Citation {
+                        source: turn.model_id.clone(),
+                        quote: String::new()
                     });
-                    confidence += 0.2;
+                    confidence = (confidence + 0.2).min(1.0);
                 }
             }
 
@@ -115,7 +152,7 @@ impl ReasoningScorer {
     #[must_use]
     pub fn score(turn: &Turn) -> f64 {
         let signals = ReasoningEngine::extract_signals(&turn.content);
-        let fallacies = FallacyDetector::scan(&turn.content);
+        let fallacies = FallacyDetector::scan(&turn.content, &[]);
         let assumptions = AssumptionExtractor::extract(&turn.content);
 
         // Dimension 1: signal richness (0.0..=0.30)
@@ -177,7 +214,7 @@ pub struct FallacyDetector;
 
 impl FallacyDetector {
     #[must_use]
-    pub fn scan(content: &str) -> Vec<FallacyReport> {
+    pub fn scan(content: &str, prior_turns: &[Turn]) -> Vec<FallacyReport> {
         let mut reports = vec![];
 
         if let Some(r) = Self::detect_circular_reasoning(content) {
@@ -189,7 +226,7 @@ impl FallacyDetector {
         if let Some(r) = Self::detect_false_dichotomy(content) {
             reports.push(r);
         }
-        if let Some(r) = Self::detect_straw_man(content) {
+        if let Some(r) = Self::detect_straw_man_robust(content, prior_turns) {
             reports.push(r);
         }
 
@@ -251,16 +288,12 @@ impl FallacyDetector {
             if max_sim < 0.2 && (lower.contains("absurd") || lower.contains("wrong") || lower.contains("false")) {
                 return Some(FallacyReport {
                     fallacy_type: "StrawMan".to_string(),
-                    evidence_span: span.to_string(),
+                    evidence_span: sanitize_directive_content(span),
                     confidence: 0.85,
                 });
             }
         }
         None
-    }
-
-    fn detect_straw_man(content: &str) -> Option<FallacyReport> {
-        Self::detect_straw_man_robust(content, &[])
     }
 
     /// Upgraded from $O(N^2)$ to $O(N)$ using a semantic hash-binning approach.
@@ -289,10 +322,10 @@ impl FallacyDetector {
                 {
                     return Some(FallacyReport {
                         fallacy_type: "CircularReasoning".to_string(),
-                        evidence_span: format!(
+                        evidence_span: sanitize_directive_content(&format!(
                             "Premise: \"{}\" vs Conclusion: \"{}\"",
                             previous_sentence, sentence
-                        ),
+                        )),
                         confidence: 0.85,
                     });
                 }
@@ -990,6 +1023,13 @@ impl SynthesisEngine {
     /// True Swarm Consensus Merge.
     /// Does not just pick the "longest" code. It checks what the majority of AI models agreed upon.
     fn semantic_ast_merge(base: &str, versions: &[String], language: &str) -> Option<String> {
+        const MAX_PARSE_BYTES: usize = 10_000_000;
+        if versions.is_empty() {
+            return Some(base.to_string());
+        }
+        if base.len() > MAX_PARSE_BYTES || versions.iter().any(|v| v.len() > MAX_PARSE_BYTES) {
+            return Some(versions[0].clone());
+        }
         let mut parser = Parser::new();
         let lang = match language.to_lowercase().as_str() {
             "rust" | "rs" => tree_sitter_rust::LANGUAGE.into(),
@@ -1018,7 +1058,7 @@ impl SynthesisEngine {
         // 1. Process existing blocks (Keep, Replace, or Delete)
         let mut replacements: Vec<(std::ops::Range<usize>, String)> = Vec::new();
         let mut handled_signatures = std::collections::HashSet::new();
-        let threshold = versions.len() / 2;
+        let threshold = (versions.len() + 1) / 2;
 
         for base_block in &base_blocks {
             handled_signatures.insert(base_block.signature.clone());
@@ -1032,7 +1072,7 @@ impl SynthesisEngine {
             };
 
             // If majority deleted it, we delete it
-            if proposals.len() <= threshold {
+            if proposals.len() < threshold {
                 replacements.push((base_block.byte_range.clone(), String::new()));
                 continue;
             }
@@ -1059,14 +1099,14 @@ impl SynthesisEngine {
             if handled_signatures.contains(sig) {
                 continue;
             }
-            if proposals.len() > threshold {
+            if proposals.len() >= threshold {
                 let mut frequency: HashMap<&String, usize> = HashMap::new();
                 for content in proposals {
                     *frequency.entry(content).or_insert(0) += 1;
                 }
                 if let Some((winning_content, count)) =
                     frequency.into_iter().max_by_key(|&(_, count)| count)
-                    && count > threshold
+                    && count >= threshold
                 {
                     additions.push(winning_content.clone());
                 }
@@ -1079,13 +1119,19 @@ impl SynthesisEngine {
         let mut result = String::with_capacity(base.len());
         let mut cursor = 0usize;
         for (range, replacement) in replacements {
-            if range.start >= cursor {
+            if range.start >= cursor
+                && range.end <= base.len()
+                && base.is_char_boundary(range.start)
+                && base.is_char_boundary(range.end)
+            {
                 result.push_str(&base[cursor..range.start]);
                 result.push_str(&replacement);
                 cursor = range.end;
             }
         }
-        result.push_str(&base[cursor..]);
+        if cursor <= base.len() && base.is_char_boundary(cursor) {
+            result.push_str(&base[cursor..]);
+        }
 
         // Append new blocks at the end
         for add in additions {

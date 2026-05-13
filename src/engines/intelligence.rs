@@ -85,7 +85,7 @@ impl CheckpointService {
 }
 
 pub struct IntelligenceEngine {
-    profiles: Arc<DashMap<String, ModelProfile>>,
+    pub profiles: Arc<DashMap<String, ModelProfile>>,
     templates: Arc<RwLock<Vec<PromptTemplate>>>,
     calibration: Arc<RwLock<Vec<CalibrationRecord>>>,
     storage_path: Option<String>,
@@ -224,7 +224,7 @@ impl IntelligenceEngine {
 
     pub fn update_profile_with_latency(&self, turn: &Turn, quality_score: f64, latency_ms: u64) {
         self.latency_predictor.record(&turn.model_id, latency_ms);
-        let predicted = self.latency_predictor.predict_latency(&turn.model_id) as f64;
+        let predicted = self.latency_predictor.predict_latency(&turn.model_id).unwrap_or(0) as f64;
 
         let mut profile = self
             .profiles
@@ -453,11 +453,9 @@ impl IntelligenceEngine {
                     continue;
                 }
                 if let Some(profile) = self.profiles.get(model_id) {
-                    let predicted = self.latency_predictor.predict_latency(model_id);
-                    let effective_latency = if predicted > 0 {
-                        predicted as f64
-                    } else {
-                        profile.latency_ms.mean
+                    let effective_latency = match self.latency_predictor.predict_latency(model_id) {
+                        Some(p) if p > 0 => p as f64,
+                        _ => profile.latency_ms.mean,
                     };
                     if effective_latency > latency_ms as f64 {
                         continue;
@@ -541,6 +539,18 @@ impl IntelligenceEngine {
     pub fn estimate_tokens(category: TaskCategory) -> u32 {
         category.token_estimate()
     }
+
+    /// Return top-n failure patterns sorted by frequency descending,
+    /// formatted as descriptive strings for prompt injection.
+    pub fn top_failure_patterns(&self, _category: TaskCategory, n: usize) -> Vec<String> {
+        let mut patterns = self.failures.scan_all();
+        patterns.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+        patterns
+            .into_iter()
+            .take(n)
+            .map(|p| format!("{} (seen {} times)", p.error_type, p.frequency))
+            .collect()
+    }
 }
 
 pub struct QualityScorer;
@@ -618,6 +628,76 @@ impl QualityScorer {
     #[must_use]
     pub fn score(turn: &Turn) -> f64 {
         Self::score_with_context(turn, "", None)
+    }
+}
+
+/// Multi-dimensional reward signal decomposing quality into orthogonal axes.
+/// Allows task-specific weighting so code and research tasks optimize different signals.
+pub struct RewardVector {
+    /// 1.0 if the turn compiled/passed tests, 0.0 if rolled back/failed, 0.5 otherwise.
+    pub compilation: f64,
+    /// 1.0 if tests passed, 0.0 if verification failed, 0.5 otherwise.
+    pub test_pass: f64,
+    /// Semantic delta from `QualityScorer::score()` — unchanged signal.
+    pub semantic_delta: f64,
+    /// Agent's self-reported certainty, defaults to 0.5 when absent.
+    pub certainty: f64,
+}
+
+impl RewardVector {
+    /// Decompose a completed turn into its reward components.
+    pub fn from_turn(turn: &Turn) -> Self {
+        let compilation = match turn.outcome {
+            TurnOutcome::TestsPassed | TurnOutcome::Compiled | TurnOutcome::AdvancedConvergence => 1.0,
+            TurnOutcome::RolledBack | TurnOutcome::VerificationFailed | TurnOutcome::Rejected => 0.0,
+            _ => 0.5,
+        };
+        let test_pass = match turn.outcome {
+            TurnOutcome::TestsPassed => 1.0,
+            TurnOutcome::VerificationFailed => 0.0,
+            _ => 0.5,
+        };
+        let semantic_delta = QualityScorer::score(turn);
+        let certainty = turn.certainty.unwrap_or(0.5);
+        Self { compilation, test_pass, semantic_delta, certainty }
+    }
+
+    /// Weighted scalar quality for the given task category.
+    #[must_use]
+    pub fn weighted_score(&self, task_category: TaskCategory) -> f64 {
+        let score = match task_category {
+            TaskCategory::CodeGeneration | TaskCategory::Debugging | TaskCategory::Refactoring => {
+                0.4 * self.compilation
+                    + 0.3 * self.test_pass
+                    + 0.2 * self.semantic_delta
+                    + 0.1 * self.certainty
+            }
+            TaskCategory::Testing => {
+                0.3 * self.compilation
+                    + 0.4 * self.test_pass
+                    + 0.2 * self.semantic_delta
+                    + 0.1 * self.certainty
+            }
+            TaskCategory::Architecture => {
+                0.2 * self.compilation
+                    + 0.1 * self.test_pass
+                    + 0.4 * self.semantic_delta
+                    + 0.3 * self.certainty
+            }
+            TaskCategory::Research => {
+                0.1 * self.compilation
+                    + 0.1 * self.test_pass
+                    + 0.5 * self.semantic_delta
+                    + 0.3 * self.certainty
+            }
+            TaskCategory::General => {
+                0.25 * self.compilation
+                    + 0.25 * self.test_pass
+                    + 0.25 * self.semantic_delta
+                    + 0.25 * self.certainty
+            }
+        };
+        score.clamp(0.0, 1.0)
     }
 }
 
@@ -851,7 +931,10 @@ impl PromptComposer {
         let context_str = context_turns
             .iter()
             .take(3)
-            .map(|t| format!("[Turn {}|{}] {}", t.index, t.model_id, t.content))
+            .map(|t| {
+                let sanitized = crate::engines::reasoning::sanitize_directive_content(&t.content);
+                format!("[Turn {}|{}] {}", t.index, t.model_id, sanitized)
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -970,6 +1053,11 @@ impl LatencyPredictor {
     }
 
     pub fn record(&self, model_id: &str, latency_ms: u64) {
+        let sample = latency_ms as f64;
+        if !sample.is_finite() {
+            return;
+        }
+
         let mut hist = self.history.entry(model_id.to_string()).or_default();
         if hist.len() >= Self::WINDOW {
             hist.pop_front();
@@ -977,16 +1065,18 @@ impl LatencyPredictor {
         hist.push_back(latency_ms);
         drop(hist);
 
-        let sample = latency_ms as f64;
         let mut ema = self.ema.entry(model_id.to_string()).or_insert(sample);
-        *ema = Self::ALPHA * sample + (1.0 - Self::ALPHA) * *ema;
+        let updated = Self::ALPHA * sample + (1.0 - Self::ALPHA) * *ema;
+        if updated.is_finite() {
+            *ema = updated;
+        }
     }
 
-    pub fn predict_latency(&self, model_id: &str) -> u64 {
+    /// Returns predicted latency in ms, or `None` if no data or EMA is non-finite.
+    pub fn predict_latency(&self, model_id: &str) -> Option<u64> {
         self.ema
             .get(model_id)
-            .map(|v| if v.is_finite() { *v as u64 } else { 0u64 })
-            .unwrap_or(0)
+            .and_then(|v| if v.is_finite() { Some(*v as u64) } else { None })
     }
 
     pub fn is_high_variance(&self, model_id: &str) -> bool {
@@ -1068,7 +1158,7 @@ impl ConvergenceVelocityTracker {
             return 0.0;
         }
         let mut it = self.velocity_history.iter().rev();
-        let latest = *it.next().unwrap();
+        let Some(&latest) = it.next() else { return 0.0 };
         let Some(prior) = it.next() else { return 0.0 };
         latest - *prior
     }
@@ -1191,9 +1281,16 @@ impl FailurePatternStore {
             .temporary(true)
             .open()
             .unwrap_or_else(|e| {
-                tracing::warn!(err = ?e, "failure pattern store unavailable, retrying with default config");
+                tracing::warn!(err = ?e, "in-memory sled unavailable, falling back to disk store");
                 sled::open(std::env::temp_dir().join("crosstalk_failures_fallback"))
-                    .expect("cannot open any sled db")
+                    .unwrap_or_else(|e2| {
+                        tracing::error!(err = ?e2, "all sled backends failed; failure patterns disabled");
+                        sled::Config::new()
+                            .temporary(true)
+                            .cache_capacity(64 * 1024)
+                            .open()
+                            .expect("minimal in-memory sled must succeed")
+                    })
             });
         Self { db: Arc::new(db) }
     }
@@ -1203,6 +1300,14 @@ impl FailurePatternStore {
         let encoded = serde_json::to_vec(&pattern)?;
         self.db.insert(key, encoded)?;
         Ok(())
+    }
+
+    pub fn scan_all(&self) -> Vec<crate::types::intelligence::FailurePattern> {
+        self.db
+            .scan_prefix("failure:")
+            .flatten()
+            .filter_map(|(_, v)| serde_json::from_slice(&v).ok())
+            .collect()
     }
 
     pub fn find_matches(&self, context_emb: &[f32], threshold: f32) -> Vec<crate::types::intelligence::FailurePattern> {
