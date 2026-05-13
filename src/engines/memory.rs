@@ -194,6 +194,24 @@ impl MemoryBridge {
         }
     }
 
+    /// Serialize ranker weights to JSON for cross-session persistence.
+    pub fn export_ranker_weights_json(&self) -> String {
+        serde_json::to_string(&self.ranker_weights).unwrap_or_default()
+    }
+
+    /// Restore ranker weights from a prior session's JSON.
+    ///
+    /// Weights are only applied if all four values are in `[0.0, 1.0]` and
+    /// their sum is positive (all-zeros would silence the ranker).
+    pub fn import_ranker_weights_json(&mut self, json: &str) {
+        if let Ok(weights) = serde_json::from_str::<[f64; 4]>(json) {
+            let total: f64 = weights.iter().sum();
+            if weights.iter().all(|&w| (0.0..=1.0).contains(&w)) && total > 0.0 {
+                self.ranker_weights = weights;
+            }
+        }
+    }
+
     /// Update learnable ranker weights based on the outcome of the most recent turn.
     /// Uses `recalled_hashes_last` to attribute features to recalled records.
     /// Weights are clipped to [0.01, 0.99] and renormalised to sum to 1.0.
@@ -309,7 +327,13 @@ impl MemoryBridge {
 
         // LanceDB path
         if let Some(store) = &self.store {
-            let results = store.query_hybrid(DEFAULT_TABLE, query, limit).await.unwrap_or_default();
+            let results = match store.query_hybrid(DEFAULT_TABLE, query, limit).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("Antipattern recall failed (safety guardrail degraded): {e}");
+                    return vec![];
+                }
+            };
             return results.into_iter().filter(|(r, _)| r.is_negative).map(|(r, _)| r).collect();
         }
 
@@ -320,11 +344,28 @@ impl MemoryBridge {
         self.sessions.entry(sid).or_default();
     }
 
+    const MAX_SESSIONS: usize = 64;
+    const MAX_RECORDS_PER_SESSION: usize = 1000;
+
     pub fn push_record(&mut self, sid: &str, record: MemoryRecord) {
         if let Some(store) = &self.store {
-            store.sessions.entry(sid.to_string()).or_default().push(record.clone());
+            let mut entry = store.sessions.entry(sid.to_string()).or_default();
+            entry.push(record.clone());
+            let len = entry.len();
+            if len > Self::MAX_RECORDS_PER_SESSION {
+                entry.drain(..len - Self::MAX_RECORDS_PER_SESSION);
+            }
         }
-        self.sessions.entry(sid.to_string()).or_default().push(record);
+        let records = self.sessions.entry(sid.to_string()).or_default();
+        records.push(record);
+        if records.len() > Self::MAX_RECORDS_PER_SESSION {
+            records.drain(..records.len() - Self::MAX_RECORDS_PER_SESSION);
+        }
+        if self.sessions.len() > Self::MAX_SESSIONS {
+            if let Some(oldest) = self.sessions.keys().next().cloned() {
+                self.sessions.remove(&oldest);
+            }
+        }
     }
 
     pub fn ingest_turn(&mut self, sid: &str, turn: &Turn) {
@@ -384,7 +425,13 @@ impl MemoryBridge {
             outcome: None,
             timestamp: ConversationState::now(),
             is_negative: true,
-            metadata_json: serde_json::to_string(&metadata).unwrap_or_default(),
+            metadata_json: match serde_json::to_string(&metadata) {
+                Ok(json) => json,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to serialize failure lesson metadata");
+                    return;
+                }
+            },
         };
         self.sessions.entry(sid.to_string()).or_default().push(rec);
     }
@@ -506,8 +553,8 @@ impl MemoryStore {
     /// in-memory session map for snapshot/recall.
     pub async fn insert(&mut self, _table_name: &str, records: Vec<MemoryRecord>) -> Result<()> {
         for rec in records {
-            self.sessions.entry(rec.session_id.clone()).or_default().push(rec.clone());
-            self.store(rec).await?;
+            self.store(rec.clone()).await?;
+            self.sessions.entry(rec.session_id.clone()).or_default().push(rec);
         }
         Ok(())
     }
@@ -596,7 +643,7 @@ impl MemoryStore {
         // Write to disk if CROSSTALK_MEMORY_DIR is set.
         if let Ok(dir) = std::env::var("CROSSTALK_MEMORY_DIR") {
             let path = std::path::Path::new(&dir).join(format!("{label}.snapshot"));
-            std::fs::write(&path, &json)?;
+            tokio::fs::write(&path, &json).await?;
         }
 
         Ok(json)
@@ -610,10 +657,13 @@ impl MemoryStore {
         if !path.exists() {
             return Err(anyhow!("Snapshot file not found: {}", path.display()));
         }
-        let data = std::fs::read(&path)?;
+        let data = tokio::fs::read(&path).await?;
         let records: Vec<MemoryRecord> = serde_json::from_slice(&data)?;
         for rec in records {
-            self.sessions.entry(rec.session_id.clone()).or_default().push(rec);
+            let mut entry = self.sessions.entry(rec.session_id.clone()).or_default();
+            if !entry.iter().any(|r| r.turn_id == rec.turn_id && r.session_id == rec.session_id) {
+                entry.push(rec);
+            }
         }
         Ok(())
     }
@@ -674,8 +724,8 @@ impl MemoryStore {
                     let floats = values.as_primitive::<arrow_array::types::Float32Type>();
                     floats.values().to_vec()
                 } else {
-                    // Fall back to re-embedding the content hash when the column is absent.
-                    embed_text(contents.value(i))
+                    tracing::warn!("vector column absent in LanceDB result; using empty embedding");
+                    vec![0.0; EMBEDDING_DIM]
                 };
                 records.push((MemoryRecord {
                     turn_id: ids.value(i),

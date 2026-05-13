@@ -22,6 +22,10 @@ impl StateManager {
         Ok(Self { db })
     }
 
+    pub fn db(&self) -> &sled::Db {
+        &self.db
+    }
+
     /// ∀ i ⇒ Checkpoint(σ)
     pub fn checkpoint(&self, state: &ConversationState) -> Result<()> {
         let key = format!("state:{}", state.iteration_index);
@@ -49,8 +53,8 @@ impl StateManager {
     /// Rewind :: σ_t ← σ_{t-k}
     pub fn restore(&self, index: u32) -> Result<Option<ConversationState>> {
         let key = format!("state:{}", index);
-        match self.db.get(key)? {
-            Some(data) => Ok(Some(serde_json::from_slice(&data)?)),
+        match self.db.get(key.as_bytes()).context("sled read failed for state checkpoint")? {
+            Some(data) => Ok(Some(serde_json::from_slice(&data).context("failed to deserialize state checkpoint")?)),
             None => Ok(None),
         }
     }

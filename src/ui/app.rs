@@ -75,6 +75,8 @@ pub struct App {
     last_render: Instant,
     /// Recent diff sizes per artifact per agent: artifact → agent → [diff_len]
     artifact_change_history: HashMap<String, HashMap<String, Vec<usize>>>,
+    pub current_mode_name: String,
+    pub mode_library_size: usize,
 }
 
 impl App {
@@ -107,6 +109,8 @@ impl App {
             fps: 0.0,
             last_render: Instant::now(),
             artifact_change_history: HashMap::new(),
+            current_mode_name: "Convergence".to_string(),
+            mode_library_size: 6,
         }
     }
 
@@ -129,17 +133,22 @@ impl App {
         };
 
         self.streaming_buffer.push_str(&prefix);
-        self.streaming_buffer.push_str(token);
+        let sanitized_token: String = token.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect();
+        self.streaming_buffer.push_str(&sanitized_token);
         const BUF_CAP: usize = 50 * 1024;
         if self.streaming_buffer.len() > BUF_CAP {
             let trim = self.streaming_buffer.len() - BUF_CAP;
-            let safe = self
-                .streaming_buffer
-                .char_indices()
-                .find(|(i, _)| *i >= trim)
-                .map(|(i, _)| i)
-                .unwrap_or(trim);
-            self.streaming_buffer.drain(..safe);
+            if trim >= self.streaming_buffer.len() {
+                self.streaming_buffer.clear();
+            } else {
+                let safe = self
+                    .streaming_buffer
+                    .char_indices()
+                    .find(|(i, _)| *i >= trim)
+                    .map(|(i, _)| i)
+                    .unwrap_or(self.streaming_buffer.len());
+                self.streaming_buffer.drain(..safe);
+            }
         }
 
         if self.ghost_auto_scroll {

@@ -1035,7 +1035,10 @@ impl SynthesisEngine {
             "rust" | "rs" => tree_sitter_rust::LANGUAGE.into(),
             _ => return Some(versions[0].clone()),
         };
-        parser.set_language(&lang).ok()?;
+        if let Err(e) = parser.set_language(&lang) {
+            tracing::warn!(error = %e, language, "failed to set tree-sitter language");
+            return None;
+        }
 
         let base_tree = parser.parse(base, None)?;
         let base_blocks = Self::extract_blocks(base, base_tree.root_node());

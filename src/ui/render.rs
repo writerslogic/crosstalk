@@ -14,11 +14,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // σ State + μ Agents
-            Constraint::Min(8),    // Ghost Stream + right panel
-            Constraint::Length(3), // Convergence + Certainty gauges
-            Constraint::Min(4),    // Δα Diffs / events
-            Constraint::Length(1), // Status bar
+            Constraint::Length(3),  // σ State + μ Agents
+            Constraint::Min(8),     // Ghost Stream + right panel
+            Constraint::Length(3),  // Convergence + Certainty gauges
+            Constraint::Length(area.height.saturating_sub(15).clamp(4, 10)), // Δα Events
+            Constraint::Length(1),  // Status bar
         ])
         .split(area);
 
@@ -34,11 +34,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
     };
     let conv_pct = (app.convergence * 100.0) as u32;
     let sigma_text = format!(
-        " i_{} | {} | Conv {}% | {} agents",
+        " i_{} | {} | Conv {}% | {} agents | [{}]",
         app.turn_index,
         mode_label,
         conv_pct,
-        app.agent_list.len()
+        app.agent_list.len(),
+        app.current_mode_name
     );
     let sigma_para = Paragraph::new(sigma_text).block(
         Block::default()
@@ -85,13 +86,21 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     let ghost_style = focus_border(app, FocusedPane::GhostStream);
     let ghost_area = center[0];
-    let inner_height = ghost_area.height.saturating_sub(2) as usize; // subtract borders
+    let inner_height = ghost_area.height.saturating_sub(2) as usize;
+    let inner_width = ghost_area.width.saturating_sub(2).max(1) as usize;
+    let sanitized = &app.streaming_buffer;
     let scroll_y = if app.ghost_auto_scroll {
-        app.ghost_scroll.saturating_sub(inner_height)
+        let wrapped_lines: usize = sanitized.split('\n')
+            .map(|line| {
+                let chars = line.chars().count();
+                if chars == 0 { 1 } else { chars.div_ceil(inner_width) }
+            })
+            .sum();
+        wrapped_lines.saturating_sub(inner_height)
     } else {
         app.ghost_scroll
     };
-    let ghost = Paragraph::new(app.streaming_buffer.as_str())
+    let ghost = Paragraph::new(sanitized.as_str())
         .scroll((scroll_y as u16, 0))
         .block(
             Block::default()
@@ -108,35 +117,45 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .split(center[1]);
 
     let art_style = focus_border(app, FocusedPane::Artifacts);
-    let artifact_items: Vec<ListItem> = app
-        .artifacts
-        .iter()
-        .skip(app.artifact_scroll)
-        .map(|snap| {
-            let ver = format!("v{}", snap.version);
-            let label = if snap.skeleton.is_empty() {
-                format!(" {ver} {}", snap.name)
-            } else {
-                format!(" {ver} {}  {}", snap.name, snap.skeleton)
-            };
-            let color = if snap.diff_count == 0 {
-                Color::DarkGray
-            } else if snap.diff_count < 3 {
-                Color::Green
-            } else {
-                Color::Yellow
-            };
-            ListItem::new(label).style(Style::default().fg(color))
-        })
-        .collect();
     let art_title = format!(" Artifacts ({}) ", app.artifacts.len());
-    let artifacts_list = List::new(artifact_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(art_title)
-            .border_style(art_style),
-    );
-    frame.render_widget(artifacts_list, right[0]);
+    if app.artifacts.is_empty() {
+        let placeholder = Paragraph::new(" Waiting for artifact snapshots...").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(art_title)
+                .border_style(art_style),
+        );
+        frame.render_widget(placeholder, right[0]);
+    } else {
+        let artifact_items: Vec<ListItem> = app
+            .artifacts
+            .iter()
+            .skip(app.artifact_scroll)
+            .map(|snap| {
+                let ver = format!("v{}", snap.version);
+                let label = if snap.skeleton.is_empty() {
+                    format!(" {ver} {}", snap.name)
+                } else {
+                    format!(" {ver} {}  {}", snap.name, snap.skeleton)
+                };
+                let color = if snap.diff_count == 0 {
+                    Color::DarkGray
+                } else if snap.diff_count < 3 {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                };
+                ListItem::new(label).style(Style::default().fg(color))
+            })
+            .collect();
+        let artifacts_list = List::new(artifact_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(art_title)
+                .border_style(art_style),
+        );
+        frame.render_widget(artifacts_list, right[0]);
+    }
 
     draw_entropy_heatmap(
         frame,
@@ -171,10 +190,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
     frame.render_widget(cert_gauge, gauges[1]);
 
     let ev_style = focus_border(app, FocusedPane::Events);
+    let ev_inner_height = rows[3].height.saturating_sub(2) as usize;
+    let ev_scroll = if app.events_auto_scroll {
+        app.recent_events.len().saturating_sub(ev_inner_height)
+    } else {
+        app.scroll_offset
+    };
     let visible: Vec<ListItem> = app
         .recent_events
         .iter()
-        .skip(app.scroll_offset)
+        .skip(ev_scroll)
         .map(|e| {
             let color = if e.starts_with("Error:") || e.contains("PANIC") || e.contains("FAIL") {
                 Color::Red
@@ -190,6 +215,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 || e.contains("[sandbox]")
             {
                 Color::Cyan
+            } else if e.contains("[MODE]") {
+                Color::Magenta
             } else {
                 Color::White
             };
@@ -219,7 +246,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         app.godview_surprise * 100.0
     );
     let status = Paragraph::new(format!(
-        " [Tab] Focus | [Ctrl+I] Inject | [j/k] Scroll | [g/G] Top/Bottom | [q] Quit | {godview_str} | {fps_str} "
+        " [Tab] Focus | [Ctrl+I] Inject | [j/k] Scroll | [g/G] Top/Bottom | [m] Mode | [q] Quit | {godview_str} | {fps_str} "
     ));
     frame.render_widget(status, rows[4]);
 
