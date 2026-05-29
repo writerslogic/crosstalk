@@ -3977,6 +3977,26 @@ impl Orchestrator {
             }
         }
 
+        // Enforce data retention policy (fiduciary duty).
+        {
+            let principal = self.principal.lock().await;
+            if let Ok(Some(event)) = crate::engines::data_minimizer::DataMinimizer::enforce(
+                self.state_manager.db(),
+                &sigma.session_id,
+                &principal.constraints,
+            ) {
+                crate::log_warn!(
+                    self.emit(StreamEvent::FiduciarySignal {
+                        principal_id: principal.id.to_string(),
+                        event,
+                        session_id: sigma.session_id.clone(),
+                        timestamp: ConversationState::now(),
+                    }).await,
+                    "data minimizer fiduciary signal failed"
+                );
+            }
+        }
+
         Ok(())
     }
 
