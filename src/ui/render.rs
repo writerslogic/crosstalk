@@ -246,13 +246,54 @@ pub fn draw(frame: &mut Frame, app: &App) {
         app.godview_surprise * 100.0
     );
     let status = Paragraph::new(format!(
-        " [Tab] Focus | [Ctrl+I] Inject | [j/k] Scroll | [g/G] Top/Bottom | [m] Mode | [q] Quit | {godview_str} | {fps_str} "
+        " [Tab] Focus | [Ctrl+I] Inject | [j/k] Scroll | [m] Mode | [?] Help | [q] Quit | {godview_str} | {fps_str} "
     ));
     frame.render_widget(status, rows[4]);
 
     if app.showing_inject {
         draw_inject_dialog(frame, &app.inject_buffer);
     }
+
+    if app.showing_help {
+        draw_help_overlay(frame);
+    }
+}
+
+fn draw_help_overlay(frame: &mut Frame) {
+    use ratatui::layout::{Alignment, Rect};
+    use ratatui::widgets::Clear;
+
+    let area = frame.area();
+    let w = 50u16.min(area.width.saturating_sub(4));
+    let h = 16u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    frame.render_widget(Clear, popup);
+    let help_text = "\
+q / Ctrl+C     Quit
+p              Pause / Resume
+Tab            Cycle focused pane
+j / k          Scroll down / up
+g / G          Scroll to top / bottom
+Ctrl+I         Inject text (pauses session)
+Ctrl+R         Rewind one turn
+m              Cycle orchestration mode
+?              Toggle this help
+
+Ctrl+S         Save SVG capture (legacy TUI)
+";
+    let help = Paragraph::new(help_text)
+        .block(
+            Block::default()
+                .title(" Keybindings ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(help, popup);
 }
 
 fn draw_entropy_heatmap(

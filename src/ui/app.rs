@@ -77,6 +77,7 @@ pub struct App {
     artifact_change_history: HashMap<String, HashMap<String, Vec<usize>>>,
     pub current_mode_name: String,
     pub mode_library_size: usize,
+    pub showing_help: bool,
 }
 
 impl App {
@@ -111,6 +112,7 @@ impl App {
             artifact_change_history: HashMap::new(),
             current_mode_name: "Convergence".to_string(),
             mode_library_size: 6,
+            showing_help: false,
         }
     }
 

@@ -7,18 +7,20 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-static LOG_FILE: OnceLock<Mutex<BufWriter<std::fs::File>>> = OnceLock::new();
+static LOG_FILE: OnceLock<Option<Mutex<BufWriter<std::fs::File>>>> = OnceLock::new();
 
 fn log_file() -> Option<std::sync::MutexGuard<'static, BufWriter<std::fs::File>>> {
-    let m = LOG_FILE.get_or_init(|| {
-        let f = std::fs::OpenOptions::new()
+    LOG_FILE.get_or_init(|| {
+        std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open("/tmp/crosstalk.log")
-            .expect("cannot open /tmp/crosstalk.log");
-        Mutex::new(BufWriter::new(f))
-    });
-    m.lock().ok()
+            .ok()
+            .map(|f| Mutex::new(BufWriter::new(f)))
+    })
+    .as_ref()?
+    .lock()
+    .ok()
 }
 
 pub enum Action {
@@ -60,7 +62,6 @@ fn log_event(ev: &StreamEvent) {
 
     if let Some(mut f) = log_file() {
         match ev {
-            StreamEvent::TokenReceived { .. } => unreachable!(),
             StreamEvent::TurnComplete(turn) => {
                 crate::log_warn!(writeln!(
                     f, "{ts} [TURN] i_{} by {} outcome={:?} cert={:.2} diffs={}",
@@ -92,6 +93,13 @@ fn log_event(ev: &StreamEvent) {
             StreamEvent::Error(msg) => {
                 crate::log_warn!(writeln!(f, "{ts} [ERROR] {msg}"), "failed to write log event");
             }
+            StreamEvent::FiduciarySignal { principal_id, event, .. } => {
+                crate::log_warn!(writeln!(f, "{ts} [FIDUCIARY] principal={principal_id} event={event:?}"), "failed to write log event");
+            }
+            StreamEvent::ModeTransition { from_name, to_name, reason, synthesized } => {
+                crate::log_warn!(writeln!(f, "{ts} [MODE] {from_name} → {to_name} synthesized={synthesized} reason={reason}"), "failed to write log event");
+            }
+            StreamEvent::TokenReceived { .. } => unreachable!("handled above"),
         }
     }
 }
@@ -153,6 +161,14 @@ pub fn drain_stream_events(app: &mut App, stream_rx: &mut mpsc::Receiver<StreamE
                 app.push_event(format!("Checkpoint i_{idx}"));
             }
             StreamEvent::Error(msg) => app.push_event(format!("Error: {msg}")),
+            StreamEvent::FiduciarySignal { principal_id, event, .. } => {
+                app.push_event(format!("[fiduciary] principal={principal_id} {event:?}"));
+            }
+            StreamEvent::ModeTransition { from_name, to_name, reason, synthesized } => {
+                app.current_mode_name = to_name.clone();
+                let tag = if synthesized { " [NEW]" } else { "" };
+                app.push_event(format!("[MODE] {} → {}{} | {}", from_name, to_name, tag, reason));
+            }
         }
     }
 }
@@ -241,6 +257,13 @@ pub fn handle_key(app: &mut App, key: event::KeyEvent) -> Action {
             }
             KeyCode::Char('G') => {
                 app.scroll_bottom();
+                Action::None
+            }
+            KeyCode::Char('m') => {
+                Action::Send(ControlSignal::CycleMode)
+            }
+            KeyCode::Char('?') => {
+                app.showing_help = !app.showing_help;
                 Action::None
             }
             _ => Action::None,

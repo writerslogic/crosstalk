@@ -178,6 +178,11 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // First-run: if no API keys are configured, launch the setup wizard.
+    if !model_select::has_any_api_key() && args.models.is_empty() {
+        model_select::run_api_key_setup().await?;
+    }
+
     // If no task provided, run the interactive wizard to collect task + optional workspace/iterations.
     let (task_str, wizard_workspace, wizard_iterations) = if args.task.is_none() {
         let (t, ws, iters) = model_select::run_task_wizard().await?;
