@@ -1734,6 +1734,19 @@ impl Orchestrator {
         tracing::Span::current().record("turn", pre_turn_idx);
         tracing::info!(turn = pre_turn_idx, "turn starting");
 
+        // Early convergence: skip agent calls when P(C) is high and last turn had no changes.
+        {
+            let current_p = f64::from_bits(self.completion_probability.load(Ordering::Acquire));
+            let last_turn_had_changes = pre_recent_turns.first().map(|t| !t.diffs.is_empty()).unwrap_or(true);
+            if current_p > 0.85 && !last_turn_had_changes && pre_turn_idx > 2 {
+                self.emit(StreamEvent::TokenReceived {
+                    agent_id: "System".to_string(),
+                    token: format!("[convergence] P(C)={current_p:.2}, no artifact changes, skipping turn\n"),
+                }).await?;
+                return Ok(true);
+            }
+        }
+
         // Phase 2: analytics strategy + adaptive agent selection.
         let (strategy_critique, strategy_reduce_agents, adaptive_selection, s) =
             self.analyze_strategy_and_select_agents(&sigma_lock).await?;
@@ -1833,6 +1846,7 @@ impl Orchestrator {
         // Execute any [TOOL: ...] directives embedded in the final response (Task 9)
         {
             let directives = Self::parse_tool_directives(&final_response);
+            let mut tool_outputs = Vec::new();
             for (tool_name, args) in &directives {
                 let output = self.execute_tool_directive(tool_name, args, &sigma_lock).await;
                 self.emit(StreamEvent::TokenReceived {
@@ -1840,6 +1854,10 @@ impl Orchestrator {
                     token: format!("{output}\n"),
                 })
                 .await?;
+                tool_outputs.push((tool_name.clone(), output));
+            }
+            if !tool_outputs.is_empty() {
+                sigma_lock.lock().await.last_tool_outputs = tool_outputs;
             }
         }
 
@@ -1981,15 +1999,15 @@ impl Orchestrator {
 
             let delta = DiffEngine::generate_delta(&current.content, &new_content, current.version);
 
-            let p_fail: f64 = self
+            let (p_fail, mc_confidence) = self
                 .mc_runner
                 .predict(current, &delta, 10)
                 .await
-                .map(|(mean, _)| mean)
-                .unwrap_or(0.5);
+                .unwrap_or((0.5, 0.0));
             if p_fail > 0.5 {
                 return Ok(ArtifactProcessOutcome::Invalid);
             }
+            let mc_variance = if mc_confidence > 0.0 { 1.0 - mc_confidence } else { 0.5 };
 
             let new_metrics = QualityEngine::analyze_artifact(
                 &Artifact {
@@ -2058,6 +2076,7 @@ impl Orchestrator {
             };
             let mut final_metrics = new_metrics.clone();
             final_metrics.visual_fidelity = visual_fidelity;
+            final_metrics.health_score *= 1.0 - (mc_variance * 0.3).min(0.15);
 
             let node_updates: Vec<(String, String)> =
                 AstValidator::extract_nodes(&new_content, &lang)
@@ -2463,6 +2482,14 @@ impl Orchestrator {
                 for tmpl in evolver.population.iter().take(3) {
                     cache.insert(format!("{:?}", tmpl.task_category), tmpl.clone());
                 }
+            }
+        }
+
+        if matches!(turn_outcome, TurnOutcome::TestsPassed | TurnOutcome::AdvancedConvergence) {
+            if let Some(certainty) = turn.certainty && certainty > 0.7 {
+                let seed_cat = turn.task_category.unwrap_or(TaskCategory::Research);
+                let mut evolver = self.prompt_evolver.lock().await;
+                evolver.seed_from_successful_turn(prompt, seed_cat);
             }
         }
 
@@ -3152,12 +3179,19 @@ impl Orchestrator {
 
         p.push_str("Artifacts (Semantic Skeleton + Active Nodes):\n");
 
-        let total_budget: usize = 30_000;
+        let artifact_count = sigma.artifacts.len();
+        let total_budget: usize = if artifact_count > 10 {
+            12_000
+        } else if artifact_count > 5 {
+            18_000
+        } else {
+            30_000
+        };
         let overhead = 2_000;
-        let artifact_budget = if sigma.artifacts.is_empty() {
+        let artifact_budget = if artifact_count == 0 {
             total_budget
         } else {
-            (total_budget - overhead) / sigma.artifacts.len()
+            (total_budget - overhead) / artifact_count
         };
 
         for artifact in sigma.artifacts.values() {
@@ -3258,6 +3292,13 @@ impl Orchestrator {
                 let status = if *passed { "PASS" } else { "FAIL" };
                 let snippet = Self::truncate_str(output, 300);
                 crate::log_warn!(writeln!(p, "  {} [{}]: {}", tool, status, snippet), "Failed to write verification result");
+            }
+        }
+
+        if !sigma.last_tool_outputs.is_empty() {
+            p.push_str("\nTool Results from Previous Turn:\n");
+            for (name, output) in &sigma.last_tool_outputs {
+                crate::log_warn!(writeln!(p, "  [{}]: {}", name, Self::truncate_str(output, 500)), "Failed to write tool result");
             }
         }
 

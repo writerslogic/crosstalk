@@ -50,7 +50,7 @@ impl NixManager {
         Ok(Self::generate_flake_static(&self.dependencies))
     }
 
-    pub fn synthesize(&mut self) -> Result<HashMap<String, String>> {
+    pub async fn synthesize(&mut self) -> Result<HashMap<String, String>> {
         let cache_key = self.cache_key();
         let cache_path = self.cache_dir.join(format!("{cache_key}.json"));
 
@@ -72,22 +72,43 @@ impl NixManager {
             }
         }
 
-        let output = Command::new("nix")
-            .args(["develop", "--command", "env"])
-            .output()
-            .map_err(|e| anyhow::anyhow!("nix not available: {e}"))?;
+        let env = tokio::task::spawn_blocking(|| -> Result<HashMap<String, String>> {
+            let output = Command::new("nix")
+                .args(["develop", "--command", "env"])
+                .output()
+                .map_err(|e| anyhow::anyhow!("nix not available: {e}"))?;
 
-        if !output.status.success() {
-            return Err(anyhow::anyhow!("nix develop failed"));
-        }
-
-        let mut env = HashMap::new();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if let Some((k, v)) = line.split_once('=') {
-                env.insert(k.to_string(), v.to_string());
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(anyhow::anyhow!("nix develop failed: {stderr}"));
             }
+
+            let mut env = HashMap::new();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if let Some((k, v)) = line.split_once('=') {
+                    env.insert(k.to_string(), v.to_string());
+                }
+            }
+            Ok(env)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("nix synthesize task panicked: {e}"))??;
+
+        // Write cache with created_at timestamp
+        let cache_key = self.cache_key();
+        let cache_path = self.cache_dir.join(format!("{cache_key}.json"));
+        let cache_entry = serde_json::json!({
+            "created_at": chrono::Utc::now().timestamp(),
+            "env": &env,
+        });
+        if let Err(e) = std::fs::create_dir_all(&self.cache_dir) {
+            tracing::warn!("Failed to create cache dir {:?}: {e}", self.cache_dir);
         }
+        if let Err(e) = std::fs::write(&cache_path, serde_json::to_string(&cache_entry).unwrap_or_default()) {
+            tracing::warn!("Failed to write cache file {:?}: {e}", cache_path);
+        }
+
         Ok(env)
     }
 

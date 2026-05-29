@@ -1,5 +1,6 @@
 use crate::types::artifact::{Artifact, ArtifactDiff};
 use crate::types::compute::BudgetLedger;
+use crate::types::fiduciary::PersonaDisclosure;
 use crate::types::planning::GoalTree;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -103,6 +104,8 @@ pub struct Turn {
     /// here for observability; the live score lives in IntelligenceEngine.
     #[serde(default)]
     pub diff_quality_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona_disclosure: Option<PersonaDisclosure>,
 }
 
 fn default_outcome() -> TurnOutcome {
@@ -130,6 +133,18 @@ pub struct ConversationState {
     pub node_consensus: BTreeMap<String, f64>,
     #[serde(default)]
     pub last_verification: Vec<(String, String, bool)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
+    #[serde(default)]
+    pub mode_library: crate::types::mode::ModeLibrary,
+    #[serde(default)]
+    pub novel_signal: Option<String>,
+    #[serde(default)]
+    pub last_tool_outputs: Vec<(String, String)>,
+    #[serde(default)]
+    pub rejection_loop_active: bool,
+    #[serde(default)]
+    pub mode_active_turns: u32,
 }
 
 impl ConversationState {
@@ -146,10 +161,21 @@ impl ConversationState {
             goal_tree: GoalTree::default(),
             node_consensus: BTreeMap::new(),
             last_verification: Vec::new(),
+            principal_id: None,
+            mode_library: crate::types::mode::ModeLibrary::new(),
+            novel_signal: None,
+            last_tool_outputs: Vec::new(),
+            rejection_loop_active: false,
+            mode_active_turns: 0,
         }
     }
 
     pub fn ingest_file(&mut self, name: String, language: String, content: String) {
+        const MAX_FILE_BYTES: usize = 10_000_000;
+        if content.len() > MAX_FILE_BYTES {
+            tracing::warn!(file = %name, bytes = content.len(), "ingest_file: file exceeds 10 MB limit; skipping");
+            return;
+        }
         use crate::types::artifact::Artifact;
         use crate::engines::validation::AstValidator;
         let skeleton = AstValidator::generate_skeleton(&content, &language);

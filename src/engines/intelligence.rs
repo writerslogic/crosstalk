@@ -704,48 +704,16 @@ impl RewardVector {
 pub struct ConsistencyScorer;
 
 impl ConsistencyScorer {
-    const STOPWORDS: &'static [&'static str] = &[
-        "fn", "let", "mut", "pub", "use", "mod", "impl", "self", "true", "false",
-        "else", "enum", "struct", "trait", "type", "where", "match", "loop", "while",
-        "for", "return", "async", "await", "move", "ref", "const", "static",
-    ];
-
     #[must_use]
     pub fn score(explanation: &str, diff_text: &str) -> f64 {
         if explanation.is_empty() || diff_text.is_empty() {
             return 0.5;
         }
 
-        let diff_terms = Self::extract_terms(diff_text);
-        let expl_terms = Self::extract_terms(explanation);
-
-        if diff_terms.is_empty() || expl_terms.is_empty() {
-            return 0.5;
-        }
-
-        let intersection = diff_terms.iter().filter(|t| expl_terms.contains(*t)).count();
-        let union = {
-            let mut all: std::collections::HashSet<&str> =
-                diff_terms.iter().map(|s| s.as_str()).collect();
-            for t in &expl_terms {
-                all.insert(t.as_str());
-            }
-            all.len()
-        };
-
-        if union == 0 {
-            return 0.5;
-        }
-
-        (intersection as f64 / union as f64).clamp(0.0, 1.0)
-    }
-
-    fn extract_terms(text: &str) -> std::collections::HashSet<String> {
-        text.split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|tok| tok.len() > 4)
-            .map(|tok| tok.to_lowercase())
-            .filter(|tok| !Self::STOPWORDS.contains(&tok.as_str()))
-            .collect()
+        let emb_a = crate::engines::memory::embed_text(explanation);
+        let emb_b = crate::engines::memory::embed_text(diff_text);
+        let sim = crate::engines::memory::cosine_sim(&emb_a, &emb_b) as f64;
+        ((sim + 1.0) / 2.0).clamp(0.0, 1.0)
     }
 }
 

@@ -338,6 +338,32 @@ impl PromptEvolver {
 
         self.population = elite.iter().cloned().chain(survivors).collect();
     }
+
+    /// Seed the population with a prompt that produced a successful turn.
+    /// Extracts the first 2000 chars (system instruction portion) and inserts
+    /// it with an initial performance score.
+    pub fn seed_from_successful_turn(
+        &mut self,
+        prompt: &str,
+        category: crate::types::conversation::TaskCategory,
+    ) {
+        if self.population.len() >= self.max_population {
+            return;
+        }
+        let text: String = prompt.chars().take(2000).collect();
+        let id = format!("seed_gen{}_{}", self.generation, self.population.len());
+        let mut tmpl = crate::types::intelligence::PromptTemplate {
+            id,
+            version: 0,
+            template_text: text,
+            task_category: category,
+            variables: vec!["task".to_string()],
+            tags: vec!["seeded".to_string()],
+            performance_history: vec![],
+        };
+        tmpl.record_performance("seed".to_string(), 0.8);
+        self.population.push(tmpl);
+    }
 }
 
 pub struct ClosedLoopFeedback;
