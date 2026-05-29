@@ -2485,12 +2485,12 @@ impl Orchestrator {
             }
         }
 
-        if matches!(turn_outcome, TurnOutcome::TestsPassed | TurnOutcome::AdvancedConvergence) {
-            if let Some(certainty) = turn.certainty && certainty > 0.7 {
-                let seed_cat = turn.task_category.unwrap_or(TaskCategory::Research);
-                let mut evolver = self.prompt_evolver.lock().await;
-                evolver.seed_from_successful_turn(prompt, seed_cat);
-            }
+        if matches!(turn_outcome, TurnOutcome::TestsPassed | TurnOutcome::AdvancedConvergence)
+            && let Some(certainty) = turn.certainty && certainty > 0.7
+        {
+            let seed_cat = turn.task_category.unwrap_or(TaskCategory::Research);
+            let mut evolver = self.prompt_evolver.lock().await;
+            evolver.seed_from_successful_turn(prompt, seed_cat);
         }
 
         if matches!(turn_outcome, TurnOutcome::TestsPassed | TurnOutcome::Compiled) {
