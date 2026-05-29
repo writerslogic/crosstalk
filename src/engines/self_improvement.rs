@@ -58,21 +58,132 @@ pub struct PostMortemGenerator;
 impl PostMortemGenerator {
     pub fn generate(sigma: &ConversationState) -> Option<PostMortem> {
         let failures: Vec<u32> = sigma.turns.iter()
-            .filter(|t| matches!(t.outcome, TurnOutcome::Rejected | TurnOutcome::RolledBack))
+            .filter(|t| matches!(t.outcome, TurnOutcome::Rejected | TurnOutcome::RolledBack | TurnOutcome::VerificationFailed))
             .map(|t| t.index)
             .collect();
-        
-        if failures.len() >= 3 {
-            Some(PostMortem {
-                session_id: sigma.session_id.clone(),
-                failure_turn_indices: failures,
-                root_cause: FailureCause::Unknown,
-                missing_context: vec![],
-                alternative_approaches: vec!["Increase context window".to_string()],
-            })
-        } else {
-            None
+
+        if failures.len() < 2 {
+            return None;
         }
+
+        let failed_turns: Vec<&Turn> = sigma.turns.iter()
+            .filter(|t| matches!(t.outcome, TurnOutcome::Rejected | TurnOutcome::RolledBack | TurnOutcome::VerificationFailed))
+            .collect();
+
+        let root_cause = Self::diagnose_root_cause(&failed_turns, sigma);
+        let missing_context = Self::identify_missing_context(&failed_turns, sigma);
+        let alternative_approaches = Self::suggest_alternatives(&root_cause, sigma);
+
+        Some(PostMortem {
+            session_id: sigma.session_id.clone(),
+            failure_turn_indices: failures,
+            root_cause,
+            missing_context,
+            alternative_approaches,
+        })
+    }
+
+    fn diagnose_root_cause(failed_turns: &[&Turn], sigma: &ConversationState) -> FailureCause {
+        let total_turns = sigma.turns.len().max(1);
+        let failure_rate = failed_turns.len() as f64 / total_turns as f64;
+
+        // Check if a single agent is responsible for most failures
+        let mut agent_failures: HashMap<&str, u32> = HashMap::new();
+        for t in failed_turns {
+            *agent_failures.entry(&t.model_id).or_default() += 1;
+        }
+        if let Some((_, &count)) = agent_failures.iter().max_by_key(|(_, c)| **c) {
+            if count as f64 / failed_turns.len() as f64 > 0.7 {
+                return FailureCause::AgentCapabilityLimit;
+            }
+        }
+
+        // Check for verification failures (type/syntax errors)
+        let verification_fails = failed_turns.iter()
+            .filter(|t| t.outcome == TurnOutcome::VerificationFailed)
+            .count();
+        if verification_fails as f64 / failed_turns.len().max(1) as f64 > 0.5 {
+            return FailureCause::TypeMismatch;
+        }
+
+        // Check for increasing complexity (artifact sizes growing but quality dropping)
+        if sigma.artifacts.values().any(|a| a.metrics.cyclomatic_complexity > 50) {
+            return FailureCause::ComplexityExceeded;
+        }
+
+        // High failure rate with low convergence suggests missing context
+        if failure_rate > 0.4 && sigma.completion_probability < 0.3 {
+            return FailureCause::MissingContext;
+        }
+
+        // Budget exhaustion
+        if sigma.budget.mode() == crate::types::compute::BudgetMode::Emergency {
+            return FailureCause::InsufficientBudget;
+        }
+
+        FailureCause::Unknown
+    }
+
+    fn identify_missing_context(failed_turns: &[&Turn], sigma: &ConversationState) -> Vec<String> {
+        let mut missing = Vec::new();
+
+        // Check if failures correlate with no artifacts loaded
+        if sigma.artifacts.is_empty() {
+            missing.push("No workspace artifacts loaded; agents may lack code context".to_string());
+        }
+
+        // Check if the initial task is vague
+        if let Some(first) = sigma.turns.first() {
+            if first.content.split_whitespace().count() < 20 {
+                missing.push("Task description is very brief; consider providing more detail".to_string());
+            }
+        }
+
+        // Check for repeated similar failures
+        let mut seen_errors: HashMap<String, u32> = HashMap::new();
+        for t in failed_turns {
+            let key = t.content.chars().take(100).collect::<String>();
+            *seen_errors.entry(key).or_default() += 1;
+        }
+        if seen_errors.values().any(|&c| c >= 3) {
+            missing.push("Agents are repeating similar failures; the task may need decomposition".to_string());
+        }
+
+        missing
+    }
+
+    fn suggest_alternatives(cause: &FailureCause, sigma: &ConversationState) -> Vec<String> {
+        let mut suggestions = Vec::new();
+        match cause {
+            FailureCause::TypeMismatch => {
+                suggestions.push("Enable linter feedback loop to catch type errors earlier".to_string());
+                suggestions.push("Use agents with stronger typed-language capabilities".to_string());
+            }
+            FailureCause::MissingContext => {
+                suggestions.push("Load additional workspace files with --files or --workspace".to_string());
+                suggestions.push("Provide more detailed task description".to_string());
+            }
+            FailureCause::AgentCapabilityLimit => {
+                suggestions.push("Add a stronger model to the agent pool".to_string());
+                if sigma.turns.iter().filter(|t| t.model_id != "User").map(|t| &t.model_id).collect::<std::collections::HashSet<_>>().len() < 2 {
+                    suggestions.push("Use multiple diverse agents for cross-validation".to_string());
+                }
+            }
+            FailureCause::ComplexityExceeded => {
+                suggestions.push("Decompose the task into smaller sub-tasks".to_string());
+                suggestions.push("Reduce artifact complexity before attempting further changes".to_string());
+            }
+            FailureCause::InsufficientBudget => {
+                suggestions.push("Increase budget limit or use more cost-effective models".to_string());
+            }
+            FailureCause::Unknown => {
+                suggestions.push("Try a different topology (e.g. mediated debate)".to_string());
+                if sigma.iteration_index > 10 {
+                    suggestions.push("Session may be stuck; consider restarting with refined task".to_string());
+                }
+            }
+        }
+        suggestions
     }
 }
 
@@ -143,8 +254,11 @@ impl SelfCodeModifier {
         if !path.exists() {
             return Err(anyhow!("File not found: {}", file_path)).context("check_file");
         }
-        let content = std::fs::read_to_string(path).context("reading file for improvement scan")?;
-        Ok(Self::identify_improvements(file_path, &content)
+        let canonical = path.canonicalize().context("check_file: canonicalize")?;
+        let canonical_str = canonical.to_str()
+            .ok_or_else(|| anyhow!("check_file: path is not valid UTF-8"))?;
+        let content = std::fs::read_to_string(&canonical).context("reading file for improvement scan")?;
+        Ok(Self::identify_improvements(canonical_str, &content)
             .into_iter()
             .map(|(line, desc)| ImprovementProposal {
                 file_path: file_path.to_string(),
@@ -160,6 +274,12 @@ impl SelfCodeModifier {
             .current_dir(workspace_root)
             .output()
             .context("running cargo fmt --check")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.is_empty() {
+                tracing::warn!(workspace = %workspace_root, %stderr, "cargo fmt --check failed");
+            }
+        }
         Ok(output.status.success())
     }
 }
@@ -366,7 +486,7 @@ impl ProgressReporter {
     /// rate = -ln(1 - p) / turns_done; remaining = -ln(threshold) / rate - turns_done.
     pub fn report(sigma: &ConversationState, turns_expected: u32) -> crate::types::self_improvement::ProgressReport {
         let turns_done = sigma.turns.len() as u32;
-        let p = sigma.completion_probability;
+        let p = sigma.completion_probability.clamp(f64::EPSILON, 1.0 - f64::EPSILON);
         let threshold = 0.999; // target probability
         let estimated = if turns_done > 0 && p > 0.0 && p < 1.0 {
             let rate = -(1.0 - p).ln() / turns_done as f64;
@@ -402,24 +522,62 @@ impl SafetyInterlock {
         "Cargo.lock",
     ];
 
+    /// Directory prefixes that must never be written into, regardless of filename.
+    const PROTECTED_DIRS: &[&str] = &[
+        ".git/",
+        ".cargo/",
+        ".config/",
+        ".ssh/",
+        ".gnupg/",
+        ".github/",
+    ];
+
+    /// Files that must never be written.
+    const PROTECTED_FILES: &[&str] = &[
+        ".env",
+        ".env.local",
+        ".env.production",
+        "Dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+    ];
+
     pub fn is_modification_allowed(path: &str) -> bool {
         let normalized = path.replace('\\', "/");
-        !Self::PROTECTED.iter().any(|&p| normalized == p || normalized.ends_with(&format!("/{p}")))
+        if Self::PROTECTED.iter().any(|&p| normalized == p || normalized.ends_with(&format!("/{p}"))) {
+            return false;
+        }
+        if Self::PROTECTED_DIRS.iter().any(|&d| normalized.starts_with(d) || normalized.contains(&format!("/{d}"))) {
+            return false;
+        }
+        if Self::PROTECTED_FILES.iter().any(|&f| {
+            normalized == f
+                || normalized.ends_with(&format!("/{f}"))
+        }) {
+            return false;
+        }
+        true
     }
 }
 
 pub struct FileWriter {
     pub root: PathBuf,
+    canonical_root: PathBuf,
 }
 
 impl FileWriter {
-    pub fn new(root: PathBuf) -> Self {
-        Self { root }
+    pub fn new(root: PathBuf) -> Result<Self> {
+        std::fs::create_dir_all(&root).context("creating FileWriter root")?;
+        let canonical_root = root.canonicalize().context("canonicalizing FileWriter root")?;
+        Ok(Self { root, canonical_root })
     }
 
     pub fn from_env() -> Result<Self> {
         let root = std::env::var("CROSSTALK_PROJECT_ROOT").unwrap_or_else(|_| ".".to_string());
-        Ok(Self { root: PathBuf::from(root) })
+        Self::new(PathBuf::from(root))
     }
 
     pub async fn write_artifact_with_proof(&self, artifact: &crate::types::artifact::Artifact) -> Result<WriteOutcome> {
@@ -438,24 +596,37 @@ impl FileWriter {
         if name.contains("..") || name.starts_with('/') || name.starts_with('\\') {
             return Ok(WriteOutcome::Skipped("path traversal rejected".to_string()));
         }
-        let abs_path = self.root.join(name);
-        let canonical_root = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
-        if !abs_path.starts_with(&self.root) {
-            return Ok(WriteOutcome::Skipped("path escapes project root".to_string()));
-        }
         if !SafetyInterlock::is_modification_allowed(name) {
             return Ok(WriteOutcome::Skipped("SafetyInterlock: protected file".to_string()));
         }
+        let abs_path = self.root.join(name);
         if let Some(parent) = abs_path.parent() {
             fs::create_dir_all(parent).await?;
-            if let Ok(canonical_parent) = parent.canonicalize()
-                && !canonical_parent.starts_with(&canonical_root)
-            {
-                crate::log_warn!(fs::remove_dir(parent).await, "Failed to remove directory after root escape detection");
-                return Ok(WriteOutcome::Skipped("path escapes project root".to_string()));
-            }
         }
-        fs::write(&abs_path, content).await?;
+        // Canonicalize the target's parent after create_dir_all; symlinks are
+        // resolved against the pre-resolved canonical_root stored at construction.
+        // Fail closed: if canonicalize fails (permission denied, symlink loop, etc.)
+        // we reject the write rather than falling back to the non-canonical path.
+        let canonical_parent = match abs_path.parent() {
+            Some(p) => p.canonicalize().map_err(|e| {
+                anyhow::anyhow!("failed to canonicalize parent of '{}': {}", abs_path.display(), e)
+            })?,
+            None => return Ok(WriteOutcome::Skipped("artifact path has no parent directory".to_string())),
+        };
+        let canonical_abs = canonical_parent.join(abs_path.file_name().unwrap_or_default());
+        if !canonical_abs.starts_with(&self.canonical_root) {
+            tracing::warn!(
+                path = %abs_path.display(),
+                root = %self.canonical_root.display(),
+                "Artifact write blocked: path escapes project root"
+            );
+            return Ok(WriteOutcome::Skipped("path escapes project root".to_string()));
+        }
+        let tmp_path = abs_path.with_extension(
+            format!("{}.tmp", abs_path.extension().unwrap_or_default().to_string_lossy())
+        );
+        fs::write(&tmp_path, content).await?;
+        fs::rename(&tmp_path, &abs_path).await?;
         Ok(WriteOutcome::Written(abs_path))
     }
 }

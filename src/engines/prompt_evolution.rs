@@ -345,12 +345,50 @@ pub struct ClosedLoopFeedback;
 impl ClosedLoopFeedback {
     #[must_use]
     pub fn generate_corrective_directive(profile: &crate::types::intelligence::AgentProfile) -> Option<String> {
-        if profile.total_turns > 3 && profile.compilation_success_rate < 0.6 {
-            Some("CRITICAL: Your recent proposals have consistently failed to compile. You MUST verify structural syntax and type signatures before responding.".to_string())
-        } else if profile.total_turns > 5 && profile.compilation_success_rate < 0.4 {
-             Some("WARNING: High failure rate detected. Switch to a conservative implementation strategy and avoid complex language features.".to_string())
-        } else {
+        if profile.total_turns < 2 {
+            return None;
+        }
+
+        let mut directives = Vec::new();
+
+        if profile.compilation_success_rate < 0.4 && profile.total_turns > 3 {
+            directives.push("CRITICAL: Your recent proposals have consistently failed to compile. Verify structural syntax and type signatures before responding.");
+        } else if profile.compilation_success_rate < 0.6 && profile.total_turns > 3 {
+            directives.push("WARNING: High failure rate detected. Use a conservative implementation strategy.");
+        }
+
+        // Category-specific feedback based on capability scores
+        for (cat, &score) in &profile.capabilities {
+            if score < 0.3 && profile.total_turns > 5 {
+                let hint = match cat {
+                    crate::types::conversation::TaskCategory::CodeGeneration =>
+                        "Your code generation accuracy is low. Produce minimal, targeted diffs rather than large rewrites.",
+                    crate::types::conversation::TaskCategory::Research =>
+                        "Your research analysis has been shallow. Cite specific evidence and explore counterarguments.",
+                    crate::types::conversation::TaskCategory::Debugging =>
+                        "Your debugging accuracy is low. Reproduce the bug first, then propose a focused fix.",
+                    _ => continue,
+                };
+                directives.push(hint);
+            }
+        }
+
+        // Detect stagnation: if capability scores are not improving
+        if profile.total_turns > 8 {
+            let avg_capability: f64 = if profile.capabilities.is_empty() {
+                0.5
+            } else {
+                profile.capabilities.values().sum::<f64>() / profile.capabilities.len() as f64
+            };
+            if avg_capability < 0.4 {
+                directives.push("Your overall performance is declining. Re-examine your assumptions and try a fundamentally different approach.");
+            }
+        }
+
+        if directives.is_empty() {
             None
+        } else {
+            Some(format!("[PERFORMANCE FEEDBACK]\n{}", directives.join("\n")))
         }
     }
 }
