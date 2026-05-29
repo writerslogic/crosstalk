@@ -55,10 +55,44 @@ pub struct ReasoningEngine;
 impl ReasoningEngine {
     pub fn extract_signals(content: &str) -> ExtractedSignals {
         let mut decisions = Vec::new();
+        let mut problems = Vec::new();
+        let mut questions = Vec::new();
+        let mut code_blocks = Vec::new();
+
+        let mut in_code_block = false;
+        let mut code_buf = String::new();
+
         for line in content.lines() {
-            if line.contains("[decision]") { decisions.push(line.trim().to_string()); }
+            let trimmed = line.trim();
+            if trimmed.starts_with("```") {
+                if in_code_block {
+                    code_blocks.push(std::mem::take(&mut code_buf));
+                    in_code_block = false;
+                } else {
+                    in_code_block = true;
+                }
+                continue;
+            }
+            if in_code_block {
+                code_buf.push_str(line);
+                code_buf.push('\n');
+                continue;
+            }
+
+            let lower = trimmed.to_lowercase();
+            if lower.contains("[decision]") || lower.starts_with("decision:") || lower.starts_with("conclusion:") {
+                decisions.push(trimmed.to_string());
+            } else if lower.contains("bug") || lower.contains("error") || lower.contains("issue:")
+                || lower.contains("problem:") || lower.contains("flaw") || lower.contains("regression")
+                || lower.starts_with("- fix") || lower.starts_with("- bug")
+            {
+                problems.push(trimmed.to_string());
+            } else if trimmed.ends_with('?') || lower.starts_with("question:") || lower.starts_with("q:") {
+                questions.push(trimmed.to_string());
+            }
         }
-        ExtractedSignals { decisions, problems: vec![], questions: vec![], code_blocks: vec![] }
+
+        ExtractedSignals { decisions, problems, questions, code_blocks }
     }
 
     pub fn select_structure(category: TaskCategory, agent_id: &str) -> TurnStructure {

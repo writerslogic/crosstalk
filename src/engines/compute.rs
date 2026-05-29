@@ -89,6 +89,7 @@ impl ResourceMonitorActor {
 
 pub struct ComputeManager {
     sys: System,
+    disks: Disks,
     resource_tx: broadcast::Sender<ResourceEvent>,
     pub cache: InferenceCache,
     pub rate_limits: RateLimitManager,
@@ -100,6 +101,7 @@ impl ComputeManager {
         let (tx, _) = broadcast::channel(100);
         Self {
             sys: System::new_all(),
+            disks: Disks::new_with_refreshed_list(),
             resource_tx: tx,
             cache: InferenceCache::new(),
             rate_limits: RateLimitManager::new(),
@@ -124,8 +126,8 @@ impl ComputeManager {
         self.sys.refresh_all();
         let rss_mb = self.sys.used_memory() / 1024 / 1024;
         let cpu_load = self.sys.global_cpu_usage();
-        let disks = Disks::new_with_refreshed_list();
-        let disk_free_gb = disk_free_gib(&disks);
+        self.disks.refresh(false);
+        let disk_free_gb = disk_free_gib(&self.disks);
         let alert = resource_alert(cpu_load, rss_mb);
 
         let event = ResourceEvent {
@@ -195,11 +197,29 @@ impl FallbackChain {
     }
 }
 
-#[derive(Default)]
+/// Maximum number of entries retained in the inference cache before LRU eviction.
+const INFERENCE_CACHE_MAX_ENTRIES: usize = 512;
+
 pub struct InferenceCache {
-    pub entries: HashMap<String, (String, f64)>,
+    /// Ordered map: most recently used at the back. Key is SHA-256 of (prompt, model_id).
+    entries: VecDeque<(String, String, f64)>,
+    /// Fast lookup: key -> index in `entries`.
+    index: HashMap<String, usize>,
     pub hits: u64,
     pub misses: u64,
+    pub max_entries: usize,
+}
+
+impl Default for InferenceCache {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            index: HashMap::new(),
+            hits: 0,
+            misses: 0,
+            max_entries: INFERENCE_CACHE_MAX_ENTRIES,
+        }
+    }
 }
 
 impl InferenceCache {
@@ -209,9 +229,16 @@ impl InferenceCache {
 
     pub fn get(&mut self, prompt: &str, model_id: &str) -> Option<String> {
         let key = Self::cache_key(prompt, model_id);
-        if let Some((res, _)) = self.entries.get(&key) {
+        if let Some(&idx) = self.index.get(&key) {
             self.hits += 1;
-            Some(res.clone())
+            // Move to back (most recently used)
+            if let Some((k, v, q)) = self.entries.remove(idx) {
+                self.entries.push_back((k.clone(), v.clone(), q));
+                self.rebuild_index();
+                Some(v)
+            } else {
+                None
+            }
         } else {
             self.misses += 1;
             None
@@ -220,7 +247,25 @@ impl InferenceCache {
 
     pub fn insert(&mut self, prompt: &str, model_id: &str, response: String, quality: f64) {
         let key = Self::cache_key(prompt, model_id);
-        self.entries.insert(key, (response, quality));
+        // Remove existing entry if present
+        if let Some(&idx) = self.index.get(&key) {
+            self.entries.remove(idx);
+        }
+        // Evict oldest if at capacity
+        while self.entries.len() >= self.max_entries {
+            if let Some((evicted_key, _, _)) = self.entries.pop_front() {
+                self.index.remove(&evicted_key);
+            }
+        }
+        self.entries.push_back((key, response, quality));
+        self.rebuild_index();
+    }
+
+    fn rebuild_index(&mut self) {
+        self.index.clear();
+        for (i, (k, _, _)) in self.entries.iter().enumerate() {
+            self.index.insert(k.clone(), i);
+        }
     }
 
     fn cache_key(prompt: &str, model_id: &str) -> String {
@@ -239,6 +284,18 @@ impl InferenceCache {
         } else {
             self.hits as f64 / total as f64
         }
+    }
+
+    /// Number of cached entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the cache is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 

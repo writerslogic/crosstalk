@@ -49,6 +49,7 @@ impl NashSolver {
     }
 
     pub fn resolve_optimal_proposal(proposals: &[(&str, &Artifact, TurnOutcome)], current: &Artifact) -> usize {
+        if proposals.is_empty() { return 0; }
         let matrix = PayoffCalculator::compute_payoff_matrix(proposals, current);
         let n = matrix.len();
         if n == 0 { return 0; }
@@ -339,8 +340,37 @@ impl CertaintyAnalyzer {
         let structure_boost = if has_steps { 0.05 } else { 0.0 }
             + if has_reasoning { 0.05 } else { 0.0 };
 
+        // Signal 7: Self-contradiction (agent contradicts itself within response)
+        let contradiction_penalty = {
+            let sentences: Vec<&str> = content.split(|c| c == '.' || c == '!' || c == '\n')
+                .map(str::trim)
+                .filter(|s| s.len() > 10)
+                .collect();
+            let mut contradictions = 0u32;
+            for s in &sentences {
+                let sl = s.to_lowercase();
+                if sl.contains("however") || sl.contains("but actually") || sl.contains("on second thought")
+                    || sl.contains("wait,") || sl.contains("correction:") || sl.contains("i was wrong")
+                {
+                    contradictions += 1;
+                }
+            }
+            (contradictions as f64 * 0.08).min(0.25)
+        };
+
+        // Signal 8: Evidence grounding (references to specific artifacts, lines, functions)
+        let grounding_boost = {
+            let refs = content.matches("line ").count()
+                + content.matches("fn ").count()
+                + content.matches("function ").count()
+                + content.matches("class ").count()
+                + content.matches("file ").count();
+            (refs as f64 * 0.02).min(0.1)
+        };
+
         let base = 0.50;
-        let raw = base + assert_boost + code_boost + quant_boost + length_signal + structure_boost - hedge_penalty;
+        let raw = base + assert_boost + code_boost + quant_boost + length_signal
+            + structure_boost + grounding_boost - hedge_penalty - contradiction_penalty;
         (raw - volatility * 0.1).clamp(0.05, 0.98)
     }
 }
@@ -419,7 +449,6 @@ impl StallDetector {
         if self.proposal_history.len() >= 6 {
             self.proposal_history.pop_front();
         }
-        self.proposal_history.push_back(proposals.clone());
 
         if self.entropy_history.len() >= 5 {
             self.entropy_history.pop_front();
@@ -427,7 +456,7 @@ impl StallDetector {
         self.entropy_history.push_back(turn_entropy);
 
         // Update disagreement runs: compare each pair in this turn vs previous turn.
-        if let Some(prev) = self.proposal_history.len().checked_sub(2).and_then(|i| self.proposal_history.get(i)) {
+        if let Some(prev) = self.proposal_history.back() {
             let agents: Vec<&String> = proposals.keys().collect();
             for i in 0..agents.len() {
                 for j in (i + 1)..agents.len() {
@@ -451,7 +480,9 @@ impl StallDetector {
             }
         }
 
-        self.compute_stall_risk(&proposals)
+        let stall_risk = self.compute_stall_risk(&proposals);
+        self.proposal_history.push_back(proposals);
+        stall_risk
     }
 
     fn compute_stall_risk(&self, current: &HashMap<String, String>) -> f64 {

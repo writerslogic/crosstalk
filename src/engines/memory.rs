@@ -53,7 +53,41 @@ pub fn get_embedder() -> Option<&'static TextEmbedding> {
     }).as_ref()
 }
 
+/// Maximum entries in the embedding LRU cache.
+const EMBED_CACHE_MAX: usize = 256;
+
+/// Thread-safe LRU embedding cache keyed by content hash.
+static EMBED_CACHE: std::sync::LazyLock<std::sync::Mutex<VecDeque<(u64, Vec<f32>)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(VecDeque::new()));
+
+fn embed_cache_key(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
 pub fn embed_text(text: &str) -> Vec<f32> {
+    let key = embed_cache_key(text);
+    if let Ok(cache) = EMBED_CACHE.lock() {
+        if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
+            return cache[pos].1.clone();
+        }
+    }
+
+    let result = embed_text_uncached(text);
+
+    if let Ok(mut cache) = EMBED_CACHE.lock() {
+        if cache.len() >= EMBED_CACHE_MAX {
+            cache.pop_front();
+        }
+        cache.push_back((key, result.clone()));
+    }
+
+    result
+}
+
+fn embed_text_uncached(text: &str) -> Vec<f32> {
     #[cfg(feature = "ort-embeddings")]
     if let Some(model) = get_embedder()
         && let Ok(mut vecs) = model.embed(vec![text.to_string()], None)

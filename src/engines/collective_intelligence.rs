@@ -31,6 +31,33 @@ impl CollectiveIntelligenceEngine {
         }
     }
 
+    /// Serialize agent profiles and meta-strategy outcomes to JSON for cross-session persistence.
+    pub fn export_state_json(&self) -> String {
+        serde_json::to_string(&(&self.profiles, &self.meta_optimizer.outcomes))
+            .unwrap_or_default()
+    }
+
+    /// Restore agent profiles and meta-strategy outcomes from a prior session's JSON.
+    ///
+    /// Profiles are merged (prior entries only fill gaps; existing entries win).
+    /// Strategy outcomes are accumulated (trial counts and quality sums are added).
+    pub fn import_state_json(&mut self, json: &str) {
+        type State = (
+            BTreeMap<String, AgentProfile>,
+            BTreeMap<MetaStrategy, StrategyOutcome>,
+        );
+        if let Ok((profiles, outcomes)) = serde_json::from_str::<State>(json) {
+            for (id, profile) in profiles {
+                self.profiles.entry(id).or_insert(profile);
+            }
+            for (strategy, prior) in outcomes {
+                let e = self.meta_optimizer.outcomes.entry(strategy).or_default();
+                e.quality_sum += prior.quality_sum;
+                e.trial_count += prior.trial_count;
+            }
+        }
+    }
+
     pub fn update_specialization(&mut self, turn: &Turn) {
         let profile = self
             .profiles
@@ -75,12 +102,42 @@ impl CollectiveIntelligenceEngine {
 pub struct KnowledgeTransfer;
 
 impl KnowledgeTransfer {
+    /// Maximum bytes of AI-generated content embedded in a lesson. Caps the
+    /// blast radius of a prompt-injection attempt carried in turn content.
+    const MAX_LESSON_CONTENT_BYTES: usize = 4096;
+
+    /// Strip characters and substrings that act as prompt-delimiter signals in
+    /// common LLM prompt formats (ChatML, Llama-2 [INST], H4 ###, XML-style).
+    fn sanitize_for_lesson(raw: &str) -> String {
+        // Dangerous delimiter patterns that could break out of the lesson block
+        // and inject instructions into the surrounding agent prompt.
+        const STRIP_PATTERNS: &[&str] = &[
+            "[INST]", "[/INST]", "<<SYS>>", "<</SYS>>",
+            "###", "<|im_start|>", "<|im_end|>",
+            "<|system|>", "<|user|>", "<|assistant|>",
+        ];
+        let truncated = if raw.len() > Self::MAX_LESSON_CONTENT_BYTES {
+            // Truncate at a UTF-8 character boundary.
+            let mut end = Self::MAX_LESSON_CONTENT_BYTES;
+            while !raw.is_char_boundary(end) { end -= 1; }
+            &raw[..end]
+        } else {
+            raw
+        };
+        let mut out = truncated.to_string();
+        for pat in STRIP_PATTERNS {
+            out = out.replace(pat, "");
+        }
+        out
+    }
+
     #[must_use]
     pub fn pack_lesson(turn: &Turn) -> Option<TransferableLesson> {
         if turn.outcome == TurnOutcome::TestsPassed {
+            let safe_content = Self::sanitize_for_lesson(&turn.content);
             return Some(TransferableLesson {
                 category: "success_pattern".to_string(),
-                content: format!("Pattern discovered by {}: {}", turn.model_id, turn.content),
+                content: format!("Pattern discovered by {}: {}", turn.model_id, safe_content),
                 confidence: 0.9,
                 applicability_tags: vec!["success".to_string()],
             });
@@ -188,6 +245,7 @@ impl EnsembleEngine {
         }
 
         // Fallback to paragraph-level selection for Research/Reasoning
+        if proposals.is_empty() { return String::new(); }
         let best_idx = proposals.iter().enumerate().max_by(|(_, a), (_, b)| a.2.total_cmp(&b.2)).map(|(i, _)| i).unwrap_or(0);
         let base_paragraphs: Vec<&str> = proposals[best_idx].1.split("\n\n").collect();
         let mut merged = String::with_capacity(proposals[best_idx].1.len());
@@ -198,14 +256,21 @@ impl EnsembleEngine {
             .flat_map(|(_, content, score)| content.split("\n\n").map(move |c| (c, *score)))
             .collect();
 
+        // Pre-compute all candidate word-sets ONCE to avoid quadratic HashSet allocation.
+        let candidate_word_sets: Vec<std::collections::HashSet<&str>> = all_candidates
+            .iter()
+            .map(|(c, _)| c.split_whitespace().collect())
+            .collect();
+
+        let base_word_set: std::collections::HashSet<&str> = proposals[best_idx].1.split_whitespace().collect();
+
         for para in &base_paragraphs {
-            // Pre-build word set for this paragraph: O(words) lookup instead of O(words × len).
             let para_words: std::collections::HashSet<&str> = para.split_whitespace().collect();
             let total = para_words.len().max(1);
             let mut best_para = (*para, proposals[best_idx].2);
-            for &(candidate, score) in &all_candidates {
-                let cand_words: std::collections::HashSet<&str> = candidate.split_whitespace().collect();
-                let overlap = para_words.intersection(&cand_words).count();
+            for (i, &(candidate, score)) in all_candidates.iter().enumerate() {
+                let cand_words = &candidate_word_sets[i];
+                let overlap = para_words.intersection(cand_words).count();
                 if overlap as f64 / total as f64 > 0.6 && score > best_para.1 {
                     best_para = (candidate, score);
                 }
@@ -214,6 +279,20 @@ impl EnsembleEngine {
                 merged.push_str("\n\n");
             }
             merged.push_str(best_para.0);
+        }
+
+        // Append unique insights from non-best proposals that have low overlap with the merged text.
+        // This captures novel perspectives that the best proposal missed.
+        for (i, &(candidate, score)) in all_candidates.iter().enumerate() {
+            if score < 0.3 { continue; }
+            let cand_words = &candidate_word_sets[i];
+            if cand_words.len() < 5 { continue; }
+            let overlap = base_word_set.intersection(cand_words).count();
+            let novelty = 1.0 - (overlap as f64 / cand_words.len().max(1) as f64);
+            if novelty > 0.5 && candidate.len() > 20 {
+                merged.push_str("\n\n[Additional insight] ");
+                merged.push_str(candidate);
+            }
         }
         merged
     }
@@ -280,7 +359,7 @@ pub struct AdaptiveSelection {
     pub preferred_agent: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StrategyOutcome {
     pub strategy: MetaStrategy,
     pub quality_sum: f64,
@@ -485,6 +564,9 @@ fn sample_beta(rng: &mut impl rand::Rng, alpha: f64, beta: f64) -> f64 {
 }
 
 fn sample_gamma(rng: &mut impl rand::Rng, shape: f64) -> f64 {
+    if shape > 100.0 {
+        return shape;
+    }
     if shape < 1.0 {
         let u: f64 = rng.random();
         return sample_gamma(rng, shape + 1.0) * u.powf(1.0 / shape);

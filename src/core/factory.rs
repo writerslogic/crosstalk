@@ -99,7 +99,7 @@ impl ModelFactory {
     fn create_openrouter_agent(model_id: &str, actual_model_id: &str) -> Result<Box<dyn PromptAgent>> {
         let api_key = require_env("OPENROUTER_API_KEY")
             .or_else(|_| {
-                tracing::warn!(model = model_id, "OPENROUTER_API_KEY not set; falling back to LLM_API_KEY");
+                tracing::warn!(model = model_id, "OPENROUTER_API_KEY not set, falling back to LLM_API_KEY");
                 require_env("LLM_API_KEY")
             })
             .map_err(|_| anyhow::anyhow!("Missing OPENROUTER_API_KEY (and LLM_API_KEY fallback) for model {}", model_id))?;

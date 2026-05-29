@@ -3226,20 +3226,28 @@ impl Orchestrator {
             } else {
                 format!(" problems=[{}]", signals.problems.join("; "))
             };
+            let questions = if signals.questions.is_empty() {
+                String::new()
+            } else {
+                format!(" open_questions=[{}]", signals.questions.iter().take(3).cloned().collect::<Vec<_>>().join("; "))
+            };
             let code_count = signals.code_blocks.len();
             let code_tag = if code_count > 0 {
                 format!(" code_blocks={code_count}")
             } else {
                 String::new()
             };
+            let certainty_tag = t.certainty.map(|c| format!(" certainty={c:.2}")).unwrap_or_default();
             crate::log_warn!(writeln!(
                 p,
-                "Turn {} by {} ({}){}{}{}: {}",
+                "Turn {} by {} ({}){}{}{}{}{}: {}",
                 t.index,
                 t.model_id,
                 outcome_tag,
+                certainty_tag,
                 decisions,
                 problems,
+                questions,
                 code_tag,
                 Self::truncate_str(&t.content, 150),
             ), "Failed to write history summary");
@@ -3254,9 +3262,21 @@ impl Orchestrator {
         }
 
         if sigma.mode_library.current().convergence_direction == crate::types::mode::ConvergenceDirection::TowardAgreement {
-            p.push_str("\nRefine artifacts or debate the solution. Use ```lang:filename to propose changes. Tag completion with 'OPTIMAL'.");
+            p.push_str(
+                "\n[INSTRUCTIONS]\n\
+                 1. Address any open questions or problems from prior turns before proposing new changes.\n\
+                 2. Ground every claim in evidence: cite specific artifact lines, prior turn numbers, or test results.\n\
+                 3. Use ```lang:filename to propose code changes. Include the COMPLETE file content.\n\
+                 4. When your analysis is complete and all issues are resolved, tag with 'OPTIMAL'.\n\
+                 5. Prefer precise, verifiable statements over vague assertions.\n"
+            );
         } else {
-            p.push_str("\nRefine artifacts or debate the solution. Use ```lang:filename to propose changes.");
+            p.push_str(
+                "\n[INSTRUCTIONS]\n\
+                 1. Explore divergent approaches. Challenge assumptions from prior turns.\n\
+                 2. Use ```lang:filename to propose code changes.\n\
+                 3. Surface disagreements explicitly rather than silently accepting prior consensus.\n"
+            );
         }
         let mode_prefix = sigma.mode_library.current().prompt_prefix.clone();
         let base = format!("{}\n\n{}", mode_prefix, p);

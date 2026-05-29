@@ -121,15 +121,29 @@ impl PromptEvolver {
     /// (deduplicated).  The resulting template inherits `parent_a`'s id with a
     /// `_x` suffix, version 0, and an empty performance history.
     pub fn crossover(parent_a: &PromptTemplate, parent_b: &PromptTemplate) -> PromptTemplate {
-        let a_chars: Vec<char> = parent_a.template_text.chars().collect();
-        let b_chars: Vec<char> = parent_b.template_text.chars().collect();
+        // Sentence-level crossover preserves semantic coherence.
+        let sentences_a: Vec<&str> = parent_a.template_text.split(". ")
+            .chain(parent_a.template_text.split(".\n"))
+            .collect();
+        let sentences_b: Vec<&str> = parent_b.template_text.split(". ")
+            .chain(parent_b.template_text.split(".\n"))
+            .collect();
 
-        let cut_a = a_chars.len() / 2;
-        let cut_b = b_chars.len() / 2;
+        let cut_a = sentences_a.len() / 2;
+        let cut_b = sentences_b.len() / 2;
 
-        let first_half: String = a_chars[..cut_a].iter().collect();
-        let second_half: String = b_chars[cut_b..].iter().collect();
-        let text = format!("{}{}", first_half, second_half);
+        let text = if sentences_a.len() >= 2 && sentences_b.len() >= 2 {
+            let first_half: String = sentences_a[..cut_a].join(". ");
+            let second_half: String = sentences_b[cut_b..].join(". ");
+            format!("{}. {}", first_half.trim_end_matches('.'), second_half)
+        } else {
+            // Fall back to character-level for very short templates
+            let a_chars: Vec<char> = parent_a.template_text.chars().collect();
+            let b_chars: Vec<char> = parent_b.template_text.chars().collect();
+            let ca = a_chars.len() / 2;
+            let cb = b_chars.len() / 2;
+            format!("{}{}", a_chars[..ca].iter().collect::<String>(), b_chars[cb..].iter().collect::<String>())
+        };
 
         let mut variables = parent_a.variables.clone();
         for v in &parent_b.variables {
@@ -276,6 +290,28 @@ impl PromptEvolver {
         }
     }
 
+    /// Serialize the current population and generation counter to JSON for
+    /// cross-session persistence.
+    pub fn export_state_json(&self) -> String {
+        serde_json::to_string(&(&self.population, self.generation)).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to serialize prompt evolution state");
+            String::default()
+        })
+    }
+
+    /// Restore population and generation counter from a prior session's JSON.
+    ///
+    /// The imported population is capped at `max_population`.
+    pub fn import_state_json(&mut self, json: &str) {
+        if let Ok((population, generation)) =
+            serde_json::from_str::<(Vec<crate::types::intelligence::PromptTemplate>, u32)>(json)
+        {
+            self.generation = generation;
+            self.population = population;
+            self.population.truncate(self.max_population);
+        }
+    }
+
     /// Remove templates whose [`mean_performance`](PromptTemplate::mean_performance)
     /// falls below `min_quality`, but only after they have accumulated at least
     /// [`CULL_MIN_OBSERVATIONS`] observations.  Elite templates (the current
@@ -301,6 +337,21 @@ impl PromptEvolver {
             .collect();
 
         self.population = elite.iter().cloned().chain(survivors).collect();
+    }
+}
+
+pub struct ClosedLoopFeedback;
+
+impl ClosedLoopFeedback {
+    #[must_use]
+    pub fn generate_corrective_directive(profile: &crate::types::intelligence::AgentProfile) -> Option<String> {
+        if profile.total_turns > 3 && profile.compilation_success_rate < 0.6 {
+            Some("CRITICAL: Your recent proposals have consistently failed to compile. You MUST verify structural syntax and type signatures before responding.".to_string())
+        } else if profile.total_turns > 5 && profile.compilation_success_rate < 0.4 {
+             Some("WARNING: High failure rate detected. Switch to a conservative implementation strategy and avoid complex language features.".to_string())
+        } else {
+            None
+        }
     }
 }
 
@@ -385,20 +436,5 @@ mod tests {
         evolver.population = vec![make_template("t", "template text", 0.7)];
         let ratings = FxHashMap::default();
         assert!(evolver.select_for_agent("agent_1", &ratings).is_some());
-    }
-}
-
-pub struct ClosedLoopFeedback;
-
-impl ClosedLoopFeedback {
-    #[must_use]
-    pub fn generate_corrective_directive(profile: &crate::types::intelligence::AgentProfile) -> Option<String> {
-        if profile.total_turns > 3 && profile.compilation_success_rate < 0.6 {
-            Some("CRITICAL: Your recent proposals have consistently failed to compile. You MUST verify structural syntax and type signatures before responding.".to_string())
-        } else if profile.total_turns > 5 && profile.compilation_success_rate < 0.4 {
-             Some("WARNING: High failure rate detected. Switch to a conservative implementation strategy and avoid complex language features.".to_string())
-        } else {
-            None
-        }
     }
 }
