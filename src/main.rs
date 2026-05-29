@@ -183,17 +183,27 @@ async fn main() -> anyhow::Result<()> {
         model_select::run_api_key_setup().await?;
     }
 
+    // Load user config (~/.config/crosstalk/config.toml)
+    let config = crosstalk::core::config::Config::load();
+
     // If no task provided, run the interactive wizard to collect task + optional workspace/iterations.
     let (task_str, wizard_workspace, wizard_iterations) = if args.task.is_none() {
         let (t, ws, iters) = model_select::run_task_wizard().await?;
+        let ws = ws.or(config.default_workspace.clone());
+        let iters = if iters == 0 { config.default_iterations.unwrap_or(0) } else { iters };
         (t, ws, iters)
     } else {
-        (args.task.unwrap_or_default(), args.workspace.clone(), args.iterations)
+        let ws = args.workspace.clone().or(config.default_workspace.clone());
+        let iters = if args.iterations == 0 { config.default_iterations.unwrap_or(0) } else { args.iterations };
+        (args.task.unwrap_or_default(), ws, iters)
     };
 
+    let use_auto = args.auto || config.auto_mode.unwrap_or(false);
     let model_ids: Vec<String> = if !args.models.is_empty() {
         args.models
-    } else if args.auto {
+    } else if let Some(ref defaults) = config.default_models && !defaults.is_empty() && !use_auto {
+        defaults.clone()
+    } else if use_auto {
         let ids = model_select::auto_select_models_dynamic(&task_str).await;
         if ids.is_empty() {
             anyhow::bail!("No API keys found. Set at least one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY.");
@@ -439,7 +449,12 @@ async fn main() -> anyhow::Result<()> {
     let sigma_orch = Arc::clone(&sigma);
     let app_orch = Arc::clone(&app);
     let iterations = wizard_iterations;
-    let turn_timeout = Duration::from_secs(args.agent_timeout_secs);
+    let timeout_secs = if args.agent_timeout_secs != 300 {
+        args.agent_timeout_secs
+    } else {
+        config.agent_timeout_secs.unwrap_or(300)
+    };
+    let turn_timeout = Duration::from_secs(timeout_secs);
     let omicron_orch = Arc::new(omicron);
     let omicron_spawn = Arc::clone(&omicron_orch);
     tokio::spawn(async move {

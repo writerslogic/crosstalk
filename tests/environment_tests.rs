@@ -45,8 +45,8 @@ fn test_generate_flake_empty_deps() {
     assert!(flake.contains("mkShell"), "flake missing mkShell call");
 }
 
-#[test]
-fn test_cache_hit_returns_fast() {
+#[tokio::test]
+async fn test_cache_hit_returns_fast() {
     let tmp = tempfile::tempdir().unwrap();
     let mut mgr = NixManager::new(vec!["git".to_string()]).unwrap();
     mgr.cache_dir = tmp.path().to_path_buf();
@@ -58,15 +58,15 @@ fn test_cache_hit_returns_fast() {
     let now = chrono::Utc::now().timestamp();
     write_cache_entry(&cache_path, now, &env).expect("write cache entry");
 
-    let result = mgr.synthesize().unwrap();
+    let result = mgr.synthesize().await.unwrap();
     assert_eq!(
         result.get("PATH").map(|s| s.as_str()),
         Some("/nix/store/bin")
     );
 }
 
-#[test]
-fn test_cache_expired_is_miss() {
+#[tokio::test]
+async fn test_cache_expired_is_miss() {
     let tmp = tempfile::tempdir().unwrap();
     let mut mgr = NixManager::new(vec!["git".to_string()]).unwrap();
     mgr.cache_dir = tmp.path().to_path_buf();
@@ -77,16 +77,14 @@ fn test_cache_expired_is_miss() {
     write_cache_entry(&cache_path, stale_ts, &env).expect("write cache entry");
 
     // Without nix installed the synthesize call will fail (cache miss -> nix required).
-    // We only verify the cache was NOT returned (i.e. we hit an error, not the stale data).
     if which::which("nix").is_err() {
         assert!(
-            mgr.synthesize().is_err(),
+            mgr.synthesize().await.is_err(),
             "stale cache must not be returned"
         );
     } else {
         // nix is present; synthesize may succeed or fail depending on env.
-        // Just verify the stale cache timestamp didn't trick us into returning stale data.
-        let _ = mgr.synthesize(); // may succeed or fail; no assertion on value
+        let _ = mgr.synthesize().await;
     }
 }
 

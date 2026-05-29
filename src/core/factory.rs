@@ -178,9 +178,18 @@ impl ModelFactory {
             } else {
                 "OPENROUTER_API_KEY"
             };
+            let url = match key {
+                "ANTHROPIC_API_KEY" => "https://console.anthropic.com/settings/keys",
+                "OPENAI_API_KEY" => "https://platform.openai.com/api-keys",
+                "OPENROUTER_API_KEY" => "https://openrouter.ai/keys",
+                "DEEPSEEK_API_KEY" => "https://platform.deepseek.com/api_keys",
+                "MISTRAL_API_KEY" => "https://console.mistral.ai/api-keys",
+                "GROQ_API_KEY" => "https://console.groq.com/keys",
+                _ => "",
+            };
             std::env::var(key)
                 .or_else(|_| std::env::var("LLM_API_KEY"))
-                .map_err(|_| anyhow::anyhow!("Missing {} (or LLM_API_KEY) for model {}", key, model_id))?;
+                .map_err(|_| anyhow::anyhow!("Missing {key} for model {model_id}. Get one at {url}"))?;
         }
         Ok(())
     }
