@@ -180,7 +180,7 @@ pub fn synthetic_swe_instances(n: usize) -> Vec<SweBenchInstance> {
     (0..n)
         .map(|i| {
             let (repo, version) = REPOS[i % REPOS.len()];
-            let short = repo.split('/').last().unwrap_or("lib");
+            let short = repo.split('/').next_back().unwrap_or("lib");
             let a = i + 3;
             let difficulty = 0.25 + (i % 6) as f64 * 0.09; // 0.25 – 0.70
             SweBenchInstance {
@@ -341,10 +341,8 @@ pub fn extract_patch(text: &str) -> Option<String> {
 
     let mut best: Option<(usize, String)> = None;
     let mut consider = |pos: usize, body: String, require_diff: bool| {
-        if !require_diff || is_diff(&body) {
-            if best.as_ref().map_or(true, |(p, _)| pos > *p) {
-                best = Some((pos, body));
-            }
+        if (!require_diff || is_diff(&body)) && best.as_ref().is_none_or(|(p, _)| pos > *p) {
+            best = Some((pos, body));
         }
     };
 
@@ -1251,7 +1249,7 @@ impl<E: SweBenchEnvironment> SweBenchRunner<E> {
             .expect("p_patch clamped to [0,1]")
             .sample(&mut self.rng);
 
-        let short = inst.repo.split('/').last().unwrap_or("lib");
+        let short = inst.repo.split('/').next_back().unwrap_or("lib");
         let patch_block = if emit_patch {
             format!(
                 "\n\n[PATCH]\n\
@@ -1337,7 +1335,7 @@ fn turn_patch_ramp(turn: u32, max_turns: u32) -> f64 {
 /// Early turns are exploration-heavy (git diff, file reads, grep).
 /// Mid turns shift to writes. Late turns focus on test verification.
 fn build_tool_block(n_tools: usize, turn: u32, max_turns: u32, inst: &SweBenchInstance) -> String {
-    let short = inst.repo.split('/').last().unwrap_or("lib");
+    let short = inst.repo.split('/').next_back().unwrap_or("lib");
     let progress = if max_turns > 0 {
         turn as f64 / max_turns as f64
     } else {
@@ -1395,7 +1393,7 @@ pub fn write_swe_bench_csv(path: &Path, results: &[SweBenchResult]) -> Result<()
     let mut wtr = csv::Writer::from_path(path)
         .with_context(|| format!("Cannot create CSV: {}", path.display()))?;
 
-    wtr.write_record(&[
+    wtr.write_record([
         "instance_id",
         "repo",
         "difficulty",
@@ -1417,7 +1415,7 @@ pub fn write_swe_bench_csv(path: &Path, results: &[SweBenchResult]) -> Result<()
             .collect::<Vec<_>>()
             .join(";");
 
-        wtr.write_record(&[
+        wtr.write_record([
             &r.instance_id,
             &r.repo,
             &format!("{:.3}", r.difficulty),
