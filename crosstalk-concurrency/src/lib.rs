@@ -16,6 +16,11 @@ pub use cancel::CancelScope;
 // can route through a single shared type.
 pub use cache::{Cache, CacheConfig};
 
+// CERTAIN: Re-export the execution primitives. AsyncExecutor centralizes
+// runtime construction (SYS-004) and MainThreadHandle enforces thread
+// confinement for GodView work (H-038).
+pub use executor::{AsyncExecutor, MainThreadHandle};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,5 +52,15 @@ mod tests {
         let _cfg = CacheConfig::default();
         let _cache: Cache<u32, u32> = Cache::default();
         assert!(_cfg.capacity > 0);
+    }
+
+    // CERTAIN: Confirms the executor re-exports are part of the public API and
+    // that AsyncExecutor::build() works through the crate root path.
+    #[test]
+    fn async_executor_is_reexported() {
+        let exec = AsyncExecutor::build().expect("build");
+        let _handle: MainThreadHandle<'_> = exec.main_thread_handle();
+        let value = exec.block_on(async { 1 + 1 });
+        assert_eq!(value, 2);
     }
 }
