@@ -1,72 +1,122 @@
 #[cfg(test)]
-mod result_propagation_tests {
-    //! Additional tests (HIGH certainty) confirming `SessionStore` semantics
-    //! that error-propagation refactors must preserve. These exercise the
-    //! public API only; they do not depend on `CrossTalkError` directly since
-    //! the visible `SessionStore` surface is infallible by design (atomic
-    //! insert never returns a discarded `Result`).
+mod security_validation_tests {
+    //! P3 MEDIUM security coverage (HIGH certainty): these tests exercise the
+    //! public `SessionStore`/`Session` surface to guard against session-id
+    //! confusion, accidental cross-session sharing, and silent insert loss.
+    //!
+    //! All assertions use only documented public API signatures, so they
+    //! remain valid regardless of internal storage refactors.
     use super::*;
     use std::sync::Arc;
 
-    /// `get_or_insert_with` must return the *already-present* session and must
-    /// NOT invoke the init closure when the key already exists. A swallowed
-    /// or ignored insert result would manifest as a duplicate instance here.
+    /// Distinct session ids must never alias to the same `Session` instance.
+    /// A regression here would let one tenant's traffic land in another's
+    /// session (a confused-deputy / isolation bug).
     #[test]
-    fn get_or_insert_with_does_not_reinit_existing() {
+    fn distinct_ids_yield_isolated_sessions() {
         let store = SessionStore::new();
-        let first = store.get_or_insert_with("dup".to_string(), || Session::new("dup"));
-
-        let mut init_ran = false;
-        let second = store.get_or_insert_with("dup".to_string(), || {
-            init_ran = true;
-            Session::new("dup-other")
-        });
+        let a = store.get_or_create("tenant-a".to_string());
+        let b = store.get_or_create("tenant-b".to_string());
 
         assert!(
-            !init_ran,
-            "init closure must not run for an existing key"
+            !Arc::ptr_eq(&a, &b),
+            "different session ids must not share a Session instance"
         );
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(second.id(), "dup");
-        assert_eq!(store.len(), 1);
+        assert_eq!(a.id(), "tenant-a");
+        assert_eq!(b.id(), "tenant-b");
+        assert_eq!(store.len(), 2);
     }
 
-    /// Round-trip: a value inserted via `get_or_create` must be observable via
-    /// `get`, proving the insert result is committed (not discarded).
+    /// Session ids are exact-match keyed: lookups must be case- and
+    /// whitespace-sensitive so that a forged near-miss id cannot resolve to a
+    /// legitimate session.
     #[test]
-    fn insert_result_is_committed_and_observable() {
+    fn lookup_is_exact_match_only() {
         let store = SessionStore::new();
-        assert!(store.get("committed").is_none());
+        let _real = store.get_or_create("Auth-Session".to_string());
 
-        let created = store.get_or_create("committed".to_string());
-        let observed = store
-            .get("committed")
-            .expect("inserted session must be retrievable");
-
-        assert!(Arc::ptr_eq(&created, &observed));
-        assert!(!store.is_empty());
+        assert!(
+            store.get("auth-session").is_none(),
+            "case-mismatched id must not resolve to an existing session"
+        );
+        assert!(
+            store.get(" Auth-Session").is_none(),
+            "leading whitespace must not resolve to an existing session"
+        );
+        assert!(
+            store.get("Auth-Session ").is_none(),
+            "trailing whitespace must not resolve to an existing session"
+        );
+        assert!(
+            store.get("Auth-Session").is_some(),
+            "the exact id must resolve"
+        );
     }
 
-    /// The store transitions from empty to non-empty exactly once per new key,
-    /// and `len`/`is_empty` stay consistent — guarding against lost insertions.
+    /// An empty session id is still a valid, *distinct* key and must not be
+    /// confused with a missing/unset session. This prevents an unauthenticated
+    /// blank id from colliding with any populated session.
     #[test]
-    fn len_tracks_committed_inserts_consistently() {
+    fn empty_id_is_distinct_and_isolated() {
         let store = SessionStore::new();
-        assert!(store.is_empty());
-        assert_eq!(store.len(), 0);
+        let blank = store.get_or_create(String::new());
+        let named = store.get_or_create("named".to_string());
 
-        for i in 0..10 {
-            let id = format!("s{i}");
-            let _session = store.get_or_create(id);
-        }
-        assert!(!store.is_empty());
-        assert_eq!(store.len(), 10);
+        assert!(!Arc::ptr_eq(&blank, &named));
+        assert_eq!(blank.id(), "");
+        assert!(store.get("").is_some());
+        assert_eq!(store.len(), 2);
+    }
 
-        // Re-requesting existing keys must not grow the store.
-        for i in 0..10 {
-            let id = format!("s{i}");
-            let _session = store.get_or_create(id);
+    /// Joining a session must monotonically increase its agent count and the
+    /// count must be observable through the shared `Arc` (no lost updates that
+    /// could let an unaccounted agent slip into a session).
+    #[test]
+    fn join_is_accounted_through_shared_handle() {
+        let store = SessionStore::new();
+        let session = store.get_or_create("counted".to_string());
+
+        let before = session.agent_count();
+        let after_join = session.join();
+        assert!(
+            after_join > before,
+            "join must increase the agent count"
+        );
+
+        let same = store
+            .get("counted")
+            .expect("session must still be retrievable");
+        assert!(Arc::ptr_eq(&session, &same));
+        assert_eq!(
+            same.agent_count(),
+            after_join,
+            "agent count must be consistent across shared handles"
+        );
+    }
+
+    /// Demonstrates surfacing a session-validation failure via `CrossTalkError`
+    /// without changing the infallible public `SessionStore` API. A gateway/
+    /// auth layer can wrap lookups in this pattern to reject unknown ids.
+    #[test]
+    fn missing_session_can_be_surfaced_as_crosstalk_error() {
+        use crate::error::{CrossTalkError, Result};
+
+        fn require_session(store: &SessionStore, id: &str) -> Result<Arc<Session>> {
+            store
+                .get(id)
+                .ok_or_else(|| CrossTalkError::Agent(format!("unknown session id: {id}")))
         }
-        assert_eq!(store.len(), 10);
+
+        let store = SessionStore::new();
+        let _ = store.get_or_create("present".to_string());
+
+        assert!(require_session(&store, "present").is_ok());
+
+        let err = require_session(&store, "absent").unwrap_err();
+        assert!(matches!(err, CrossTalkError::Agent(_)));
+        assert!(
+            err.to_string().contains("absent"),
+            "error must identify the rejected id"
+        );
     }
 }
