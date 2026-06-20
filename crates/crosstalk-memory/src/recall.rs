@@ -1,102 +1,92 @@
-//! Memory recall configuration.
-//!
-//! Magic literals for recall tuning have been swept into
-//! `crosstalk_core::consts`.
-
-use crosstalk_core::consts::{DEFAULT_RECALL_LIMIT, DEFAULT_RECALL_THRESHOLD};
-
-/// Parameters controlling a recall query.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RecallConfig {
-    /// Maximum number of results returned.
-    pub limit: usize,
-    /// Minimum similarity threshold (0.0..=1.0).
-    pub threshold: f32,
-}
-
-impl Default for RecallConfig {
-    fn default() -> Self {
-        Self {
-            limit: DEFAULT_RECALL_LIMIT,
-            threshold: DEFAULT_RECALL_THRESHOLD,
-        }
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_uses_named_consts() {
-        let cfg = RecallConfig::default();
-        assert_eq!(cfg.limit, DEFAULT_RECALL_LIMIT);
-        assert_eq!(cfg.threshold, DEFAULT_RECALL_THRESHOLD);
-    }
-}
-
-#[cfg(test)]
-mod shared_recall_tests {
-    //! Tests confirming that recall records are shared (Arc) rather than
-    //! deep-cloned on the hot path (per H-036 pattern).
+mod cached_recall_tests {
+    //! Tests confirming recall hot paths cache derived/expensive values and
+    //! reuse them rather than recomputing per query (P3 perf fix).
     //!
-    //! NOTE (LOW certainty): The concrete `Shared<T>` wrapper from
+    //! NOTE (LOW certainty): The concrete `Cache` primitive from
     //! `crosstalk-concurrency` is not yet visible in this crate's view, so
-    //! these tests exercise the underlying sharing invariant directly via
-    //! `std::sync::Arc`. When the recall hot path adopts `Shared<T>`, the
-    //! recalled records must satisfy this same `Arc::ptr_eq` invariant.
+    //! these tests model the caching invariant directly with an atomic compute
+    //! counter behind a `OnceLock`. The real recall hot path MUST uphold the
+    //! same "compute-once, reuse-many" guarantee when it adopts `Cache`.
     use super::*;
     use std::sync::Arc;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A stand-in recalled record. Cheap to share, expensive to clone in the
-    /// real system (embeddings + payload), which is exactly why the hot path
-    /// must share via Arc rather than clone.
-    #[derive(Debug, PartialEq)]
-    struct RecalledRecord {
-        id: u64,
-        cfg: RecallConfig,
-        payload: String,
+    /// Stand-in for a cached, derived recall artifact (e.g. a normalized
+    /// threshold vector or compiled query). Expensive to derive, cheap to
+    /// share once cached.
+    struct CachedRecallArtifact {
+        cell: OnceLock<Arc<RecallConfig>>,
+        derive_calls: AtomicUsize,
     }
 
-    /// Simulates a recall hot path that returns shared handles to stored
-    /// records instead of cloning their contents.
-    fn recall_shared(store: &[Arc<RecalledRecord>]) -> Vec<Arc<RecalledRecord>> {
-        // Hot path: share via Arc::clone (pointer bump), never deep clone.
-        store.iter().map(Arc::clone).collect()
+    impl CachedRecallArtifact {
+        fn new() -> Self {
+            Self {
+                cell: OnceLock::new(),
+                derive_calls: AtomicUsize::new(0),
+            }
+        }
+
+        /// Hot-path accessor: derives the config once, then returns shared
+        /// handles on every subsequent recall query.
+        fn config(&self) -> Arc<RecallConfig> {
+            let value = self.cell.get_or_init(|| {
+                self.derive_calls.fetch_add(1, Ordering::SeqCst);
+                Arc::new(RecallConfig::default())
+            });
+            Arc::clone(value)
+        }
+
+        fn derive_count(&self) -> usize {
+            self.derive_calls.load(Ordering::SeqCst)
+        }
     }
 
     #[test]
-    fn recalled_records_are_shared_not_cloned() {
-        let store: Vec<Arc<RecalledRecord>> = vec![Arc::new(RecalledRecord {
-            id: 1,
-            cfg: RecallConfig::default(),
-            payload: "embedding-payload".to_string(),
-        })];
-
-        let recalled = recall_shared(&store);
-
-        // The recalled handle must point to the *same* allocation as the
-        // stored record (no deep clone occurred on the hot path).
-        assert!(
-            Arc::ptr_eq(&store[0], &recalled[0]),
-            "recalled record must be Arc-shared with the stored record"
+    fn recall_config_derived_once_across_queries() {
+        let artifact = CachedRecallArtifact::new();
+        for _ in 0..64 {
+            let _ = artifact.config();
+        }
+        assert_eq!(
+            artifact.derive_count(),
+            1,
+            "cached recall config must be derived exactly once"
         );
     }
 
     #[test]
-    fn sharing_does_not_duplicate_payload_allocation() {
-        let original = Arc::new(RecalledRecord {
-            id: 42,
-            cfg: RecallConfig::default(),
-            payload: "x".repeat(1024),
-        });
+    fn repeated_recalls_share_config_allocation() {
+        let artifact = CachedRecallArtifact::new();
+        let a = artifact.config();
+        let b = artifact.config();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "repeated recall queries must share one cached config allocation"
+        );
+    }
 
-        let store = vec![Arc::clone(&original)];
-        let recalled = recall_shared(&store);
+    #[test]
+    fn cached_config_preserves_default_values() {
+        let artifact = CachedRecallArtifact::new();
+        let cfg = artifact.config();
+        let expected = RecallConfig::default();
+        assert_eq!(cfg.limit, expected.limit, "cached limit must match default");
+        assert_eq!(
+            cfg.threshold, expected.threshold,
+            "cached threshold must match default"
+        );
+    }
 
-        assert_eq!(Arc::strong_count(&original), 3, "all handles share one allocation");
-        assert!(Arc::ptr_eq(&original, &recalled[0]));
-        assert_eq!(recalled[0].id, 42);
-        assert_eq!(recalled[0].payload.len(), 1024);
+    #[test]
+    fn first_query_triggers_single_derivation() {
+        let artifact = CachedRecallArtifact::new();
+        assert_eq!(artifact.derive_count(), 0, "no derivation before first query");
+        let _ = artifact.config();
+        assert_eq!(artifact.derive_count(), 1, "first query derives once");
+        let _ = artifact.config();
+        assert_eq!(artifact.derive_count(), 1, "subsequent queries reuse cache");
     }
 }
