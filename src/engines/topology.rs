@@ -6,7 +6,8 @@
 //! outcomes, with a history-weighted preference for topologies that have
 //! produced good outcomes in this session.
 
-use crate::types::conversation::{ConversationState, TurnOutcome};
+use crate::types::compute::BudgetMode;
+use crate::types::conversation::{ConversationState, TaskCategory, TurnOutcome};
 use crate::types::intelligence::RunningAverage;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -147,8 +148,18 @@ pub struct TopologyManager {
     pub history: Vec<(u32, DebateTopology, TopologyReason)>,
     /// Consecutive turns without meaningful progress.
     pub deadlock_counter: u32,
-    /// Per-topology rolling quality averages used for informed selection.
-    pub topology_scores: FxHashMap<DebateTopology, RunningAverage>,
+    /// Per-(topology, category) rolling quality averages used for UCB1 selection.
+    pub topology_scores: FxHashMap<(DebateTopology, TaskCategory), RunningAverage>,
+    /// Per-(topology, category) rolling cost averages in USD.
+    topology_cost_scores: FxHashMap<(DebateTopology, TaskCategory), RunningAverage>,
+    /// Per-(topology, category) rolling latency averages in milliseconds.
+    topology_latency_scores: FxHashMap<(DebateTopology, TaskCategory), RunningAverage>,
+    /// Global running average of cost across all topologies (used for ratio normalization).
+    global_mean_cost: RunningAverage,
+    /// Global running average of latency in ms across all topologies (used for ratio normalization).
+    global_mean_latency: RunningAverage,
+    /// Total turns recorded across all topologies and categories (UCB1 denominator).
+    total_topology_turns: u32,
     /// Number of active agents (updated by caller when the pool changes).
     agent_count: usize,
     /// Recent per-turn quality scores for trend detection (capped at 8).
@@ -167,6 +178,11 @@ impl TopologyManager {
             history: Vec::new(),
             deadlock_counter: 0,
             topology_scores: FxHashMap::default(),
+            topology_cost_scores: FxHashMap::default(),
+            topology_latency_scores: FxHashMap::default(),
+            global_mean_cost: RunningAverage::default(),
+            global_mean_latency: RunningAverage::default(),
+            total_topology_turns: 0,
             agent_count,
             recent_quality: std::collections::VecDeque::with_capacity(8),
             recent_outcomes: std::collections::VecDeque::with_capacity(8),
@@ -196,13 +212,18 @@ impl TopologyManager {
 
     /// Record the outcome of a completed turn, updating deadlock tracking
     /// and topology quality scores.
-    pub fn record_turn_outcome(&mut self, outcome: TurnOutcome, quality_score: f64) {
+    pub fn record_turn_outcome(
+        &mut self,
+        outcome: TurnOutcome,
+        quality_score: f64,
+        task_category: TaskCategory,
+        cost_usd: f64,
+        latency_ms: u64,
+    ) {
         // Deadlock counter
         let made_progress = matches!(
             outcome,
-            TurnOutcome::Compiled
-                | TurnOutcome::TestsPassed
-                | TurnOutcome::AdvancedConvergence
+            TurnOutcome::Compiled | TurnOutcome::TestsPassed | TurnOutcome::AdvancedConvergence
         );
         if made_progress {
             self.deadlock_counter = 0;
@@ -210,11 +231,25 @@ impl TopologyManager {
             self.deadlock_counter += 1;
         }
 
-        // Rolling quality for the current topology
+        // Rolling quality keyed by (topology, category) for UCB1
         self.topology_scores
-            .entry(self.current)
+            .entry((self.current, task_category))
             .or_default()
             .update(quality_score);
+
+        // Rolling cost and latency for efficiency scoring
+        self.topology_cost_scores
+            .entry((self.current, task_category))
+            .or_default()
+            .update(cost_usd);
+        self.topology_latency_scores
+            .entry((self.current, task_category))
+            .or_default()
+            .update(latency_ms as f64);
+        self.global_mean_cost.update(cost_usd);
+        self.global_mean_latency.update(latency_ms as f64);
+
+        self.total_topology_turns += 1;
 
         // Recent windows
         self.recent_quality.push_back(quality_score);
@@ -233,7 +268,11 @@ impl TopologyManager {
     ///
     /// This does NOT mutate state — it only advises.  Call `shift_to` to
     /// commit the recommendation.
-    pub fn recommend_topology(&self, sigma: &ConversationState) -> DebateTopology {
+    pub fn recommend_topology(
+        &self,
+        sigma: &ConversationState,
+        task_category: TaskCategory,
+    ) -> DebateTopology {
         let n_agents = self.agent_count;
 
         // --- Hard deadlock escalation ladder ---
@@ -250,13 +289,8 @@ impl TopologyManager {
 
         // --- Three consecutive Stalled turns → TreeOfThoughts ---
         if self.recent_outcomes.len() >= 3 {
-            let last3: Vec<TurnOutcome> = self
-                .recent_outcomes
-                .iter()
-                .rev()
-                .take(3)
-                .copied()
-                .collect();
+            let last3: Vec<TurnOutcome> =
+                self.recent_outcomes.iter().rev().take(3).copied().collect();
             if last3.iter().all(|o| *o == TurnOutcome::Stalled) {
                 return DebateTopology::TreeOfThoughts;
             }
@@ -271,21 +305,54 @@ impl TopologyManager {
             };
         }
 
+        // --- UCB1: primary signal when sufficient data exists ---
+        const ALL_TOPOLOGIES: &[DebateTopology] = &[
+            DebateTopology::RoundRobin,
+            DebateTopology::Adversarial,
+            DebateTopology::Ensemble,
+            DebateTopology::TreeOfThoughts,
+            DebateTopology::Mediated,
+            DebateTopology::Critique,
+        ];
+        let sufficient_data = ALL_TOPOLOGIES.iter().all(|t| {
+            self.topology_scores
+                .get(&(*t, task_category))
+                .map(|a| a.count >= 5)
+                .unwrap_or(false)
+        });
+        if sufficient_data {
+            let bm = sigma.budget.mode();
+            if let Some(ucb_winner) = ALL_TOPOLOGIES
+                .iter()
+                .filter(|t| self.agent_count >= t.minimum_agents())
+                .max_by(|a, b| {
+                    self.ucb1_score(**a, task_category, bm)
+                        .partial_cmp(&self.ucb1_score(**b, task_category, bm))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .copied()
+            {
+                let current_ucb = self.ucb1_score(self.current, task_category, bm);
+                let winner_ucb = self.ucb1_score(ucb_winner, task_category, bm);
+                if ucb_winner != self.current && winner_ucb - current_ucb > 0.1 {
+                    return ucb_winner;
+                }
+            }
+        }
+
         // --- If quality is improving, stay the course ---
         if self.quality_is_improving() {
             return self.current;
         }
 
         // --- Quality drop: prefer historically best topology ---
-        let best = self.best_historical_topology();
+        let best = self.best_historical_topology(task_category);
 
-        // Cross-check with session completion probability: if the session is
-        // far from complete and quality is dropping, escalate to Ensemble for
-        // breadth, otherwise Critique for depth.
         if let Some(candidate) = best
-            && candidate != self.current {
-                return candidate;
-            }
+            && candidate != self.current
+        {
+            return candidate;
+        }
 
         // Fall back based on completion probability signal from sigma.
         if sigma.completion_probability < 0.3 {
@@ -320,11 +387,12 @@ impl TopologyManager {
         &mut self,
         sigma: &ConversationState,
         turn_idx: u32,
+        task_category: TaskCategory,
     ) -> Option<TopologyDirective> {
         if turn_idx.saturating_sub(self.last_shift_turn) < MIN_TURNS_BETWEEN_SHIFTS {
             return None;
         }
-        let recommended = self.recommend_topology(sigma);
+        let recommended = self.recommend_topology(sigma, task_category);
         if recommended == self.current {
             return None;
         }
@@ -354,7 +422,14 @@ impl TopologyManager {
         ];
 
         (0..n_branches.min(directives.len()))
-            .map(|i| format!("<context>\n{}\n</context>\n\n[THOUGHT BRANCH {}]\n{}", base_prompt, i + 1, directives[i]))
+            .map(|i| {
+                format!(
+                    "<context>\n{}\n</context>\n\n[THOUGHT BRANCH {}]\n{}",
+                    base_prompt,
+                    i + 1,
+                    directives[i]
+                )
+            })
             .collect()
     }
 
@@ -497,28 +572,121 @@ impl TopologyManager {
             return false;
         }
         let half = self.recent_quality.len() / 2;
-        let early: f64 =
-            self.recent_quality.iter().take(half).sum::<f64>() / half as f64;
-        let late: f64 =
-            self.recent_quality.iter().rev().take(half).sum::<f64>() / half as f64;
+        let half = half.max(1);
+        let early: f64 = self.recent_quality.iter().take(half).sum::<f64>() / half as f64;
+        let late: f64 = self.recent_quality.iter().rev().take(half).sum::<f64>() / half as f64;
         late > early + QUALITY_TREND_THRESHOLD
     }
 
     /// Return the topology with the highest historical mean quality score,
     /// excluding topologies for which we have fewer than 3 observations or
     /// that require more agents than currently available.
-    fn best_historical_topology(&self) -> Option<DebateTopology> {
+    fn best_historical_topology(&self, task_category: TaskCategory) -> Option<DebateTopology> {
         self.topology_scores
             .iter()
-            .filter(|(topo, avg)| {
-                avg.count >= MIN_TOPOLOGY_OBSERVATIONS && self.agent_count >= topo.minimum_agents()
+            .filter(|((topo, cat), avg)| {
+                *cat == task_category
+                    && avg.count >= MIN_TOPOLOGY_OBSERVATIONS
+                    && self.agent_count >= topo.minimum_agents()
             })
             .max_by(|(_, a), (_, b)| {
                 a.mean
                     .partial_cmp(&b.mean)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map(|(topo, _)| *topo)
+            .map(|((topo, _), _)| *topo)
+    }
+
+    /// Raw efficiency ratio for a (topology, category) pair without the UCB1 exploration bonus.
+    /// Returns `None` when no quality data exists.
+    fn raw_efficiency(
+        &self,
+        topology: DebateTopology,
+        task_category: TaskCategory,
+        alpha: f64,
+        beta: f64,
+    ) -> Option<f64> {
+        const EPSILON_COST: f64 = 1e-6;
+        const EPSILON_LATENCY: f64 = 50.0;
+        const EPSILON_FLOOR: f64 = 1e-4;
+
+        let quality_avg = self.topology_scores.get(&(topology, task_category))?;
+        if quality_avg.count == 0 {
+            return None;
+        }
+        let mean_cost = self
+            .topology_cost_scores
+            .get(&(topology, task_category))
+            .map(|a| a.mean)
+            .unwrap_or(0.0);
+        let mean_latency = self
+            .topology_latency_scores
+            .get(&(topology, task_category))
+            .map(|a| a.mean)
+            .unwrap_or(0.0);
+        let global_cost = self.global_mean_cost.mean.max(EPSILON_COST);
+        let global_latency = self.global_mean_latency.mean.max(EPSILON_LATENCY);
+        let norm_cost = (mean_cost + EPSILON_COST) / global_cost;
+        let norm_latency = (mean_latency + EPSILON_LATENCY) / global_latency;
+        Some(quality_avg.mean / (alpha * norm_cost + beta * norm_latency + EPSILON_FLOOR))
+    }
+
+    /// Efficiency-weighted UCB1 score for a (topology, category) pair.
+    ///
+    /// Efficiency = quality / (α·norm_cost + β·norm_latency + ε_floor).
+    /// Both cost and latency are ratio-normalized against their global running
+    /// averages so the two dimensions stay dimensionless and comparably scaled.
+    /// The UCB1 exploration bonus is scaled by the global mean raw efficiency
+    /// so it stays proportional when the efficiency range is large.
+    /// Returns `f64::MAX` (force explore) when no data exists for the pair.
+    fn ucb1_score(
+        &self,
+        topology: DebateTopology,
+        task_category: TaskCategory,
+        budget_mode: BudgetMode,
+    ) -> f64 {
+        let (alpha, beta) = match budget_mode {
+            BudgetMode::Normal => (0.3, 0.2),
+            BudgetMode::CostReduction => (0.7, 0.3),
+            BudgetMode::Emergency => (1.5, 0.5),
+        };
+
+        let quality_avg = match self.topology_scores.get(&(topology, task_category)) {
+            None => return f64::MAX,
+            Some(a) if a.count == 0 => return f64::MAX,
+            Some(a) => a,
+        };
+
+        let efficiency = match self.raw_efficiency(topology, task_category, alpha, beta) {
+            Some(e) => e,
+            None => return f64::MAX,
+        };
+
+        let n = quality_avg.count as f64;
+        if n == 0.0 {
+            return f64::MAX;
+        }
+        let total = self.total_topology_turns.max(1) as f64;
+        let exploration = (2.0 * total.ln() / n).sqrt();
+        let global_mean_eff = self.global_mean_efficiency(alpha, beta);
+
+        efficiency + global_mean_eff * exploration
+    }
+
+    /// Mean raw efficiency across all topology/category pairs that have observations.
+    /// Used to scale the UCB1 exploration bonus. Falls back to 1.0 when no data exists.
+    /// Does NOT call `ucb1_score` to avoid mutual recursion.
+    fn global_mean_efficiency(&self, alpha: f64, beta: f64) -> f64 {
+        let scores: Vec<f64> = self
+            .topology_scores
+            .keys()
+            .filter_map(|key| self.raw_efficiency(key.0, key.1, alpha, beta))
+            .collect();
+        if scores.is_empty() {
+            1.0
+        } else {
+            scores.iter().sum::<f64>() / scores.len() as f64
+        }
     }
 
     /// Select the best topology when the agent count is below 3.
@@ -526,6 +694,29 @@ impl TopologyManager {
         match count {
             0 | 1 => DebateTopology::TreeOfThoughts,
             _ => DebateTopology::Adversarial,
+        }
+    }
+
+    /// Serialize per-topology quality scores to JSON for cross-session persistence.
+    pub fn export_scores_json(&self) -> String {
+        let scores: Vec<((DebateTopology, TaskCategory), RunningAverage)> = self
+            .topology_scores
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        serde_json::to_string(&scores).unwrap_or_default()
+    }
+
+    /// Merge topology scores from a prior session's JSON into the current map.
+    ///
+    /// Uses `entry().or_insert()` so current-session scores always win.
+    pub fn import_scores_json(&mut self, json: &str) {
+        if let Ok(scores) =
+            serde_json::from_str::<Vec<((DebateTopology, TaskCategory), RunningAverage)>>(json)
+        {
+            for (key, avg) in scores {
+                self.topology_scores.entry(key).or_insert(avg);
+            }
         }
     }
 
@@ -564,7 +755,7 @@ impl Default for TopologyManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::conversation::ConversationState;
+    use crate::types::conversation::{ConversationState, TaskCategory};
 
     fn make_state() -> ConversationState {
         ConversationState::new("test-session")
@@ -575,11 +766,17 @@ mod tests {
         let mut mgr = TopologyManager::new(4);
         // Pump 5 non-progress outcomes
         for _ in 0..5 {
-            mgr.record_turn_outcome(TurnOutcome::Stalled, 0.2);
+            mgr.record_turn_outcome(
+                TurnOutcome::Stalled,
+                0.2,
+                TaskCategory::Research,
+                0.01,
+                1000,
+            );
         }
         let sigma = make_state();
         assert_eq!(
-            mgr.recommend_topology(&sigma),
+            mgr.recommend_topology(&sigma, TaskCategory::Research),
             DebateTopology::Critique,
             "5 stalls from RoundRobin should recommend Critique"
         );
@@ -589,11 +786,17 @@ mod tests {
     fn deadlock_escalation_to_mediated() {
         let mut mgr = TopologyManager::new(4);
         for _ in 0..8 {
-            mgr.record_turn_outcome(TurnOutcome::Stalled, 0.1);
+            mgr.record_turn_outcome(
+                TurnOutcome::Stalled,
+                0.1,
+                TaskCategory::Research,
+                0.01,
+                1000,
+            );
         }
         let sigma = make_state();
         assert_eq!(
-            mgr.recommend_topology(&sigma),
+            mgr.recommend_topology(&sigma, TaskCategory::Research),
             DebateTopology::Mediated,
             "8 stalls should recommend Mediated"
         );
@@ -603,14 +806,44 @@ mod tests {
     fn three_consecutive_stalls_trigger_tree_of_thoughts() {
         let mut mgr = TopologyManager::new(4);
         // Two non-stall turns first to avoid the deadlock counter firing
-        mgr.record_turn_outcome(TurnOutcome::Compiled, 0.8);
-        mgr.record_turn_outcome(TurnOutcome::Compiled, 0.8);
-        mgr.record_turn_outcome(TurnOutcome::Stalled, 0.2);
-        mgr.record_turn_outcome(TurnOutcome::Stalled, 0.2);
-        mgr.record_turn_outcome(TurnOutcome::Stalled, 0.2);
+        mgr.record_turn_outcome(
+            TurnOutcome::Compiled,
+            0.8,
+            TaskCategory::Research,
+            0.01,
+            1000,
+        );
+        mgr.record_turn_outcome(
+            TurnOutcome::Compiled,
+            0.8,
+            TaskCategory::Research,
+            0.01,
+            1000,
+        );
+        mgr.record_turn_outcome(
+            TurnOutcome::Stalled,
+            0.2,
+            TaskCategory::Research,
+            0.01,
+            1000,
+        );
+        mgr.record_turn_outcome(
+            TurnOutcome::Stalled,
+            0.2,
+            TaskCategory::Research,
+            0.01,
+            1000,
+        );
+        mgr.record_turn_outcome(
+            TurnOutcome::Stalled,
+            0.2,
+            TaskCategory::Research,
+            0.01,
+            1000,
+        );
         let sigma = make_state();
         assert_eq!(
-            mgr.recommend_topology(&sigma),
+            mgr.recommend_topology(&sigma, TaskCategory::Research),
             DebateTopology::TreeOfThoughts
         );
     }
@@ -619,7 +852,7 @@ mod tests {
     fn small_agent_count_forces_adversarial() {
         let mgr = TopologyManager::new(2);
         let sigma = make_state();
-        let rec = mgr.recommend_topology(&sigma);
+        let rec = mgr.recommend_topology(&sigma, TaskCategory::Research);
         assert!(
             rec == DebateTopology::Adversarial || rec == DebateTopology::Critique,
             "2 agents should not recommend Ensemble"
@@ -631,11 +864,17 @@ mod tests {
         let mut mgr = TopologyManager::new(4);
         // Feed improving scores
         for q in [0.4f64, 0.5, 0.6, 0.7, 0.8] {
-            mgr.record_turn_outcome(TurnOutcome::AdvancedConvergence, q);
+            mgr.record_turn_outcome(
+                TurnOutcome::AdvancedConvergence,
+                q,
+                TaskCategory::Research,
+                0.01,
+                1000,
+            );
         }
         let sigma = make_state();
         assert_eq!(
-            mgr.recommend_topology(&sigma),
+            mgr.recommend_topology(&sigma, TaskCategory::Research),
             DebateTopology::RoundRobin,
             "improving quality should keep current topology"
         );
@@ -649,7 +888,10 @@ mod tests {
         assert_eq!(mgr.current, DebateTopology::Ensemble);
         assert_eq!(mgr.deadlock_counter, 0);
         assert_eq!(mgr.history.len(), 1);
-        assert_eq!(mgr.history[0], (10, DebateTopology::Ensemble, TopologyReason::ManualOverride));
+        assert_eq!(
+            mgr.history[0],
+            (10, DebateTopology::Ensemble, TopologyReason::ManualOverride)
+        );
         assert_eq!(directive.topology, DebateTopology::Ensemble);
     }
 
@@ -685,7 +927,10 @@ mod tests {
         let mut mgr = TopologyManager::new(4);
         mgr.current = DebateTopology::Ensemble; // requires >= 3
         let directive = mgr.set_agent_count(2, 5);
-        assert!(directive.is_some(), "dropping to 2 agents should trigger shift");
+        assert!(
+            directive.is_some(),
+            "dropping to 2 agents should trigger shift"
+        );
         let d = directive.unwrap();
         assert_ne!(
             d.topology,
@@ -707,8 +952,11 @@ mod tests {
     #[test]
     fn adversarial_directive_uses_pairs() {
         let mut mgr = TopologyManager::new(4);
-        let directive =
-            mgr.shift_to(DebateTopology::Adversarial, 1, TopologyReason::ManualOverride);
+        let directive = mgr.shift_to(
+            DebateTopology::Adversarial,
+            1,
+            TopologyReason::ManualOverride,
+        );
         assert!(
             matches!(directive.agent_grouping, AgentGrouping::Pairs(_)),
             "Adversarial should yield Pairs grouping"

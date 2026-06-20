@@ -9,8 +9,8 @@ fn invalid_wasm_bytes() -> Vec<u8> {
     vec![0xFF, 0xFF, 0xFF, 0xFF]
 }
 
-#[test]
-fn test_sandbox_fuel_limit() {
+#[tokio::test]
+async fn test_sandbox_fuel_limit() {
     let config = SandboxConfig {
         memory_limit_bytes: 1024 * 1024,
         cpu_fuel_limit: 100,
@@ -29,8 +29,8 @@ fn test_sandbox_fuel_limit() {
     );
 }
 
-#[test]
-fn test_sandbox_memory_limit() {
+#[tokio::test]
+async fn test_sandbox_memory_limit() {
     let config = SandboxConfig {
         memory_limit_bytes: 1024,
         cpu_fuel_limit: 10_000_000,
@@ -46,8 +46,8 @@ fn test_sandbox_memory_limit() {
     assert!(result.is_err(), "Invalid WASM should fail");
 }
 
-#[test]
-fn test_sandbox_stdout_capture() {
+#[tokio::test]
+async fn test_sandbox_stdout_capture() {
     let config = SandboxConfig {
         memory_limit_bytes: 1024 * 1024,
         cpu_fuel_limit: 10_000_000,
@@ -330,8 +330,8 @@ fn diff_nodes_identical_versions_has_no_changes() {
 
 // ── SandboxManager with valid WASM ──────────────────────────────────────────
 
-#[test]
-fn execute_returns_error_on_invalid_wasm() {
+#[tokio::test]
+async fn execute_returns_error_on_invalid_wasm() {
     let config = SandboxConfig {
         memory_limit_bytes: 1024 * 1024,
         cpu_fuel_limit: 10_000_000,

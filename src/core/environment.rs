@@ -1,13 +1,14 @@
-use anyhow::Result;
 use crate::types::mcp::McpTool;
+use anyhow::Result;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
-use serde_json::json;
 
 fn is_valid_nix_dep_name(s: &str) -> bool {
-    s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    s.chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
 pub struct NixManager {
@@ -28,11 +29,14 @@ impl NixManager {
     }
 
     pub fn generate_flake_static(dependencies: &[String]) -> String {
-        let deps = dependencies.iter()
+        let deps = dependencies
+            .iter()
             .filter(|d| is_valid_nix_dep_name(d))
             .map(|d| format!("pkgs.{d}"))
-            .collect::<Vec<_>>().join(" ");
-        format!(r#"{{
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            r#"{{
   description = "Crosstalk Generated Environment";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   outputs = {{ self, nixpkgs }}: let
@@ -43,7 +47,8 @@ impl NixManager {
       buildInputs = [ {deps} ];
     }};
   }};
-}}"#)
+}}"#
+        )
     }
 
     pub fn generate_flake(&self) -> Result<String> {
@@ -105,7 +110,10 @@ impl NixManager {
         if let Err(e) = std::fs::create_dir_all(&self.cache_dir) {
             tracing::warn!("Failed to create cache dir {:?}: {e}", self.cache_dir);
         }
-        if let Err(e) = std::fs::write(&cache_path, serde_json::to_string(&cache_entry).unwrap_or_default()) {
+        if let Err(e) = std::fs::write(
+            &cache_path,
+            serde_json::to_string(&cache_entry).unwrap_or_default(),
+        ) {
             tracing::warn!("Failed to write cache file {:?}: {e}", cache_path);
         }
 
@@ -152,13 +160,14 @@ impl NixManager {
     }
 }
 
-
 pub struct ToolDiscovery;
 
 impl ToolDiscovery {
     pub fn scan() -> Vec<McpTool> {
         let mut tools = Vec::new();
-        let known_bins = ["cargo", "rustc", "git", "rustfmt", "python3", "python", "node", "go"];
+        let known_bins = [
+            "cargo", "rustc", "git", "rustfmt", "python3", "python", "node", "go",
+        ];
 
         for bin in known_bins {
             if which::which(bin).is_ok() {

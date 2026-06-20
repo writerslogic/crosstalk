@@ -233,3 +233,14 @@ pub struct HandoffPackage {
     pub recommended_next_action: String,
     pub context_snapshot: String,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SessionLesson {
+    pub task_summary: String,
+    pub topology_sequence: Vec<String>,
+    pub final_outcome: String,
+    pub winning_model: String,
+    pub quality_trajectory: Vec<f64>,
+    pub turn_count: u32,
+    pub timestamp: u64,
+}

@@ -63,11 +63,11 @@ impl BudgetLedger {
 
     #[must_use]
     pub fn mode(&self) -> BudgetMode {
-        let pct = if self.session_budget > f64::EPSILON {
-            self.remaining() / self.session_budget
-        } else {
-            0.0
-        };
+        // session_budget == 0.0 means "no limit configured" — treat as Normal.
+        if self.session_budget <= f64::EPSILON {
+            return BudgetMode::Normal;
+        }
+        let pct = self.remaining() / self.session_budget;
         if pct < 0.05 {
             BudgetMode::Emergency
         } else if pct < 0.20 {

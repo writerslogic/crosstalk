@@ -11,14 +11,24 @@ use ratatui::{
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
+    // Minimum 19 rows needed for the 5-row layout (3+8+3+4+1)
+    if area.height < 19 || area.width < 40 {
+        let msg = format!(
+            "Terminal too small: {}x{}  (need 40x19+)",
+            area.width, area.height
+        );
+        frame.render_widget(Paragraph::new(msg).wrap(Wrap { trim: false }), area);
+        return;
+    }
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // σ State + μ Agents
-            Constraint::Min(8),     // Ghost Stream + right panel
-            Constraint::Length(3),  // Convergence + Certainty gauges
+            Constraint::Length(3), // σ State + μ Agents
+            Constraint::Min(8),    // Ghost Stream + right panel
+            Constraint::Length(3), // Convergence + Certainty gauges
             Constraint::Length(area.height.saturating_sub(15).clamp(4, 10)), // Δα Events
-            Constraint::Length(1),  // Status bar
+            Constraint::Length(1), // Status bar
         ])
         .split(area);
 
@@ -90,10 +100,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let inner_width = ghost_area.width.saturating_sub(2).max(1) as usize;
     let sanitized = &app.streaming_buffer;
     let scroll_y = if app.ghost_auto_scroll {
-        let wrapped_lines: usize = sanitized.split('\n')
+        let wrapped_lines: usize = sanitized
+            .split('\n')
             .map(|line| {
                 let chars = line.chars().count();
-                if chars == 0 { 1 } else { chars.div_ceil(inner_width) }
+                if chars == 0 {
+                    1
+                } else {
+                    chars.div_ceil(inner_width)
+                }
             })
             .sum();
         wrapped_lines.saturating_sub(inner_height)

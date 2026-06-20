@@ -1,13 +1,10 @@
-use std::collections::VecDeque;
 use crate::types::conversation::{ConversationState, Turn, TurnOutcome};
 pub use crate::types::memory::OutcomeRecord;
 use crate::types::memory::{
     DeletionLogEntry, Lesson, MemoryRecord, MemoryStoreStats, SnapshotBundle, SnapshotMetadata,
 };
 use anyhow::{Context, Result, anyhow};
-use arrow_array::{
-    RecordBatch, RecordBatchIterator, StringArray, UInt32Array, cast::AsArray,
-};
+use arrow_array::{RecordBatch, RecordBatchIterator, StringArray, UInt32Array, cast::AsArray};
 use arrow_schema::{DataType, Field, Schema};
 use futures::StreamExt;
 use lancedb::{
@@ -17,6 +14,7 @@ use lancedb::{
     table::Table,
 };
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 #[cfg(feature = "ort-embeddings")]
@@ -41,23 +39,26 @@ static EMBEDDER: OnceLock<Option<TextEmbedding>> = OnceLock::new();
 
 #[cfg(feature = "ort-embeddings")]
 pub fn get_embedder() -> Option<&'static TextEmbedding> {
-    EMBEDDER.get_or_init(|| {
-        let options = InitOptions {
-            execution_providers: vec![
-                ExecutionProviderDispatch::from(CoreMLExecutionProvider::default()),
-                ExecutionProviderDispatch::from(CPUExecutionProvider::default()),
-            ],
-            ..Default::default()
-        };
-        TextEmbedding::try_new(options).ok()
-    }).as_ref()
+    EMBEDDER
+        .get_or_init(|| {
+            let options = InitOptions {
+                execution_providers: vec![
+                    ExecutionProviderDispatch::from(CoreMLExecutionProvider::default()),
+                    ExecutionProviderDispatch::from(CPUExecutionProvider::default()),
+                ],
+                ..Default::default()
+            };
+            TextEmbedding::try_new(options).ok()
+        })
+        .as_ref()
 }
 
 /// Maximum entries in the embedding LRU cache.
 const EMBED_CACHE_MAX: usize = 256;
 
-/// Thread-safe LRU embedding cache keyed by content hash.
-static EMBED_CACHE: std::sync::LazyLock<std::sync::Mutex<VecDeque<(u64, Vec<f32>)>>> =
+type EmbedCache = std::sync::Mutex<VecDeque<(u64, Vec<f32>)>>;
+
+static EMBED_CACHE: std::sync::LazyLock<EmbedCache> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(VecDeque::new()));
 
 fn embed_cache_key(text: &str) -> u64 {
@@ -154,7 +155,13 @@ impl MemoryBridge {
         }
     }
 
-    pub async fn recall_relevant(&mut self, sid: &str, query: &str, k: usize, idx: u32) -> Result<Vec<MemoryRecord>> {
+    pub async fn recall_relevant(
+        &mut self,
+        sid: &str,
+        query: &str,
+        k: usize,
+        idx: u32,
+    ) -> Result<Vec<MemoryRecord>> {
         // Rate-limit: at most one recall per (session, turn_idx)
         let key = (sid.to_string(), idx);
         if !self.recalled_turns.insert(key) {
@@ -175,7 +182,10 @@ impl MemoryBridge {
                     let sim = local_cosine_similarity(&query_emb, &r.embedding);
                     let age_hours = (now.saturating_sub(r.timestamp)) as f64 / 3600.0;
                     let decay = (-0.01 * age_hours).exp() as f32;
-                    let outcome_boost = r.outcome.as_ref().map_or(0.0, |o| if o.tests_passed { 0.2 } else { 0.0 });
+                    let outcome_boost = r
+                        .outcome
+                        .as_ref()
+                        .map_or(0.0, |o| if o.tests_passed { 0.2 } else { 0.0 });
                     (sim * decay + outcome_boost, r)
                 })
                 .collect();
@@ -187,7 +197,11 @@ impl MemoryBridge {
         if let Some(store) = &self.store {
             let mut results = store.query_hybrid(DEFAULT_TABLE, query, k).await?;
             results.retain(|(r, _)| r.session_id == sid && r.turn_id < idx);
-            return Ok(results.into_iter().filter(|(r, _)| !r.is_negative).map(|(r, _)| r).collect());
+            return Ok(results
+                .into_iter()
+                .filter(|(r, _)| !r.is_negative)
+                .map(|(r, _)| r)
+                .collect());
         }
 
         Ok(vec![])
@@ -195,7 +209,13 @@ impl MemoryBridge {
 
     /// Return a string summary of recalled records (used by orchestrator).
     /// Also registers which turn received memory injection for feedback tracking.
-    pub async fn recall_relevant_summary(&mut self, sid: &str, query: &str, k: usize, idx: u32) -> Result<String> {
+    pub async fn recall_relevant_summary(
+        &mut self,
+        sid: &str,
+        query: &str,
+        k: usize,
+        idx: u32,
+    ) -> Result<String> {
         let records = self.recall_relevant(sid, query, k, idx).await?;
         if !records.is_empty() {
             let query_emb = local_embed_text(query);
@@ -204,18 +224,25 @@ impl MemoryBridge {
                 .iter()
                 .map(|r| local_cosine_similarity(&query_emb, &r.embedding) as f64)
                 .collect();
-            self.recalled_hashes_last = hashes.iter().map(|h| {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                h.hash(&mut hasher);
-                hasher.finish()
-            }).collect();
+            self.recalled_hashes_last = hashes
+                .iter()
+                .map(|h| {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    h.hash(&mut hasher);
+                    hasher.finish()
+                })
+                .collect();
             self.recall_pending.insert(idx, hashes);
         } else {
             self.recalled_hashes_last.clear();
             self.recalled_scores_last.clear();
         }
-        Ok(records.into_iter().map(|r| r.content_hash).collect::<Vec<_>>().join("\n"))
+        Ok(records
+            .into_iter()
+            .map(|r| r.content_hash)
+            .collect::<Vec<_>>()
+            .join("\n"))
     }
 
     /// Called after a turn completes. Records whether memory injection helped.
@@ -282,7 +309,9 @@ impl MemoryBridge {
                 let age_hours = now.saturating_sub(rec.timestamp) as f64 / 3600.0;
                 feature_sums[0] += mean_cosine_sim;
                 feature_sums[1] += (-0.01 * age_hours).exp();
-                feature_sums[2] += rec.outcome.as_ref()
+                feature_sums[2] += rec
+                    .outcome
+                    .as_ref()
                     .map_or(0.0, |o| if o.tests_passed { 1.0 } else { 0.0 });
                 feature_sums[3] += 0.0; // surprise_signal: MemoryRecord has no such field
                 count += 1;
@@ -368,7 +397,11 @@ impl MemoryBridge {
                     return vec![];
                 }
             };
-            return results.into_iter().filter(|(r, _)| r.is_negative).map(|(r, _)| r).collect();
+            return results
+                .into_iter()
+                .filter(|(r, _)| r.is_negative)
+                .map(|(r, _)| r)
+                .collect();
         }
 
         vec![]
@@ -404,7 +437,10 @@ impl MemoryBridge {
 
     pub fn ingest_turn(&mut self, sid: &str, turn: &Turn) {
         let hash = content_hash(&turn.content);
-        let is_negative = matches!(turn.outcome, TurnOutcome::Rejected | TurnOutcome::RolledBack);
+        let is_negative = matches!(
+            turn.outcome,
+            TurnOutcome::Rejected | TurnOutcome::RolledBack
+        );
         let outcome = Some(OutcomeRecord {
             compiled: !matches!(turn.outcome, TurnOutcome::Rejected),
             tests_passed: matches!(turn.outcome, TurnOutcome::TestsPassed),
@@ -426,7 +462,11 @@ impl MemoryBridge {
     }
 
     /// Async version for use with LanceDB backing store.
-    pub async fn store_failure_lesson_async(&self, sid: &str, mortem: &crate::types::self_improvement::PostMortem) -> Result<()> {
+    pub async fn store_failure_lesson_async(
+        &self,
+        sid: &str,
+        mortem: &crate::types::self_improvement::PostMortem,
+    ) -> Result<()> {
         let rec = MemoryRecord {
             turn_id: 0,
             session_id: sid.to_string(),
@@ -445,7 +485,11 @@ impl MemoryBridge {
     }
 
     /// Sync version that stores the failure lesson in the in-memory session map.
-    pub fn store_failure_lesson(&mut self, sid: &str, mortem: &crate::types::self_improvement::PostMortem) {
+    pub fn store_failure_lesson(
+        &mut self,
+        sid: &str,
+        mortem: &crate::types::self_improvement::PostMortem,
+    ) {
         let metadata = serde_json::json!({
             "is_negative": true,
             "root_cause": format!("{:?}", mortem.root_cause),
@@ -476,7 +520,10 @@ impl MemoryBridge {
     }
 
     pub fn index_snapshot(&mut self, sid: &str, records: Vec<MemoryRecord>) {
-        self.sessions.entry(sid.to_string()).or_default().extend(records);
+        self.sessions
+            .entry(sid.to_string())
+            .or_default()
+            .extend(records);
     }
 
     pub fn session_count(&self) -> usize {
@@ -493,7 +540,9 @@ impl MemoryBridge {
 }
 
 impl Default for MemoryBridge {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── MemoryStore ──────────────────────────────────────────────────────────────
@@ -541,7 +590,9 @@ impl MemoryStore {
     }
 
     fn conn(&self) -> Result<&Connection> {
-        self.conn.as_ref().ok_or_else(|| anyhow!("MemoryStore not initialized; call init() first"))
+        self.conn
+            .as_ref()
+            .ok_or_else(|| anyhow!("MemoryStore not initialized; call init() first"))
     }
 
     pub async fn get_or_create_table(&self, name: &str) -> Result<Table> {
@@ -554,10 +605,20 @@ impl MemoryStore {
                     Field::new("turn_id", DataType::UInt32, false),
                     Field::new("session_id", DataType::Utf8, false),
                     Field::new("content", DataType::Utf8, false),
-                    Field::new("vector", DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim), false),
+                    Field::new(
+                        "vector",
+                        DataType::FixedSizeList(
+                            Arc::new(Field::new("item", DataType::Float32, true)),
+                            dim,
+                        ),
+                        false,
+                    ),
                 ]));
                 let batches = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema);
-                conn.create_table(name, Box::new(batches)).execute().await.map_err(|e| anyhow!(e))
+                conn.create_table(name, Box::new(batches))
+                    .execute()
+                    .await
+                    .map_err(|e| anyhow!(e))
             }
         }
     }
@@ -579,7 +640,13 @@ impl MemoryStore {
         builder.append(true);
         let vectors = Arc::new(builder.finish());
         let batch = RecordBatch::try_new(schema, vec![turn_ids, session_ids, contents, vectors])?;
-        table.add(Box::new(RecordBatchIterator::new(vec![Ok(batch)], table.schema().await?))).execute().await?;
+        table
+            .add(Box::new(RecordBatchIterator::new(
+                vec![Ok(batch)],
+                table.schema().await?,
+            )))
+            .execute()
+            .await?;
         Ok(())
     }
 
@@ -588,7 +655,10 @@ impl MemoryStore {
     pub async fn insert(&mut self, _table_name: &str, records: Vec<MemoryRecord>) -> Result<()> {
         for rec in records {
             self.store(rec.clone()).await?;
-            self.sessions.entry(rec.session_id.clone()).or_default().push(rec);
+            self.sessions
+                .entry(rec.session_id.clone())
+                .or_default()
+                .push(rec);
         }
         Ok(())
     }
@@ -645,12 +715,16 @@ impl MemoryStore {
         }
 
         // LanceDB path
-        let table = self.get_or_create_table(DEFAULT_TABLE).await.context("opening table for stats")?;
+        let table = self
+            .get_or_create_table(DEFAULT_TABLE)
+            .await
+            .context("opening table for stats")?;
         let mut stream = table.query().execute().await?;
         while let Some(batch_res) = stream.next().await {
             let batch = batch_res?;
             total += batch.num_rows();
-            let sids = batch.column_by_name("session_id")
+            let sids = batch
+                .column_by_name("session_id")
                 .ok_or_else(|| anyhow::anyhow!("missing 'session_id' column in memory table"))?
                 .as_string::<i32>();
             for i in 0..batch.num_rows() {
@@ -661,7 +735,11 @@ impl MemoryStore {
         Ok(MemoryStoreStats {
             total_records: total,
             unique_sessions: unique,
-            avg_cluster_size: if unique > 0 { total as f64 / unique as f64 } else { 0.0 },
+            avg_cluster_size: if unique > 0 {
+                total as f64 / unique as f64
+            } else {
+                0.0
+            },
             storage_size: 0,
         })
     }
@@ -695,7 +773,10 @@ impl MemoryStore {
         let records: Vec<MemoryRecord> = serde_json::from_slice(&data)?;
         for rec in records {
             let mut entry = self.sessions.entry(rec.session_id.clone()).or_default();
-            if !entry.iter().any(|r| r.turn_id == rec.turn_id && r.session_id == rec.session_id) {
+            if !entry
+                .iter()
+                .any(|r| r.turn_id == rec.turn_id && r.session_id == rec.session_id)
+            {
                 entry.push(rec);
             }
         }
@@ -703,7 +784,9 @@ impl MemoryStore {
     }
 
     pub async fn snapshot_session(&self, session_id: &str) -> Result<SnapshotBundle> {
-        let records: Vec<MemoryRecord> = self.sessions.get(session_id)
+        let records: Vec<MemoryRecord> = self
+            .sessions
+            .get(session_id)
             .map(|r| r.value().clone())
             .unwrap_or_default();
         let json = serde_json::to_vec(&records)?;
@@ -721,29 +804,46 @@ impl MemoryStore {
     pub async fn delete_session(&self, session_id: &str) -> Result<Vec<DeletionLogEntry>> {
         let removed = self.sessions.remove(session_id);
         let now = ConversationState::now();
-        Ok(removed.map(|(_, recs)| {
-            recs.iter().map(|r| DeletionLogEntry {
-                turn_id: r.turn_id,
-                session_id: r.session_id.clone(),
-                deleted_at: now,
-            }).collect()
-        }).unwrap_or_default())
+        Ok(removed
+            .map(|(_, recs)| {
+                recs.iter()
+                    .map(|r| DeletionLogEntry {
+                        turn_id: r.turn_id,
+                        session_id: r.session_id.clone(),
+                        deleted_at: now,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
-    pub async fn query_hybrid(&self, table_name: &str, query_text: &str, top_k: usize) -> Result<Vec<(MemoryRecord, f64)>> {
+    pub async fn query_hybrid(
+        &self,
+        table_name: &str,
+        query_text: &str,
+        top_k: usize,
+    ) -> Result<Vec<(MemoryRecord, f64)>> {
         let table = self.get_or_create_table(table_name).await?;
         let emb = embed_text(query_text);
-        let mut results_stream = table.query().nearest_to(emb.clone())?.limit(top_k).execute().await?;
+        let mut results_stream = table
+            .query()
+            .nearest_to(emb.clone())?
+            .limit(top_k)
+            .execute()
+            .await?;
         let mut records = Vec::new();
         while let Some(batch_res) = results_stream.next().await {
             let batch = batch_res?;
-            let ids = batch.column_by_name("turn_id")
+            let ids = batch
+                .column_by_name("turn_id")
                 .ok_or_else(|| anyhow::anyhow!("missing 'turn_id' column in memory table"))?
                 .as_primitive::<arrow_array::types::UInt32Type>();
-            let sids = batch.column_by_name("session_id")
+            let sids = batch
+                .column_by_name("session_id")
                 .ok_or_else(|| anyhow::anyhow!("missing 'session_id' column in memory table"))?
                 .as_string::<i32>();
-            let contents = batch.column_by_name("content")
+            let contents = batch
+                .column_by_name("content")
                 .ok_or_else(|| anyhow::anyhow!("missing 'content' column in memory table"))?
                 .as_string::<i32>();
             // Extract stored embedding vector from the "vector" column when available.
@@ -761,16 +861,19 @@ impl MemoryStore {
                     tracing::warn!("vector column absent in LanceDB result; using empty embedding");
                     vec![0.0; EMBEDDING_DIM]
                 };
-                records.push((MemoryRecord {
-                    turn_id: ids.value(i),
-                    session_id: sids.value(i).to_string(),
-                    content_hash: contents.value(i).to_string(),
-                    embedding,
-                    outcome: None,
-                    timestamp: 0,
-                    is_negative: false,
-                    metadata_json: String::new(),
-                }, 1.0));
+                records.push((
+                    MemoryRecord {
+                        turn_id: ids.value(i),
+                        session_id: sids.value(i).to_string(),
+                        content_hash: contents.value(i).to_string(),
+                        embedding,
+                        outcome: None,
+                        timestamp: 0,
+                        is_negative: false,
+                        metadata_json: String::new(),
+                    },
+                    1.0,
+                ));
             }
         }
         Ok(records)
@@ -791,31 +894,39 @@ impl ContextDistiller {
     /// Distill conversation state with a configurable temporal decay rate.
     /// Turns are weighted by outcome quality and recency. Higher decay_rate
     /// means older turns lose weight faster.
-    pub fn distill_with_decay(state: &ConversationState, max_tokens: usize, decay_rate: f64) -> String {
+    pub fn distill_with_decay(
+        state: &ConversationState,
+        max_tokens: usize,
+        decay_rate: f64,
+    ) -> String {
         let now = ConversationState::now();
-        let mut weighted_turns: Vec<(f64, &Turn)> = state.turns.iter().map(|t| {
-            let outcome_weight = match t.outcome {
-                TurnOutcome::TestsPassed => 1.0,
-                TurnOutcome::Compiled => 0.7,
-                TurnOutcome::Unknown => 0.5,
-                TurnOutcome::Rejected => 0.2,
-                TurnOutcome::RolledBack => 0.1,
-                TurnOutcome::AdvancedConvergence => 0.9,
-                TurnOutcome::Stalled => 0.3,
-                TurnOutcome::VerificationFailed => 0.05,
-            };
-            let age_hours = (now.saturating_sub(t.timestamp)) as f64 / 3600.0;
-            let time_weight = (-decay_rate * age_hours).exp();
-            
-            // --- Sovereign-Tier: Entropy-Driven Weighting ---
-            let entropy_weight = if let Some(s) = t.surprise_signal {
-                if s < 0.15 { 0.5 } else { 1.2 }
-            } else {
-                1.0
-            };
+        let mut weighted_turns: Vec<(f64, &Turn)> = state
+            .turns
+            .iter()
+            .map(|t| {
+                let outcome_weight = match t.outcome {
+                    TurnOutcome::TestsPassed => 1.0,
+                    TurnOutcome::Compiled => 0.7,
+                    TurnOutcome::Unknown => 0.5,
+                    TurnOutcome::Rejected => 0.2,
+                    TurnOutcome::RolledBack => 0.1,
+                    TurnOutcome::AdvancedConvergence => 0.9,
+                    TurnOutcome::Stalled => 0.3,
+                    TurnOutcome::VerificationFailed => 0.05,
+                };
+                let age_hours = (now.saturating_sub(t.timestamp)) as f64 / 3600.0;
+                let time_weight = (-decay_rate * age_hours).exp();
 
-            (outcome_weight * time_weight * entropy_weight, t)
-        }).collect();
+                // --- Sovereign-Tier: Entropy-Driven Weighting ---
+                let entropy_weight = if let Some(s) = t.surprise_signal {
+                    if s < 0.15 { 0.5 } else { 1.2 }
+                } else {
+                    1.0
+                };
+
+                (outcome_weight * time_weight * entropy_weight, t)
+            })
+            .collect();
 
         weighted_turns.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -824,8 +935,12 @@ impl ContextDistiller {
         for (_, turn) in &weighted_turns {
             // --- Sovereign-Tier: Compression of Low-Entropy Turns ---
             let line = if turn.surprise_signal.unwrap_or(0.5) < 0.15 && turn.content.len() > 100 {
-                format!("[{}] {}: [Compressed: Low Semantic Entropy (Surprise={:.2})]\n", 
-                    turn.index, turn.model_id, turn.surprise_signal.unwrap_or(0.0))
+                format!(
+                    "[{}] {}: [Compressed: Low Semantic Entropy (Surprise={:.2})]\n",
+                    turn.index,
+                    turn.model_id,
+                    turn.surprise_signal.unwrap_or(0.0)
+                )
             } else {
                 format!("[{}] {}: {}\n", turn.index, turn.model_id, turn.content)
             };
@@ -908,7 +1023,11 @@ impl LessonExtractor {
                 }
                 Lesson {
                     context_type: "coding".to_string(),
-                    approach: format!("Model {} applied: {}", t.model_id, truncate(&t.content, 100)),
+                    approach: format!(
+                        "Model {} applied: {}",
+                        t.model_id,
+                        truncate(&t.content, 100)
+                    ),
                     outcome: "Success (Tests Passed)".to_string(),
                     confidence,
                     applicability_tags: tags,
@@ -919,11 +1038,7 @@ impl LessonExtractor {
 }
 
 fn truncate(s: &str, max_len: usize) -> &str {
-    if s.len() <= max_len {
-        s
-    } else {
-        &s[..max_len]
-    }
+    if s.len() <= max_len { s } else { &s[..max_len] }
 }
 
 // ── SemanticClusterer ────────────────────────────────────────────────────────
@@ -1007,7 +1122,9 @@ impl DecayCalibrator {
 }
 
 impl Default for DecayCalibrator {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── Tiered memory ────────────────────────────────────────────────────────────
@@ -1052,7 +1169,9 @@ fn score_record(rec: &MemoryRecord, query_emb: &[f32], now_secs: u64, w: [f64; 4
     let sim = local_cosine_similarity(query_emb, &rec.embedding) as f64;
     let age_hours = now_secs.saturating_sub(rec.timestamp) as f64 / 3600.0;
     let decay = (-0.01 * age_hours).exp();
-    let outcome_boost = rec.outcome.as_ref()
+    let outcome_boost = rec
+        .outcome
+        .as_ref()
         .map_or(0.0, |o| if o.tests_passed { 1.0 } else { 0.0 });
     w[0] * sim + w[1] * decay + w[2] * outcome_boost
     // w[3] (surprise_signal) is omitted: MemoryRecord has no such field.
@@ -1129,7 +1248,11 @@ impl TieredMemoryManager {
         if scored.len() < k {
             let cold_limit = k - scored.len();
             // Cold tier may be uninitialized or empty; degrade gracefully.
-            if let Ok(cold_results) = self.cold.query_hybrid(DEFAULT_TABLE, query, cold_limit * 2).await {
+            if let Ok(cold_results) = self
+                .cold
+                .query_hybrid(DEFAULT_TABLE, query, cold_limit * 2)
+                .await
+            {
                 for (rec, _dist) in cold_results {
                     if seen.contains(&rec.content_hash) {
                         continue;
@@ -1202,7 +1325,9 @@ impl TieredMemoryManager {
             let sim = *score_map.get(&fp).unwrap_or(&fallback_sim);
             let age_hours = now.saturating_sub(rec.timestamp) as f64 / 3600.0;
             let decay = (-0.01 * age_hours).exp();
-            let outcome_boost = rec.outcome.as_ref()
+            let outcome_boost = rec
+                .outcome
+                .as_ref()
                 .map_or(0.0, |o| if o.tests_passed { 1.0 } else { 0.0 });
             let surprise = 0.0_f64;
             feature_sums[0] += sim;
@@ -1219,7 +1344,9 @@ impl TieredMemoryManager {
             let sim = *score_map.get(&fp).unwrap_or(&fallback_sim);
             let age_hours = now.saturating_sub(rec.timestamp) as f64 / 3600.0;
             let decay = (-0.01 * age_hours).exp();
-            let outcome_boost = rec.outcome.as_ref()
+            let outcome_boost = rec
+                .outcome
+                .as_ref()
                 .map_or(0.0, |o| if o.tests_passed { 1.0 } else { 0.0 });
             let surprise = 0.0_f64;
             feature_sums[0] += sim;
@@ -1315,5 +1442,9 @@ pub fn local_cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if na > 0.0 && nb > 0.0 { dot / (na * nb) } else { 0.0 }
+    if na > 0.0 && nb > 0.0 {
+        dot / (na * nb)
+    } else {
+        0.0
+    }
 }

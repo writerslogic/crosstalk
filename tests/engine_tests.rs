@@ -57,6 +57,7 @@ fn test_quality_scorer_penalizes_failure() {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     };
     let turn_pass = Turn {
         index: 1,
@@ -72,6 +73,7 @@ fn test_quality_scorer_penalizes_failure() {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     };
 
     assert!(QualityScorer::score(&turn_pass) > QualityScorer::score(&turn_fail));
@@ -93,6 +95,7 @@ fn test_reasoning_scorer_detects_evidence() {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     };
     let score = ReasoningScorer::score(&turn);
     assert!(score > 0.5);
@@ -109,7 +112,11 @@ fn test_structure_selector_prefers_step_by_step_for_complex_tasks() {
             step_count += 1;
         }
     }
-    assert!(step_count >= 10, "StepByStep should dominate for Architecture tasks, got {}/20", step_count);
+    assert!(
+        step_count >= 10,
+        "StepByStep should dominate for Architecture tasks, got {}/20",
+        step_count
+    );
 }
 
 #[test]

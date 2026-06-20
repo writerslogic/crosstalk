@@ -12,7 +12,7 @@ use tree_sitter::Parser;
 thread_local! {
     static PARSER: RefCell<Parser> = RefCell::new({
         let mut p = Parser::new();
-        p.set_language(&tree_sitter_rust::LANGUAGE.into()).ok();
+        p.set_language(&tree_sitter_rust::LANGUAGE.into()).expect("tree-sitter Rust grammar unavailable");
         p
     });
 }
@@ -249,7 +249,8 @@ impl RegressionDetector {
     pub fn is_regressive(old: &ArtifactMetrics, new: &ArtifactMetrics) -> bool {
         let health_drop = old.health_score - new.health_score;
         let complexity_pct_increase = if old.cyclomatic_complexity > 0 {
-            (new.cyclomatic_complexity as f64 - old.cyclomatic_complexity as f64) / old.cyclomatic_complexity as f64
+            (new.cyclomatic_complexity as f64 - old.cyclomatic_complexity as f64)
+                / old.cyclomatic_complexity as f64
         } else {
             0.0
         };
@@ -566,7 +567,7 @@ impl CompletionScorer {
 
     #[must_use]
     pub fn diagnose_blocker(recent: &[CompletionReport]) -> Option<BlockerReport> {
-        if recent.len() < 3 {
+        if recent.len() < 4 {
             return None;
         }
         let stalled = recent
@@ -635,10 +636,15 @@ impl TournamentRunner {
                 (p, s)
             })
             .collect();
+        let max_score = scored
+            .iter()
+            .map(|(_, s)| *s)
+            .fold(f64::NEG_INFINITY, f64::max);
         let winner = scored
             .iter()
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .filter(|(_, s)| (*s - max_score).abs() < f64::EPSILON)
             .map(|(p, _)| p.agent_id.clone())
+            .min()
             .unwrap_or_default();
         Some(TournamentResult {
             proposals: proposals.to_vec(),
@@ -855,14 +861,19 @@ impl DeadCodeDetector {
             }
         }
 
+        let non_use_text: String = lines
+            .iter()
+            .filter(|&&l| !l.trim().starts_with("use "))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+
         for (fn_name, ln) in &defined_fns {
             let def_pattern = format!("fn {fn_name}");
             let call_pattern = format!("{fn_name}(");
-            let call_count = lines
-                .iter()
-                .filter(|&&l| l.contains(&call_pattern) && !l.contains(&def_pattern))
-                .count();
-            if call_count == 0 {
+            let total = content.matches(call_pattern.as_str()).count();
+            let defs = content.matches(def_pattern.as_str()).count();
+            if total <= defs {
                 dead_items.push(DeadItem {
                     name: fn_name.clone(),
                     kind: DeadItemKind::UnusedFunction,
@@ -889,11 +900,7 @@ impl DeadCodeDetector {
                     if sym.is_empty() || sym == "*" {
                         continue;
                     }
-                    let used_elsewhere = lines
-                        .iter()
-                        .enumerate()
-                        .any(|(j, &l)| j != i && l.contains(sym) && !l.trim().starts_with("use "));
-                    if !used_elsewhere {
+                    if !non_use_text.contains(sym) {
                         dead_items.push(DeadItem {
                             name: sym.to_string(),
                             kind: DeadItemKind::UnusedImport,
@@ -928,11 +935,21 @@ pub struct RegressionReport {
 
 impl RegressionDetector {
     #[must_use]
-    pub fn detect(gold: &crate::types::conversation::ConversationState, actual: &crate::types::conversation::ConversationState) -> RegressionReport {
+    pub fn detect(
+        gold: &crate::types::conversation::ConversationState,
+        actual: &crate::types::conversation::ConversationState,
+    ) -> RegressionReport {
         let mut report = RegressionReport::default();
         let mut total_drift = 0.0;
-        
+
         // 1. Compare turns outcome and certainty
+        if gold.turns.len() != actual.turns.len() {
+            tracing::warn!(
+                gold_turns = gold.turns.len(),
+                actual_turns = actual.turns.len(),
+                "RegressionDetector: turn count mismatch; zip will truncate to shorter length"
+            );
+        }
         for (g, a) in gold.turns.iter().zip(actual.turns.iter()) {
             if g.outcome != a.outcome {
                 report.outcome_mismatches.push(g.index);

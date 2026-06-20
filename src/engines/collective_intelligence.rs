@@ -33,8 +33,7 @@ impl CollectiveIntelligenceEngine {
 
     /// Serialize agent profiles and meta-strategy outcomes to JSON for cross-session persistence.
     pub fn export_state_json(&self) -> String {
-        serde_json::to_string(&(&self.profiles, &self.meta_optimizer.outcomes))
-            .unwrap_or_default()
+        serde_json::to_string(&(&self.profiles, &self.meta_optimizer.outcomes)).unwrap_or_default()
     }
 
     /// Restore agent profiles and meta-strategy outcomes from a prior session's JSON.
@@ -112,14 +111,23 @@ impl KnowledgeTransfer {
         // Dangerous delimiter patterns that could break out of the lesson block
         // and inject instructions into the surrounding agent prompt.
         const STRIP_PATTERNS: &[&str] = &[
-            "[INST]", "[/INST]", "<<SYS>>", "<</SYS>>",
-            "###", "<|im_start|>", "<|im_end|>",
-            "<|system|>", "<|user|>", "<|assistant|>",
+            "[INST]",
+            "[/INST]",
+            "<<SYS>>",
+            "<</SYS>>",
+            "###",
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|system|>",
+            "<|user|>",
+            "<|assistant|>",
         ];
         let truncated = if raw.len() > Self::MAX_LESSON_CONTENT_BYTES {
             // Truncate at a UTF-8 character boundary.
             let mut end = Self::MAX_LESSON_CONTENT_BYTES;
-            while !raw.is_char_boundary(end) { end -= 1; }
+            while !raw.is_char_boundary(end) {
+                end -= 1;
+            }
             &raw[..end]
         } else {
             raw
@@ -201,7 +209,7 @@ impl PeerReview {
             correctness -= 0.2;
             comments.push("Incomplete implementation (TODO found)".to_string());
         }
-        
+
         // Use reviewer_id to potentially adjust strictness in the future
         if reviewer_id.contains("strict") {
             correctness -= 0.1;
@@ -227,8 +235,12 @@ impl EnsembleEngine {
         task_category: TaskCategory,
         language: &str,
     ) -> String {
-        if proposals.is_empty() { return String::new(); }
-        if proposals.len() == 1 { return proposals.into_iter().next().unwrap().1; }
+        if proposals.is_empty() {
+            return String::new();
+        }
+        if proposals.len() == 1 {
+            return proposals.into_iter().next().unwrap().1;
+        }
 
         // For Code Generation, use high-fidelity AST merging
         if task_category == TaskCategory::CodeGeneration || !language.is_empty() {
@@ -238,15 +250,24 @@ impl EnsembleEngine {
                 let diff = crate::engines::diff::DiffEngine::generate_delta(base, content, 0);
                 diff_proposals.push((id.clone(), diff));
             }
-            
-            if let Some(merged_code) = crate::engines::reasoning::SynthesisEngine::merge(base, diff_proposals, language) {
+
+            if let Some(merged_code) =
+                crate::engines::reasoning::SynthesisEngine::merge(base, diff_proposals, language)
+            {
                 return merged_code;
             }
         }
 
         // Fallback to paragraph-level selection for Research/Reasoning
-        if proposals.is_empty() { return String::new(); }
-        let best_idx = proposals.iter().enumerate().max_by(|(_, a), (_, b)| a.2.total_cmp(&b.2)).map(|(i, _)| i).unwrap_or(0);
+        if proposals.is_empty() {
+            return String::new();
+        }
+        let best_idx = proposals
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.2.total_cmp(&b.2))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
         let base_paragraphs: Vec<&str> = proposals[best_idx].1.split("\n\n").collect();
         let mut merged = String::with_capacity(proposals[best_idx].1.len());
 
@@ -262,7 +283,8 @@ impl EnsembleEngine {
             .map(|(c, _)| c.split_whitespace().collect())
             .collect();
 
-        let base_word_set: std::collections::HashSet<&str> = proposals[best_idx].1.split_whitespace().collect();
+        let base_word_set: std::collections::HashSet<&str> =
+            proposals[best_idx].1.split_whitespace().collect();
 
         for para in &base_paragraphs {
             let para_words: std::collections::HashSet<&str> = para.split_whitespace().collect();
@@ -284,9 +306,13 @@ impl EnsembleEngine {
         // Append unique insights from non-best proposals that have low overlap with the merged text.
         // This captures novel perspectives that the best proposal missed.
         for (i, &(candidate, score)) in all_candidates.iter().enumerate() {
-            if score < 0.3 { continue; }
+            if score < 0.3 {
+                continue;
+            }
             let cand_words = &candidate_word_sets[i];
-            if cand_words.len() < 5 { continue; }
+            if cand_words.len() < 5 {
+                continue;
+            }
             let overlap = base_word_set.intersection(cand_words).count();
             let novelty = 1.0 - (overlap as f64 / cand_words.len().max(1) as f64);
             if novelty > 0.5 && candidate.len() > 20 {
@@ -425,7 +451,9 @@ impl MetaStrategyOptimizer {
     #[must_use]
     pub fn select_best(&self, task_category: TaskCategory) -> MetaStrategy {
         // Apply task-category specific strategy bias
-        if task_category == TaskCategory::Debugging { return MetaStrategy::DebateAndCritique; }
+        if task_category == TaskCategory::Debugging {
+            return MetaStrategy::DebateAndCritique;
+        }
         let mut rng = rand::rng();
 
         self.outcomes
@@ -475,11 +503,7 @@ impl MetaStrategyOptimizer {
         let mut preferred_agent: Option<String> = None;
         let ranked = observer.ranked_agents();
         if let Some((top_id, top_elo)) = ranked.first() {
-            let turn_count = sigma
-                .turns
-                .iter()
-                .filter(|t| &t.model_id == top_id)
-                .count();
+            let turn_count = sigma.turns.iter().filter(|t| &t.model_id == top_id).count();
             if *top_elo > 1600.0 && turn_count > 3 {
                 *scores
                     .entry(MetaStrategy::DirectImplementation)
@@ -594,7 +618,11 @@ fn sample_gamma(rng: &mut impl rand::Rng, shape: f64) -> f64 {
         }
     }
     // Iteration cap reached: return best approximation or shape as fallback.
-    if best_dv > d * f64::EPSILON { best_dv } else { shape }
+    if best_dv > d * f64::EPSILON {
+        best_dv
+    } else {
+        shape
+    }
 }
 
 // ── SwarmPremiumCalculator ────────────────────────────────────────────────────

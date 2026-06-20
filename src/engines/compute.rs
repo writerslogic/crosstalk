@@ -73,12 +73,15 @@ impl ResourceMonitorActor {
                 let cpu_load = sys.global_cpu_usage();
                 let disk_free_gb = disk_free_gib(&disks);
                 let alert = resource_alert(cpu_load, rss_mb);
-                if tx.send(ResourceEvent {
-                    rss_mb,
-                    cpu_load,
-                    disk_free_gb,
-                    alert,
-                }).is_err() {
+                if tx
+                    .send(ResourceEvent {
+                        rss_mb,
+                        cpu_load,
+                        disk_free_gb,
+                        alert,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -136,7 +139,10 @@ impl ComputeManager {
             disk_free_gb,
             alert,
         };
-        crate::log_warn!(self.resource_tx.send(event.clone()), "Failed to broadcast resource event");
+        crate::log_warn!(
+            self.resource_tx.send(event.clone()),
+            "Failed to broadcast resource event"
+        );
         event
     }
 
@@ -426,7 +432,10 @@ impl RequestRateLimiter {
             let mut guard = self.timestamps.lock().await;
             let entries = guard.entry(model_id.to_string()).or_default();
             let now = Instant::now();
-            while entries.front().is_some_and(|t| now.duration_since(*t) >= window) {
+            while entries
+                .front()
+                .is_some_and(|t| now.duration_since(*t) >= window)
+            {
                 entries.pop_front();
             }
             if entries.len() >= self.requests_per_minute as usize {
@@ -444,7 +453,10 @@ impl RequestRateLimiter {
             let mut guard = self.timestamps.lock().await;
             let entries = guard.entry(model_id.to_string()).or_default();
             let now = Instant::now();
-            while entries.front().is_some_and(|t| now.duration_since(*t) >= window) {
+            while entries
+                .front()
+                .is_some_and(|t| now.duration_since(*t) >= window)
+            {
                 entries.pop_front();
             }
             entries.push_back(now);
@@ -458,9 +470,11 @@ impl LocalInference {
     /// Placeholder for llama-cpp-rs integration.
     /// In emergency mode, this performs low-cost local synthesis.
     pub fn generate_emergency(prompt: &str) -> String {
-        format!("[EMERGENCY LOCAL INFERENCE] Fallback active for prompt: {}
+        format!(
+            "[EMERGENCY LOCAL INFERENCE] Fallback active for prompt: {}
 
-Note: Switched to offline synthesis to preserve final 5% budget.", 
-                prompt.chars().take(100).collect::<String>())
+Note: Switched to offline synthesis to preserve final 5% budget.",
+            prompt.chars().take(100).collect::<String>()
+        )
     }
 }

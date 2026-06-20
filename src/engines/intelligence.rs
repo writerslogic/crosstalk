@@ -2,8 +2,8 @@ use crate::types::conversation::{ConversationState, TaskCategory, Turn, TurnOutc
 use crate::types::intelligence::{ModelProfile, PromptTemplate, RegressionAlert};
 use crate::types::self_improvement::CalibrationRecord;
 use anyhow::{Context, Result, anyhow};
-use sled;
 use dashmap::DashMap;
+use sled;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::fs;
@@ -126,8 +126,14 @@ impl IntelligenceEngine {
             latency_predictor: LatencyPredictor::new(),
             failures: {
                 let id = format!("{}-{:x}", std::process::id(), rand::random::<u64>());
-                Arc::new(FailurePatternStore::new(&format!("{}/crosstalk-intel-{}", std::env::temp_dir().display(), id))
-                    .unwrap_or_else(|_| FailurePatternStore::ephemeral()))
+                Arc::new(
+                    FailurePatternStore::new(&format!(
+                        "{}/crosstalk-intel-{}",
+                        std::env::temp_dir().display(),
+                        id
+                    ))
+                    .unwrap_or_else(|_| FailurePatternStore::ephemeral()),
+                )
             },
             learner: StrategyLearner::new(),
             checkpoint: CheckpointService::new(),
@@ -145,8 +151,14 @@ impl IntelligenceEngine {
             latency_predictor: LatencyPredictor::new(),
             failures: {
                 let id = format!("{}-{:x}", std::process::id(), rand::random::<u64>());
-                Arc::new(FailurePatternStore::new(&format!("{}/crosstalk-intel-{}", std::env::temp_dir().display(), id))
-                    .unwrap_or_else(|_| FailurePatternStore::ephemeral()))
+                Arc::new(
+                    FailurePatternStore::new(&format!(
+                        "{}/crosstalk-intel-{}",
+                        std::env::temp_dir().display(),
+                        id
+                    ))
+                    .unwrap_or_else(|_| FailurePatternStore::ephemeral()),
+                )
             },
             learner: StrategyLearner::new(),
             checkpoint: CheckpointService::new(),
@@ -224,7 +236,10 @@ impl IntelligenceEngine {
 
     pub fn update_profile_with_latency(&self, turn: &Turn, quality_score: f64, latency_ms: u64) {
         self.latency_predictor.record(&turn.model_id, latency_ms);
-        let predicted = self.latency_predictor.predict_latency(&turn.model_id).unwrap_or(0) as f64;
+        let predicted = self
+            .latency_predictor
+            .predict_latency(&turn.model_id)
+            .unwrap_or(0) as f64;
 
         let mut profile = self
             .profiles
@@ -238,7 +253,11 @@ impl IntelligenceEngine {
             });
 
         if let Some(cat) = turn.task_category {
-            profile.task_scores.entry(cat).or_default().update(quality_score);
+            profile
+                .task_scores
+                .entry(cat)
+                .or_default()
+                .update(quality_score);
         }
         profile.total_turns += 1;
         profile.last_updated = ConversationState::now();
@@ -278,9 +297,7 @@ impl IntelligenceEngine {
     /// If both `clean` and `regressive` are false the diff was conflicted or
     /// failed to apply (e.g. patch rejected), which also penalises the score.
     pub fn update_diff_quality(&self, agent_id: &str, clean: bool, regressive: bool) {
-        let mut score = self.diff_quality
-            .entry(agent_id.to_string())
-            .or_insert(1.0);
+        let mut score = self.diff_quality.entry(agent_id.to_string()).or_insert(1.0);
         if regressive {
             *score = (*score - 0.2).max(0.0);
         } else if clean {
@@ -295,10 +312,7 @@ impl IntelligenceEngine {
     /// exists yet.
     #[must_use]
     pub fn diff_quality_score(&self, agent_id: &str) -> f64 {
-        self.diff_quality
-            .get(agent_id)
-            .map(|v| *v)
-            .unwrap_or(1.0)
+        self.diff_quality.get(agent_id).map(|v| *v).unwrap_or(1.0)
     }
 
     pub fn detect_regression(
@@ -360,7 +374,11 @@ impl IntelligenceEngine {
         latency_ms: u64,
         blacklist: &[String],
     ) -> Result<String, String> {
-        self.route_task_internal(category, available_models, Some((budget, latency_ms, blacklist)))
+        self.route_task_internal(
+            category,
+            available_models,
+            Some((budget, latency_ms, blacklist)),
+        )
     }
 
     /// Sample from Beta(alpha, beta) using the Joehnk method.
@@ -518,7 +536,8 @@ impl IntelligenceEngine {
 
     pub async fn evolve_prompts(&self, category: TaskCategory) -> Result<()> {
         let mut templates = self.templates.write().await;
-        let mut top_performers: Vec<_> = templates.iter()
+        let mut top_performers: Vec<_> = templates
+            .iter()
             .filter(|t| t.category() == category)
             .collect();
 
@@ -528,7 +547,7 @@ impl IntelligenceEngine {
             && best.mean_performance() > 0.8
         {
             let mutation = crate::types::intelligence::MutationStrategy::Append(
-                "Be precise and follow all project invariants strictly.".to_string()
+                "Be precise and follow all project invariants strictly.".to_string(),
             );
             let new_version = best.mutate(mutation);
             templates.push(new_version);
@@ -648,8 +667,12 @@ impl RewardVector {
     /// Decompose a completed turn into its reward components.
     pub fn from_turn(turn: &Turn) -> Self {
         let compilation = match turn.outcome {
-            TurnOutcome::TestsPassed | TurnOutcome::Compiled | TurnOutcome::AdvancedConvergence => 1.0,
-            TurnOutcome::RolledBack | TurnOutcome::VerificationFailed | TurnOutcome::Rejected => 0.0,
+            TurnOutcome::TestsPassed | TurnOutcome::Compiled | TurnOutcome::AdvancedConvergence => {
+                1.0
+            }
+            TurnOutcome::RolledBack | TurnOutcome::VerificationFailed | TurnOutcome::Rejected => {
+                0.0
+            }
             _ => 0.5,
         };
         let test_pass = match turn.outcome {
@@ -659,7 +682,12 @@ impl RewardVector {
         };
         let semantic_delta = QualityScorer::score(turn);
         let certainty = turn.certainty.unwrap_or(0.5);
-        Self { compilation, test_pass, semantic_delta, certainty }
+        Self {
+            compilation,
+            test_pass,
+            semantic_delta,
+            certainty,
+        }
     }
 
     /// Weighted scalar quality for the given task category.
@@ -720,27 +748,35 @@ impl ConsistencyScorer {
 pub struct ConvergenceMonitor;
 
 impl ConvergenceMonitor {
-    pub fn monitor_convergence(sigma: &ConversationState) -> crate::types::intelligence::IterationDecision {
+    pub fn monitor_convergence(
+        sigma: &ConversationState,
+    ) -> crate::types::intelligence::IterationDecision {
         if sigma.turns.len() < 3 {
             return crate::types::intelligence::IterationDecision::Continue;
         }
 
         let last_p = sigma.completion_probability;
-        let p_history: Vec<f64> = sigma.turns.iter()
+        let p_history: Vec<f64> = sigma
+            .turns
+            .iter()
             .map(|t| t.certainty.unwrap_or(0.0))
             .collect();
-        
-        if last_p > 0.98 { return crate::types::intelligence::IterationDecision::StopEarly; }
+
+        if last_p > 0.98 {
+            return crate::types::intelligence::IterationDecision::StopEarly;
+        }
 
         let window = 3;
         if p_history.len() >= window {
-            let recent = &p_history[p_history.len()-window..];
-            let velocity = recent[window-1] - recent[0];
+            let recent = &p_history[p_history.len() - window..];
+            let velocity = recent[window - 1] - recent[0];
             let acceleration = if p_history.len() > window {
-                let prev_recent = &p_history[p_history.len()-window-1..p_history.len()-1];
-                let prev_velocity = prev_recent[window-1] - prev_recent[0];
+                let prev_recent = &p_history[p_history.len() - window - 1..p_history.len() - 1];
+                let prev_velocity = prev_recent[window - 1] - prev_recent[0];
                 velocity - prev_velocity
-            } else { 0.0 };
+            } else {
+                0.0
+            };
 
             if velocity < 0.005 && sigma.turns.len() > 10 {
                 return crate::types::intelligence::IterationDecision::StopEarly;
@@ -1263,7 +1299,10 @@ impl FailurePatternStore {
         Self { db: Arc::new(db) }
     }
 
-    pub fn record_failure(&self, pattern: crate::types::intelligence::FailurePattern) -> Result<()> {
+    pub fn record_failure(
+        &self,
+        pattern: crate::types::intelligence::FailurePattern,
+    ) -> Result<()> {
         let key = format!("failure:{}", pattern.pattern_id);
         let encoded = serde_json::to_vec(&pattern)?;
         self.db.insert(key, encoded)?;
@@ -1278,10 +1317,15 @@ impl FailurePatternStore {
             .collect()
     }
 
-    pub fn find_matches(&self, context_emb: &[f32], threshold: f32) -> Vec<crate::types::intelligence::FailurePattern> {
+    pub fn find_matches(
+        &self,
+        context_emb: &[f32],
+        threshold: f32,
+    ) -> Vec<crate::types::intelligence::FailurePattern> {
         let mut matches = Vec::new();
         for (_, v) in self.db.scan_prefix("failure:").flatten() {
-            if let Ok(p) = serde_json::from_slice::<crate::types::intelligence::FailurePattern>(&v) {
+            if let Ok(p) = serde_json::from_slice::<crate::types::intelligence::FailurePattern>(&v)
+            {
                 let sim = self.cosine_similarity(context_emb, &p.context_signature);
                 if sim > threshold {
                     matches.push(p);
@@ -1292,11 +1336,15 @@ impl FailurePatternStore {
     }
 
     fn cosine_similarity(&self, a: &[f32], b: &[f32]) -> f32 {
-        if a.len() != b.len() || a.is_empty() { return 0.0; }
+        if a.len() != b.len() || a.is_empty() {
+            return 0.0;
+        }
         let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
         let mag_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
         let mag_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if mag_a == 0.0 || mag_b == 0.0 { return 0.0; }
+        if mag_a == 0.0 || mag_b == 0.0 {
+            return 0.0;
+        }
         dot / (mag_a * mag_b)
     }
 }
@@ -1312,7 +1360,12 @@ impl StrategyLearner {
         }
     }
 
-    pub fn record_session_sequence(&self, category: TaskCategory, sequence: Vec<String>, quality: f64) {
+    pub fn record_session_sequence(
+        &self,
+        category: TaskCategory,
+        sequence: Vec<String>,
+        quality: f64,
+    ) {
         let mut list = self.strategies.entry(category).or_default();
         if let Some(existing) = list.iter_mut().find(|s| s.agent_sequence == sequence) {
             let total = existing.avg_quality * f64::from(existing.sample_size) + quality;
@@ -1337,5 +1390,7 @@ impl StrategyLearner {
 }
 
 impl Default for StrategyLearner {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

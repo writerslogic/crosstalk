@@ -1,9 +1,8 @@
-use crosstalk::log_warn;
 use crosstalk::core::agent_trait::PromptAgent;
 use crosstalk::core::factory::ModelFactory;
-use futures::future::join_all;
 use crosstalk::core::orchestrator::Orchestrator;
 use crosstalk::core::state::StateManager;
+use crosstalk::log_warn;
 use crosstalk::types::conversation::{
     ConversationState, TaskCategory, Turn, TurnOutcome, TurnStructure,
 };
@@ -17,6 +16,7 @@ use crossterm::cursor::MoveTo;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use futures::future::join_all;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io;
@@ -28,7 +28,11 @@ use tokio::sync::mpsc;
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "Crosstalk", version = "1.0.5", about = "AI Multi-Model Mediator")]
+#[command(
+    name = "Crosstalk",
+    version = "1.0.5",
+    about = "AI Multi-Model Mediator"
+)]
 struct Args {
     #[arg(short, long)]
     task: Option<String>,
@@ -83,19 +87,34 @@ fn lang_from_ext(path: &str) -> String {
         "c" | "h" => "c",
         "cpp" | "hpp" | "cc" => "cpp",
         ext => ext,
-    }.to_string()
+    }
+    .to_string()
 }
 
 const SKIP_DIRS: &[&str] = &[
-    ".git", "__pycache__", "node_modules", "target", ".venv", "venv",
-    ".tox", ".mypy_cache", ".pytest_cache", "dist", "build",
-    ".eggs", "*.egg-info", ".DS_Store",
+    ".git",
+    "__pycache__",
+    "node_modules",
+    "target",
+    ".venv",
+    "venv",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    "dist",
+    "build",
+    ".eggs",
+    "*.egg-info",
+    ".DS_Store",
 ];
 
 fn should_skip(path: &std::path::Path) -> bool {
     for component in path.components() {
         let name = component.as_os_str().to_string_lossy();
-        if SKIP_DIRS.iter().any(|s| name == *s || name.ends_with(".egg-info")) {
+        if SKIP_DIRS
+            .iter()
+            .any(|s| name == *s || name.ends_with(".egg-info"))
+        {
             return true;
         }
     }
@@ -104,14 +123,60 @@ fn should_skip(path: &std::path::Path) -> bool {
 
 fn is_likely_text(path: &std::path::Path) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    matches!(ext,
-        "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "md" | "txt" | "toml" |
-        "yaml" | "yml" | "json" | "sh" | "bash" | "zsh" | "html" | "css" |
-        "sql" | "go" | "java" | "c" | "h" | "cpp" | "hpp" | "cc" | "rb" |
-        "ex" | "exs" | "hs" | "ml" | "mli" | "r" | "R" | "jl" | "lua" |
-        "pl" | "pm" | "swift" | "kt" | "scala" | "clj" | "erl" | "cfg" |
-        "ini" | "conf" | "env" | "xml" | "csv" | "tsv" | "makefile" |
-        "dockerfile" | "gitignore" | "lock"
+    matches!(
+        ext,
+        "rs" | "py"
+            | "js"
+            | "ts"
+            | "tsx"
+            | "jsx"
+            | "md"
+            | "txt"
+            | "toml"
+            | "yaml"
+            | "yml"
+            | "json"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "html"
+            | "css"
+            | "sql"
+            | "go"
+            | "java"
+            | "c"
+            | "h"
+            | "cpp"
+            | "hpp"
+            | "cc"
+            | "rb"
+            | "ex"
+            | "exs"
+            | "hs"
+            | "ml"
+            | "mli"
+            | "r"
+            | "R"
+            | "jl"
+            | "lua"
+            | "pl"
+            | "pm"
+            | "swift"
+            | "kt"
+            | "scala"
+            | "clj"
+            | "erl"
+            | "cfg"
+            | "ini"
+            | "conf"
+            | "env"
+            | "xml"
+            | "csv"
+            | "tsv"
+            | "makefile"
+            | "dockerfile"
+            | "gitignore"
+            | "lock"
     ) || path.file_name().is_some_and(|n| {
         let n = n.to_string_lossy().to_lowercase();
         n == "makefile" || n == "dockerfile" || n == ".gitignore" || n == "cargo.lock"
@@ -127,14 +192,16 @@ async fn main() -> anyhow::Result<()> {
     let _ = dotenv::dotenv();
 
     // 0. Initialize structured logging -- rotate, keeping last 5 logs
-    let log_dir = std::env::var("XDG_STATE_HOME")
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(|h| format!("{h}/.local/state"))
-                .unwrap_or_else(|_| "/tmp".to_string())
-        });
+    let log_dir = std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| {
+        std::env::var("HOME")
+            .map(|h| format!("{h}/.local/state"))
+            .unwrap_or_else(|_| "/tmp".to_string())
+    });
     let log_path = format!("{log_dir}/crosstalk");
-    log_warn!(std::fs::create_dir_all(&log_path), "Failed to create log directory");
+    log_warn!(
+        std::fs::create_dir_all(&log_path),
+        "Failed to create log directory"
+    );
     // Rotate: keep the 5 most recent logs (ISO timestamps sort lexicographically)
     if let Ok(entries) = std::fs::read_dir(&log_path) {
         let mut logs: Vec<_> = entries
@@ -172,7 +239,9 @@ async fn main() -> anyhow::Result<()> {
         for shell_str in &args.generate_completions {
             match shell_str.parse::<Shell>() {
                 Ok(shell) => generate(shell, &mut cmd, "crosstalk", &mut std::io::stdout()),
-                Err(_) => anyhow::bail!("Unknown shell '{shell_str}'. Supported: bash, zsh, fish, powershell, elvish"),
+                Err(_) => anyhow::bail!(
+                    "Unknown shell '{shell_str}'. Supported: bash, zsh, fish, powershell, elvish"
+                ),
             }
         }
         return Ok(());
@@ -190,23 +259,36 @@ async fn main() -> anyhow::Result<()> {
     let (task_str, wizard_workspace, wizard_iterations) = if args.task.is_none() {
         let (t, ws, iters) = model_select::run_task_wizard().await?;
         let ws = ws.or(config.default_workspace.clone());
-        let iters = if iters == 0 { config.default_iterations.unwrap_or(0) } else { iters };
+        let iters = if iters == 0 {
+            config.default_iterations.unwrap_or(0)
+        } else {
+            iters
+        };
         (t, ws, iters)
     } else {
         let ws = args.workspace.clone().or(config.default_workspace.clone());
-        let iters = if args.iterations == 0 { config.default_iterations.unwrap_or(0) } else { args.iterations };
+        let iters = if args.iterations == 0 {
+            config.default_iterations.unwrap_or(0)
+        } else {
+            args.iterations
+        };
         (args.task.unwrap_or_default(), ws, iters)
     };
 
     let use_auto = args.auto || config.auto_mode.unwrap_or(false);
     let model_ids: Vec<String> = if !args.models.is_empty() {
         args.models
-    } else if let Some(ref defaults) = config.default_models && !defaults.is_empty() && !use_auto {
+    } else if let Some(ref defaults) = config.default_models
+        && !defaults.is_empty()
+        && !use_auto
+    {
         defaults.clone()
     } else if use_auto {
         let ids = model_select::auto_select_models_dynamic(&task_str).await;
         if ids.is_empty() {
-            anyhow::bail!("No API keys found. Set at least one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY.");
+            anyhow::bail!(
+                "No API keys found. Set at least one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY."
+            );
         }
         ids
     } else {
@@ -219,13 +301,27 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("crosstalk session starting, models: {:?}", model_ids);
 
+    // Status helpers for the initialization phase (between model-select TUI and main TUI).
+    // These write to stderr so they are visible in normal-mode terminal but do not interfere
+    // with any stdout piping.
+    let print_status = |msg: &str| {
+        eprint!("\r\x1B[K  \x1B[36m▸\x1B[0m {msg}");
+        let _ = io::Write::flush(&mut io::stderr());
+    };
+    let print_error = |msg: &str| {
+        eprint!("\r\x1B[K  \x1B[31m✗\x1B[0m {msg}\n");
+        let _ = io::Write::flush(&mut io::stderr());
+    };
+
     // 2. Pre-flight credential check
+    print_status("Checking credentials...");
     if let Err(e) = ModelFactory::check_env(&model_ids) {
-        eprintln!("PRE-FLIGHT ERROR: {}", e);
+        print_error(&format!("Credential check failed: {e}"));
         anyhow::bail!("Initialization aborted due to missing credentials.");
     }
 
     // 3. Initialize Agents
+    print_status(&format!("Creating {} agent(s)...", model_ids.len()));
     let mut agents: Vec<Box<dyn PromptAgent>> = vec![];
     for m in &model_ids {
         agents.push(ModelFactory::create_agent(m)?);
@@ -236,6 +332,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 3b. Validate agent endpoints in parallel; fallback to OpenRouter on failure
     {
+        print_status(&format!("Validating {} agent endpoint(s)...", agents.len()));
         let validation_futures: Vec<_> = agents
             .iter()
             .map(|a| crosstalk::core::factory::validate_agent(a.as_ref()))
@@ -252,45 +349,53 @@ async fn main() -> anyhow::Result<()> {
                     if let Ok(fallback) = ModelFactory::create_openrouter_fallback(&name) {
                         if crosstalk::core::factory::validate_agent(fallback.as_ref()).await {
                             tracing::info!(agent = %name, "native provider failed, using OpenRouter fallback");
+                            print_status(&format!("Agent {name}: using OpenRouter fallback"));
                             valid_agents.push(fallback);
                             continue;
                         }
                     }
                 }
                 tracing::warn!(agent = %name, "agent validation failed, removing");
+                print_status(&format!("Agent {name}: validation failed, skipping"));
             }
         }
         agents = valid_agents;
         if agents.is_empty() {
+            print_error("All agents failed endpoint validation. Check model IDs and API keys.");
             anyhow::bail!("All agents failed endpoint validation. Check model IDs and API keys.");
         }
     }
 
     // 4. Initialize Core State
+    print_status("Initializing session state...");
     let session_id = args.resume.clone().unwrap_or_else(|| run_ts.clone());
-    let data_dir = std::env::var("XDG_DATA_HOME")
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(|h| format!("{h}/.local/share"))
-                .unwrap_or_else(|_| "/tmp".to_string())
-        });
+    let data_dir = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
+        std::env::var("HOME")
+            .map(|h| format!("{h}/.local/share"))
+            .unwrap_or_else(|_| "/tmp".to_string())
+    });
     let state_path = format!("{data_dir}/crosstalk/{session_id}");
-    log_warn!(std::fs::create_dir_all(&state_path), "Failed to create state directory");
+    log_warn!(
+        std::fs::create_dir_all(&state_path),
+        "Failed to create state directory"
+    );
     let manager = StateManager::new(&state_path)?;
     let sigma = Arc::new(Mutex::new(if args.resume.is_some() {
         // Restore the latest checkpoint if resuming a prior session
         manager
             .list_checkpoints()
             .ok()
-            .and_then(|mut idxs| { idxs.sort_unstable(); idxs.last().copied() })
+            .and_then(|mut idxs| {
+                idxs.sort_unstable();
+                idxs.last().copied()
+            })
             .and_then(|idx| manager.restore(idx).ok().flatten())
             .unwrap_or_else(|| ConversationState::new(&session_id))
     } else {
         ConversationState::new(&session_id)
     }));
 
-    let effective_workspace = wizard_workspace.as_deref()
-        .or(args.workspace.as_deref());
+    let effective_workspace = wizard_workspace.as_deref().or(args.workspace.as_deref());
 
     if let Some(ws) = effective_workspace {
         let patterns = if args.files.is_empty() {
@@ -323,7 +428,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 match tokio::fs::read_to_string(&path).await {
                     Ok(content) => {
-                        let name = path.strip_prefix(ws).unwrap_or(&path).display().to_string();
+                        let name = path.strip_prefix(ws).unwrap_or(path).display().to_string();
                         let lang = lang_from_ext(&name);
                         s.ingest_file(name, lang, content);
                     }
@@ -342,7 +447,8 @@ async fn main() -> anyhow::Result<()> {
             }
             match tokio::fs::read_to_string(path).await {
                 Ok(content) => {
-                    let name = path.file_name()
+                    let name = path
+                        .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| file_path.clone());
                     let lang = lang_from_ext(&name);
@@ -358,14 +464,16 @@ async fn main() -> anyhow::Result<()> {
     let (control_tx, control_rx) = mpsc::channel::<ControlSignal>(100);
 
     // 5. Initialize Orchestrator (may fail if engines fail to init)
+    print_status("Starting orchestration engine...");
     let workspace_root = effective_workspace.map(std::path::PathBuf::from);
-    let omicron = match Orchestrator::new(manager, agents, event_tx, control_rx, workspace_root).await {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("ORCHESTRATOR INIT ERROR: {}", e);
-            anyhow::bail!("Failed to start orchestration engine.");
-        }
-    };
+    let omicron =
+        match Orchestrator::new(manager, agents, event_tx, control_rx, workspace_root).await {
+            Ok(o) => o,
+            Err(e) => {
+                print_error(&format!("Orchestrator init failed: {e}"));
+                anyhow::bail!("Failed to start orchestration engine.");
+            }
+        };
 
     let task = task_str;
     let task_content = {
@@ -376,20 +484,26 @@ async fn main() -> anyhow::Result<()> {
             let file_names: Vec<&str> = s.artifacts.keys().map(|k| k.as_str()).collect();
             let names_str = file_names.join(", ");
             let edit_instruction = if args.edit {
-                format!("\n\n[EDIT MODE] After reaching consensus, produce a final artifact named exactly `{}` containing the complete revised document with all agreed changes applied.", names_str)
+                format!(
+                    "\n\n[EDIT MODE] After reaching consensus, produce a final artifact named exactly `{}` containing the complete revised document with all agreed changes applied.",
+                    names_str
+                )
             } else {
                 String::new()
             };
             format!(
                 "{}\n\n[GROUNDING CONSTRAINT] All claims must be grounded in the attached document(s): {}. Quote the specific section you are referencing. Do not assert implementation details, algorithms, or assumptions not explicitly stated in the text.{}\n\n[Workspace: {} file(s) loaded]",
-                task, names_str, edit_instruction, s.artifacts.len()
+                task,
+                names_str,
+                edit_instruction,
+                s.artifacts.len()
             )
         }
     };
 
     {
         let mut s = sigma.lock().await;
-        s.turns.push(Turn {
+        s.push_turn(Turn {
             index: 0,
             model_id: "User".to_string(),
             content: task_content,
@@ -441,7 +555,10 @@ async fn main() -> anyhow::Result<()> {
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         log_warn!(disable_raw_mode(), "Failed to disable raw mode");
-        log_warn!(io::stdout().execute(LeaveAlternateScreen), "Failed to leave alternate screen");
+        log_warn!(
+            io::stdout().execute(LeaveAlternateScreen),
+            "Failed to leave alternate screen"
+        );
         prev_hook(info);
     }));
 
@@ -460,16 +577,25 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         let mut i = 0u32;
         loop {
+            if app_orch.lock().await.shutdown {
+                break;
+            }
             let sigma_in = Arc::clone(&sigma_orch);
             let omicron_in = Arc::clone(&omicron_spawn);
             let join = tokio::task::spawn(async move { omicron_in.run_turn(sigma_in).await });
             let res = match tokio::time::timeout(turn_timeout, join).await {
                 Err(_elapsed) => {
                     let mut a = app_orch.lock().await;
-                    a.push_event(format!("Turn {} timed out after {}s", i + 1, turn_timeout.as_secs()));
+                    a.push_event(format!(
+                        "Turn {} timed out after {}s",
+                        i + 1,
+                        turn_timeout.as_secs()
+                    ));
                     drop(a);
                     tokio::time::sleep(Duration::from_secs(2)).await;
-                    if iterations > 0 && i >= iterations { break; }
+                    if iterations > 0 && i >= iterations {
+                        break;
+                    }
                     continue;
                 }
                 Ok(r) => r,
@@ -489,7 +615,12 @@ async fn main() -> anyhow::Result<()> {
                         break;
                     }
                     let session_id = sigma_orch.lock().await.session_id.clone();
-                    Orchestrator::git_commit_session(&omicron_spawn.file_writer.root, &session_id, i).await;
+                    Orchestrator::git_commit_session(
+                        &omicron_spawn.file_writer.root,
+                        &session_id,
+                        i,
+                    )
+                    .await;
                 }
                 Ok(Err(e)) => {
                     let mut app_err = app_orch.lock().await;
@@ -536,6 +667,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 8. Initialize TUI
+    print_status("Launching TUI...\n");
     enable_raw_mode()?;
     io::stdout().execute(MoveTo(0, 0))?;
     io::stdout().execute(EnterAlternateScreen)?;
@@ -598,13 +730,19 @@ async fn main() -> anyhow::Result<()> {
     io::stdout().execute(LeaveAlternateScreen)?;
 
     // Graceful shutdown: finalize session, persist memory, shut down orchestrator.
-    log_warn!(omicron_orch.finalize_session(Arc::clone(&sigma)).await, "session finalization failed");
+    log_warn!(
+        omicron_orch.finalize_session(Arc::clone(&sigma)).await,
+        "session finalization failed"
+    );
     {
         let bridge = omicron_orch.memory_bridge.lock().await;
         let session_id = sigma.lock().await.session_id.clone();
         let records = bridge.take_snapshot(&session_id);
         for record in records {
-            log_warn!(omicron_orch.memory_store.store(record).await, "failed to persist memory record");
+            log_warn!(
+                omicron_orch.memory_store.store(record).await,
+                "failed to persist memory record"
+            );
         }
     }
     omicron_orch.shutdown().await;
@@ -631,8 +769,12 @@ async fn main() -> anyhow::Result<()> {
             }
             if target.exists() && artifact.version > 1 {
                 match tokio::fs::write(&target, &artifact.content).await {
-                    Ok(()) => tracing::info!(path = %target.display(), bytes = artifact.content.len(), "edit-mode wrote artifact"),
-                    Err(e) => tracing::warn!(path = %target.display(), err = %e, "edit-mode write failed"),
+                    Ok(()) => {
+                        tracing::info!(path = %target.display(), bytes = artifact.content.len(), "edit-mode wrote artifact")
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %target.display(), err = %e, "edit-mode write failed")
+                    }
                 }
             }
         }
@@ -646,7 +788,11 @@ async fn main() -> anyhow::Result<()> {
         let turns = s.turns.len().saturating_sub(1); // exclude initial user turn
         let artifacts = s.artifacts.len();
         let conv = s.completion_probability;
-        let errors: Vec<&String> = a.recent_events.iter().filter(|e| e.contains("ERROR") || e.contains("error:") || e.contains("PANIC")).collect();
+        let errors: Vec<&String> = a
+            .recent_events
+            .iter()
+            .filter(|e| e.contains("ERROR") || e.contains("error:") || e.contains("PANIC"))
+            .collect();
         eprintln!("\n--- Crosstalk Session Summary ---");
         eprintln!("  Turns completed: {}", turns);
         eprintln!("  Artifacts:       {}", artifacts);
@@ -669,4 +815,3 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
-

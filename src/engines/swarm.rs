@@ -62,9 +62,6 @@ impl SwarmController {
                     result = turn_rx.recv() => {
                         match result {
                             Ok(_) => {
-                                nodes_ref.entry(id_clone.clone()).and_modify(|s| {
-                                    if let NodeStatus::Idle = s { *s = NodeStatus::Processing; }
-                                });
                                 nodes_ref.insert(id_clone.clone(), NodeStatus::WaitingMerge);
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -87,7 +84,11 @@ impl SwarmController {
 
     pub fn broadcast_turn(&self, turn: Turn) -> Result<()> {
         for node in self.node_tx.iter() {
-            if node.value().send(format!("SYNC_TURN:{}", turn.index)).is_err() {
+            if node
+                .value()
+                .send(format!("SYNC_TURN:{}", turn.index))
+                .is_err()
+            {
                 tracing::warn!(node = %node.key(), turn = turn.index, "sync broadcast failed");
             }
         }
@@ -96,7 +97,9 @@ impl SwarmController {
 }
 
 impl Default for SwarmController {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub struct TaskDecomposer;
@@ -105,19 +108,28 @@ impl TaskDecomposer {
         if n_tracks == 0 {
             return vec![];
         }
-        let lines: Vec<&str> = description.lines().filter(|l| !l.trim().is_empty()).collect();
+        let lines: Vec<&str> = description
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .collect();
         if lines.is_empty() {
             return vec![];
         }
         let chunk_size = (lines.len() as f64 / n_tracks as f64).ceil() as usize;
-        lines.chunks(chunk_size.max(1)).enumerate().map(|(i, chunk)| {
-            SubTask {
+        lines
+            .chunks(chunk_size.max(1))
+            .enumerate()
+            .map(|(i, chunk)| SubTask {
                 id: format!("task-{}", i),
                 description: chunk.join("\n"),
-                dependencies: if i > 0 { vec![format!("task-{}", i-1)] } else { vec![] },
+                dependencies: if i > 0 {
+                    vec![format!("task-{}", i - 1)]
+                } else {
+                    vec![]
+                },
                 estimated_turns: chunk.len() as u32,
-            }
-        }).collect()
+            })
+            .collect()
     }
 }
 
@@ -134,8 +146,8 @@ impl LeaderElection {
         }
     }
 
-    pub fn elect_leader(nodes: &[String]) -> String {
-        nodes.iter().min().cloned().unwrap_or_default()
+    pub fn elect_leader(nodes: &[String]) -> Option<String> {
+        nodes.iter().min().cloned()
     }
 
     pub async fn run_election_cycle<N: RaftNetwork + Send + Sync>(
@@ -172,11 +184,7 @@ impl LeaderElection {
 
 #[allow(async_fn_in_trait)]
 pub trait RaftNetwork {
-    async fn request_vote(
-        &self,
-        term: u64,
-        candidate_id: Arc<str>,
-    ) -> Result<bool>;
+    async fn request_vote(&self, term: u64, candidate_id: Arc<str>) -> Result<bool>;
 }
 
 // ── AgentAssigner ────────────────────────────────────────────────────────────
@@ -184,15 +192,22 @@ pub trait RaftNetwork {
 pub struct AgentAssigner;
 
 impl AgentAssigner {
-    pub fn assign(tasks: &[SubTask], capabilities: &HashMap<String, f64>) -> HashMap<String, String> {
+    pub fn assign(
+        tasks: &[SubTask],
+        capabilities: &HashMap<String, f64>,
+    ) -> HashMap<String, String> {
         if capabilities.is_empty() {
             return HashMap::new();
         }
-        let best_agent = capabilities.iter()
+        let best_agent = capabilities
+            .iter()
             .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(k, _)| k.clone())
             .unwrap_or_default();
-        tasks.iter().map(|t| (t.id.clone(), best_agent.clone())).collect()
+        tasks
+            .iter()
+            .map(|t| (t.id.clone(), best_agent.clone()))
+            .collect()
     }
 }
 
@@ -296,9 +311,15 @@ impl SwarmTelemetry {
             conflicts: AtomicU32::new(0),
         }
     }
-    pub fn record_spawn(&self) { self.spawns.fetch_add(1, AtomicOrdering::Relaxed); }
-    pub fn record_merge(&self) { self.merges.fetch_add(1, AtomicOrdering::Relaxed); }
-    pub fn record_conflict(&self) { self.conflicts.fetch_add(1, AtomicOrdering::Relaxed); }
+    pub fn record_spawn(&self) {
+        self.spawns.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    pub fn record_merge(&self) {
+        self.merges.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    pub fn record_conflict(&self) {
+        self.conflicts.fetch_add(1, AtomicOrdering::Relaxed);
+    }
     pub fn snapshot(&self) -> (u32, u32, u32) {
         (
             self.spawns.load(AtomicOrdering::Relaxed),
@@ -309,7 +330,9 @@ impl SwarmTelemetry {
 }
 
 impl Default for SwarmTelemetry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── GlobalMergeGate ──────────────────────────────────────────────────────────

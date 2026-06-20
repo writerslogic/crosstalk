@@ -1,16 +1,23 @@
 use crate::core::agent_trait::PromptAgent;
 use crate::core::environment::NixManager;
+use crate::core::environment::ToolDiscovery;
 use crate::core::state::StateManager;
 use crate::engines::FallacyDetector;
 use crate::engines::analytics::AnalyticsEngine;
-use crate::engines::collective_intelligence::{AdaptiveSelection, CollectiveIntelligenceEngine, EnsembleEngine, MetaStrategy};
+use crate::engines::collective_intelligence::{
+    AdaptiveSelection, CollectiveIntelligenceEngine, EnsembleEngine, MetaStrategy,
+};
 use crate::engines::compute::{ComputeManager, RequestRateLimiter};
 use crate::engines::consensus::{CertaintyAnalyzer, KalmanConvergence, StallDetector};
 use crate::engines::diff::DiffEngine;
-use crate::engines::intelligence::{ConsistencyScorer, IntelligenceEngine, QualityScorer, RegressionFeedbackHandler, RewardVector};
+use crate::engines::intelligence::{
+    ConsistencyScorer, IntelligenceEngine, QualityScorer, RegressionFeedbackHandler, RewardVector,
+};
 use crate::engines::linter::LinterGuard;
 use crate::engines::memory::{MemoryBridge, MemoryStore};
+use crate::engines::metacognition::MetacognitiveObserver;
 use crate::engines::planning::PlanningEngine;
+use crate::engines::prompt_evolution::PromptEvolver;
 use crate::engines::proof::ProofManager;
 use crate::engines::quality::{ArtifactMetrics, QualityEngine, RegressionDetector};
 use crate::engines::reasoning::{ReasoningEngine, SynthesisEngine};
@@ -22,16 +29,14 @@ use crate::engines::self_improvement::{
     FileWriter, PostMortemGenerator, SelfImprovementEngine, WriteOutcome,
 };
 use crate::engines::simulation::MonteCarloRunner;
-use crate::engines::metacognition::MetacognitiveObserver;
-use crate::engines::prompt_evolution::PromptEvolver;
 use crate::engines::surprise::SurpriseEngine;
 use crate::engines::swarm::SwarmController;
 use crate::engines::topology::TopologyManager;
 use crate::engines::validation::AstValidator;
+use crate::engines::verification::DecisionLedger;
 use crate::engines::verification::{
     AuditAlert, ContinuousAuditor, HashChain, InvariantChecker, TautologyFilter,
 };
-use crate::core::environment::ToolDiscovery;
 use crate::mcp::gateway::McpGateway;
 use crate::types::artifact::{Artifact, ArtifactDiff, ProofAttachment};
 use crate::types::compute::{BudgetMode, CostEntry, TokenUsage};
@@ -40,10 +45,9 @@ use crate::types::conversation::{
 };
 use crate::types::events::{ControlSignal, StreamEvent};
 use crate::types::fiduciary::{FiduciaryDutyEvent, PersonaDisclosure};
-use crate::types::principal::{AutonomyLevel, Principal};
-use crate::engines::verification::DecisionLedger;
 use crate::types::intelligence::PromptTemplate;
 use crate::types::memory::{MemoryRecord, OutcomeRecord, SessionContext};
+use crate::types::principal::{AutonomyLevel, Principal};
 use crate::types::self_improvement::SessionLesson;
 use crate::ui::visualization::GodView;
 use anyhow::{Context, Result};
@@ -54,7 +58,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::{Mutex, MutexGuard, RwLock, mpsc};
-use tracing::{warn, instrument};
+use tracing::{instrument, warn};
 
 const MAX_SESSION_TURNS: usize = 1000;
 
@@ -221,7 +225,9 @@ fn is_fatal_auth_error(e: &anyhow::Error) -> bool {
 impl Orchestrator {
     fn truncate_str(s: &str, max_bytes: usize) -> &str {
         let mut end = s.len().min(max_bytes);
-        while !s.is_char_boundary(end) { end -= 1; }
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
         &s[..end]
     }
 
@@ -273,7 +279,12 @@ impl Orchestrator {
             }
         };
 
-        if let Some(env) = &nix_env { mcp_gateway.set_nix_env(Some(std::collections::HashMap::from([("NIX_ENV".to_string(), env.clone())]))); }
+        if let Some(env) = &nix_env {
+            mcp_gateway.set_nix_env(Some(std::collections::HashMap::from([(
+                "NIX_ENV".to_string(),
+                env.clone(),
+            )])));
+        }
 
         let (alert_tx, alert_rx) = mpsc::unbounded_channel::<AuditAlert>();
         let auditor_tx = Some(ContinuousAuditor::spawn(alert_tx));
@@ -431,7 +442,9 @@ impl Orchestrator {
             principal: Mutex::new(Principal::anonymous("pending")),
             ab_control_quality: Mutex::new(Vec::new()),
             ab_test_quality: Mutex::new(Vec::new()),
-            runtime_adjuster: Mutex::new(crate::engines::self_improvement::RuntimeParameterAdjuster::new()),
+            runtime_adjuster: Mutex::new(
+                crate::engines::self_improvement::RuntimeParameterAdjuster::new(),
+            ),
             pending_planning_hints: Mutex::new(Vec::new()),
             last_rendered_template_id: Mutex::new(None),
             recent_quality_ema: Arc::new(std::sync::atomic::AtomicU64::new(0.5f64.to_bits())),
@@ -450,18 +463,27 @@ impl Orchestrator {
             .map_err(|_| anyhow::anyhow!("event channel closed"))
     }
 
-
-    pub async fn tool_call(&self, agent_id: &str, name: &str, args: serde_json::Value) -> Result<serde_json::Value> {
+    pub async fn tool_call(
+        &self,
+        agent_id: &str,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let categories = {
             let p = self.principal.lock().await;
             p.constraints.allowed_tool_categories.clone()
         };
         let mut gw = self.mcp_gateway.lock().await;
         gw.set_principal_allowed_categories(categories);
-        gw.dispatch(agent_id, "tools/call", serde_json::json!({
-            "name": name,
-            "arguments": args
-        })).await
+        gw.dispatch(
+            agent_id,
+            "tools/call",
+            serde_json::json!({
+                "name": name,
+                "arguments": args
+            }),
+        )
+        .await
     }
 
     #[instrument(skip_all, fields(session, turn))]
@@ -474,7 +496,14 @@ impl Orchestrator {
     async fn prepare_context_from_memory(
         &self,
         sigma_lock: &Arc<Mutex<ConversationState>>,
-    ) -> Result<(String, u32, Vec<Turn>, Vec<String>, Vec<MemoryRecord>, String)> {
+    ) -> Result<(
+        String,
+        u32,
+        Vec<Turn>,
+        Vec<String>,
+        Vec<MemoryRecord>,
+        String,
+    )> {
         let (session_id, turn_idx, recent_turns) = {
             let s = sigma_lock.lock().await;
             let recent: Vec<Turn> = s.turns.iter().rev().take(5).cloned().collect();
@@ -489,10 +518,12 @@ impl Orchestrator {
         let (memory_examples, antipatterns) = {
             let mut bridge = self.memory_bridge.lock().await;
             bridge.open_session(session_id.clone());
-            let examples = vec![bridge
-                .recall_relevant_summary(&session_id, &recall_query, 3, turn_idx)
-                .await
-                .unwrap_or_default()];
+            let examples = vec![
+                bridge
+                    .recall_relevant_summary(&session_id, &recall_query, 3, turn_idx)
+                    .await
+                    .unwrap_or_default(),
+            ];
             let anti = bridge.recall_antipatterns(&recall_query, 2).await;
             (examples, anti)
         };
@@ -526,7 +557,14 @@ impl Orchestrator {
             }
         };
 
-        Ok((session_id, turn_idx, recent_turns, memory_examples, antipatterns, regression_prefix))
+        Ok((
+            session_id,
+            turn_idx,
+            recent_turns,
+            memory_examples,
+            antipatterns,
+            regression_prefix,
+        ))
     }
 
     /// Phase 2: Apply analytics strategy recommendations and select active agents.
@@ -545,7 +583,10 @@ impl Orchestrator {
             for task in sub_swarms {
                 self.emit(StreamEvent::TokenReceived {
                     agent_id: "System".to_string(),
-                    token: format!("[Swarm] Spawning sub-orchestrator for complex task: {}\n", task.description),
+                    token: format!(
+                        "[Swarm] Spawning sub-orchestrator for complex task: {}\n",
+                        task.description
+                    ),
                 })
                 .await?;
                 self.swarm.spawn_node(&task.id, self.turn_tx.subscribe());
@@ -559,7 +600,9 @@ impl Orchestrator {
                             strategy_critique = true;
                             self.emit(StreamEvent::TokenReceived {
                                 agent_id: "System".to_string(),
-                                token: "Low success rate detected — switching to critique protocol\n".to_string(),
+                                token:
+                                    "Low success rate detected — switching to critique protocol\n"
+                                        .to_string(),
                             })
                             .await?;
                         }
@@ -602,7 +645,12 @@ impl Orchestrator {
             guard.clone()
         };
 
-        Ok((strategy_critique, strategy_reduce_agents, adaptive_selection, state_clone))
+        Ok((
+            strategy_critique,
+            strategy_reduce_agents,
+            adaptive_selection,
+            state_clone,
+        ))
     }
 
     /// Phase 3: Build the final prompt string including memory, metacognition, and topology.
@@ -615,7 +663,12 @@ impl Orchestrator {
         memory_examples: &[String],
         antipatterns: &[MemoryRecord],
         regression_prefix: &str,
-    ) -> Result<(String, Vec<String>, Vec<(usize, String)>, BTreeMap<String, Arc<Artifact>>)> {
+    ) -> Result<(
+        String,
+        Vec<String>,
+        Vec<(usize, String)>,
+        BTreeMap<String, Arc<Artifact>>,
+    )> {
         let history_contents: Vec<String> = s
             .turns
             .iter()
@@ -688,9 +741,15 @@ impl Orchestrator {
                 AgentGrouping::Pairs(ref pairs) => {
                     if let Some(&(a, b)) = pairs.first() {
                         let mut subset = Vec::new();
-                        if a < active.len() { subset.push(active[a].clone()); }
-                        if b < active.len() { subset.push(active[b].clone()); }
-                        if !subset.is_empty() { active = subset; }
+                        if a < active.len() {
+                            subset.push(active[a].clone());
+                        }
+                        if b < active.len() {
+                            subset.push(active[b].clone());
+                        }
+                        if !subset.is_empty() {
+                            active = subset;
+                        }
                     }
                 }
                 AgentGrouping::Branches(ref branches) => {
@@ -700,7 +759,9 @@ impl Orchestrator {
                             .iter()
                             .filter_map(|&i| active.get(i).cloned())
                             .collect();
-                        if !subset.is_empty() { active = subset; }
+                        if !subset.is_empty() {
+                            active = subset;
+                        }
                     }
                 }
                 AgentGrouping::All => {}
@@ -714,9 +775,8 @@ impl Orchestrator {
 
         let structure = ReasoningEngine::select_structure(TaskCategory::Research, &active[0].1);
         match structure {
-            TurnStructure::StepByStep => {
-                distilled_prompt.push_str("\nStructure your response with numbered reasoning steps.")
-            }
+            TurnStructure::StepByStep => distilled_prompt
+                .push_str("\nStructure your response with numbered reasoning steps."),
             TurnStructure::ProsCons => {
                 distilled_prompt.push_str("\nExplicitly analyze tradeoffs (Pros vs Cons).")
             }
@@ -736,7 +796,11 @@ impl Orchestrator {
             distilled_prompt.push_str("\n\nSuccessful examples from similar tasks:\n");
             for (i, _ex) in memory_examples.iter().take(5).enumerate() {
                 crate::log_warn!(
-                    writeln!(distilled_prompt, "- [Example {}] (recalled from memory)", i + 1),
+                    writeln!(
+                        distilled_prompt,
+                        "- [Example {}] (recalled from memory)",
+                        i + 1
+                    ),
                     "Failed to write example to prompt"
                 );
             }
@@ -745,7 +809,11 @@ impl Orchestrator {
             distilled_prompt.push_str("\n\nAntipatterns to AVOID (failed in similar tasks):\n");
             for ap in antipatterns.iter().take(3) {
                 crate::log_warn!(
-                    writeln!(distilled_prompt, "- [Session {}] {}", ap.session_id, ap.metadata_json),
+                    writeln!(
+                        distilled_prompt,
+                        "- [Session {}] {}",
+                        ap.session_id, ap.metadata_json
+                    ),
                     "Failed to write antipattern to prompt"
                 );
             }
@@ -754,7 +822,11 @@ impl Orchestrator {
         // Inject known failure patterns from intelligence store (Task 6)
         {
             let intell = self.intelligence.lock().await;
-            let task_cat = s.turns.last().and_then(|t| t.task_category).unwrap_or(TaskCategory::Research);
+            let task_cat = s
+                .turns
+                .last()
+                .and_then(|t| t.task_category)
+                .unwrap_or(TaskCategory::Research);
             let patterns = intell.top_failure_patterns(task_cat, 3);
             if !patterns.is_empty() {
                 distilled_prompt.push_str("\n\n[KNOWN FAILURE MODES — avoid these]:\n");
@@ -794,7 +866,8 @@ impl Orchestrator {
             let mut pending = self.pending_interventions.lock().await;
             if !pending.is_empty() {
                 for (_, name) in &active {
-                    if let Some(block) = MetacognitiveObserver::format_interventions(&pending, name) {
+                    if let Some(block) = MetacognitiveObserver::format_interventions(&pending, name)
+                    {
                         distilled_prompt.push_str(&block);
                     }
                 }
@@ -818,7 +891,12 @@ impl Orchestrator {
         }
 
         let artifacts_snapshot = s.artifacts.clone();
-        Ok((distilled_prompt, history_contents, active, artifacts_snapshot))
+        Ok((
+            distilled_prompt,
+            history_contents,
+            active,
+            artifacts_snapshot,
+        ))
     }
 
     /// Selects and orders the active agent list for a turn.
@@ -866,17 +944,26 @@ impl Orchestrator {
 
         {
             let obs = self.observer.lock().await;
-            let task_cat = s.turns.last().and_then(|t| t.task_category).unwrap_or(TaskCategory::Research);
+            let task_cat = s
+                .turns
+                .last()
+                .and_then(|t| t.task_category)
+                .unwrap_or(TaskCategory::Research);
             if !obs.elo_ratings.is_empty() {
                 active.sort_by(|a, b| {
                     let elo_a = obs.elo_for_category(&a.1, task_cat);
                     let elo_b = obs.elo_for_category(&b.1, task_cat);
-                    elo_b.partial_cmp(&elo_a).unwrap_or(std::cmp::Ordering::Equal)
+                    elo_b
+                        .partial_cmp(&elo_a)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 });
             }
         }
 
-        if let Some(AdaptiveSelection { preferred_agent: Some(preferred), .. }) = adaptive_selection
+        if let Some(AdaptiveSelection {
+            preferred_agent: Some(preferred),
+            ..
+        }) = adaptive_selection
             && let Some(pos) = active.iter().position(|(_, n)| n == preferred)
         {
             active.swap(0, pos);
@@ -940,7 +1027,8 @@ impl Orchestrator {
                 .await?;
             }
             if !cached_results.is_empty() {
-                let cached_names: Vec<&str> = cached_results.iter().map(|(n, _)| n.as_str()).collect();
+                let cached_names: Vec<&str> =
+                    cached_results.iter().map(|(n, _)| n.as_str()).collect();
                 self.emit(StreamEvent::TokenReceived {
                     agent_id: "System".to_string(),
                     token: format!("Reusing cached response from {}\n", cached_names.join(", ")),
@@ -951,9 +1039,16 @@ impl Orchestrator {
 
         let (is_divergent, artifacts_for_divergent) = {
             let s = sigma_lock.lock().await;
-            let divergent = s.mode_library.current().context_distribution == crate::types::mode::ContextDistribution::Divergent;
-            let arts: std::collections::HashMap<String, std::sync::Arc<crate::types::artifact::Artifact>> =
-                s.artifacts.iter().map(|(k, v)| (k.clone(), std::sync::Arc::clone(v))).collect();
+            let divergent = s.mode_library.current().context_distribution
+                == crate::types::mode::ContextDistribution::Divergent;
+            let arts: std::collections::HashMap<
+                String,
+                std::sync::Arc<crate::types::artifact::Artifact>,
+            > = s
+                .artifacts
+                .iter()
+                .map(|(k, v)| (k.clone(), std::sync::Arc::clone(v)))
+                .collect();
             (divergent, arts)
         };
 
@@ -1152,7 +1247,7 @@ impl Orchestrator {
                                 diff_quality_score: None,
                                 persona_disclosure: None,
                             };
-                            sigma.turns.push(user_turn);
+                            sigma.push_turn(user_turn);
                             sigma.iteration_index += 1;
                             return Ok(vec![]);
                         }
@@ -1219,13 +1314,19 @@ impl Orchestrator {
                 let mut sim_sum = 0.0;
                 let mut count = 0;
                 for (j, (_, set_j)) in word_sets.iter().enumerate() {
-                    if i == j { continue; }
+                    if i == j {
+                        continue;
+                    }
                     let intersection = set_i.intersection(set_j).count() as f64;
                     let union = set_i.union(set_j).count().max(1) as f64;
                     sim_sum += intersection / union;
                     count += 1;
                 }
-                let mean_sim = if count > 0 { sim_sum / count as f64 } else { 1.0 };
+                let mean_sim = if count > 0 {
+                    sim_sum / count as f64
+                } else {
+                    1.0
+                };
                 if mean_sim < 0.3 {
                     outlier_penalty.insert(id, 0.1);
                 }
@@ -1233,11 +1334,16 @@ impl Orchestrator {
 
             // Entropy mapping (disagreement heatmap)
             let mut entropy_entries = Vec::new();
-            let mut agent_artifact_proposals: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
-                std::collections::HashMap::new();
+            let mut agent_artifact_proposals: std::collections::HashMap<
+                String,
+                std::collections::HashMap<String, String>,
+            > = std::collections::HashMap::new();
             for (id, text) in final_results {
                 for (art_name, (_, content)) in Self::parse_artifacts(text) {
-                    agent_artifact_proposals.entry(art_name).or_default().insert(id.clone(), content);
+                    agent_artifact_proposals
+                        .entry(art_name)
+                        .or_default()
+                        .insert(id.clone(), content);
                 }
             }
             for (art_name, proposals) in agent_artifact_proposals {
@@ -1247,17 +1353,30 @@ impl Orchestrator {
                     let mut dist_sum = 0.0;
                     let mut count = 0;
                     for (id_j, content_j) in &agents {
-                        if id_i == id_j { continue; }
-                        let diff = similar::TextDiff::from_lines(content_i.as_str(), content_j.as_str());
+                        if id_i == id_j {
+                            continue;
+                        }
+                        let diff =
+                            similar::TextDiff::from_lines(content_i.as_str(), content_j.as_str());
                         dist_sum += 1.0 - diff.ratio();
                         count += 1;
                     }
-                    let score: f64 = if count > 0 { dist_sum as f64 / (count as f64).max(1.0) } else { 0.0 };
+                    let score: f64 = if count > 0 {
+                        dist_sum as f64 / (count as f64).max(1.0)
+                    } else {
+                        0.0
+                    };
                     scores.push(((*id_i).clone(), score));
                 }
-                entropy_entries.push(crate::types::events::EntropyEntry { artifact_name: art_name, scores });
+                entropy_entries.push(crate::types::events::EntropyEntry {
+                    artifact_name: art_name,
+                    scores,
+                });
             }
-            self.emit(crate::types::events::StreamEvent::EntropyUpdated(entropy_entries)).await?;
+            self.emit(crate::types::events::StreamEvent::EntropyUpdated(
+                entropy_entries,
+            ))
+            .await?;
         }
 
         if final_results.len() > 1 {
@@ -1265,13 +1384,19 @@ impl Orchestrator {
             if outlier_names.is_empty() {
                 self.emit(StreamEvent::TokenReceived {
                     agent_id: "System".to_string(),
-                    token: format!("All {} agents broadly agree. Merging into consensus...\n", final_results.len()),
+                    token: format!(
+                        "All {} agents broadly agree. Merging into consensus...\n",
+                        final_results.len()
+                    ),
                 })
                 .await?;
             } else {
                 self.emit(StreamEvent::TokenReceived {
                     agent_id: "System".to_string(),
-                    token: format!("{} diverged from the group — downweighting outlier during synthesis\n", outlier_names.join(", ")),
+                    token: format!(
+                        "{} diverged from the group — downweighting outlier during synthesis\n",
+                        outlier_names.join(", ")
+                    ),
                 })
                 .await?;
             }
@@ -1295,7 +1420,8 @@ impl Orchestrator {
 
         // Collective artifact synthesis (Nash equilibrium resolution)
         let mut synthesized_artifacts = String::new();
-        let mut nash_score_acc: std::collections::BTreeMap<String, (f64, u32)> = std::collections::BTreeMap::new();
+        let mut nash_score_acc: std::collections::BTreeMap<String, (f64, u32)> =
+            std::collections::BTreeMap::new();
         let artifact_proposals = Self::parse_artifacts(&synthesized_text);
         for (name, (lang, _content)) in artifact_proposals {
             let default_art = Arc::new(Artifact::default());
@@ -1309,17 +1435,28 @@ impl Orchestrator {
                     proposals_for_nash.push((agent_id.as_str(), temp_art, TurnOutcome::Compiled));
                 }
             }
-            if proposals_for_nash.is_empty() { continue; }
-            let nash_refs: Vec<(&str, &Artifact, TurnOutcome)> =
-                proposals_for_nash.iter().map(|(id, art, out)| (*id, art, *out)).collect();
-            for (agent_id, score) in crate::engines::consensus::NashSolver::compute_nash_scores(&nash_refs) {
+            if proposals_for_nash.is_empty() {
+                continue;
+            }
+            let nash_refs: Vec<(&str, &Artifact, TurnOutcome)> = proposals_for_nash
+                .iter()
+                .map(|(id, art, out)| (*id, art, *out))
+                .collect();
+            for (agent_id, score) in
+                crate::engines::consensus::NashSolver::compute_nash_scores(&nash_refs)
+            {
                 let e = nash_score_acc.entry(agent_id).or_insert((0.0_f64, 0_u32));
                 e.0 += score;
                 e.1 += 1;
             }
-            let winning_content = crate::engines::consensus::NashSolver::resolve_with_synthesis(&nash_refs, current);
+            let winning_content =
+                crate::engines::consensus::NashSolver::resolve_with_synthesis(&nash_refs, current);
             crate::log_warn!(
-                writeln!(synthesized_artifacts, "\n```{}:{}\n{}\n```", lang, name, winning_content),
+                writeln!(
+                    synthesized_artifacts,
+                    "\n```{}:{}\n{}\n```",
+                    lang, name, winning_content
+                ),
                 "Failed to write synthesized artifact"
             );
         }
@@ -1331,18 +1468,32 @@ impl Orchestrator {
 
         // Stall detection
         let stall_risk = {
-            let proposals_map: HashMap<String, String> = final_results.iter().map(|(id, text)| {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                text.hash(&mut h);
-                (id.clone(), format!("{:x}", h.finish()))
-            }).collect();
+            let proposals_map: HashMap<String, String> = final_results
+                .iter()
+                .map(|(id, text)| {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    text.hash(&mut h);
+                    (id.clone(), format!("{:x}", h.finish()))
+                })
+                .collect();
             let turn_entropy = if final_results.len() >= 2 {
-                let word_sets: Vec<std::collections::HashSet<&str>> =
-                    final_results.iter().map(|(_, t)| t.split_whitespace().collect()).collect();
-                let union_size = word_sets.iter().flat_map(|s| s.iter()).collect::<std::collections::HashSet<_>>().len();
-                let avg_size: f64 = word_sets.iter().map(|s| s.len() as f64).sum::<f64>() / word_sets.len() as f64;
-                if union_size > 0 { 1.0 - avg_size / union_size as f64 } else { 0.0 }
+                let word_sets: Vec<std::collections::HashSet<&str>> = final_results
+                    .iter()
+                    .map(|(_, t)| t.split_whitespace().collect())
+                    .collect();
+                let union_size = word_sets
+                    .iter()
+                    .flat_map(|s| s.iter())
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+                let avg_size: f64 =
+                    word_sets.iter().map(|s| s.len() as f64).sum::<f64>() / word_sets.len() as f64;
+                if union_size > 0 {
+                    1.0 - avg_size / union_size as f64
+                } else {
+                    0.0
+                }
             } else {
                 0.0
             };
@@ -1363,11 +1514,7 @@ impl Orchestrator {
 
     /// Phase 6: Run security, tautology, and fallacy filters on the synthesised response.
     /// Returns `Ok(false)` when the response must be dropped, `Ok(true)` when it passes.
-    async fn filter_response(
-        &self,
-        response: &str,
-        history_contents: &[String],
-    ) -> Result<bool> {
+    async fn filter_response(&self, response: &str, history_contents: &[String]) -> Result<bool> {
         let secrets = SecretScanner::scan(response);
         if !secrets.is_empty() {
             self.emit(StreamEvent::TokenReceived {
@@ -1378,7 +1525,10 @@ impl Orchestrator {
             return Ok(false);
         }
 
-        let current_p = f64::from_bits(self.completion_probability.load(std::sync::atomic::Ordering::Acquire));
+        let current_p = f64::from_bits(
+            self.completion_probability
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
         if current_p < 0.5 && TautologyFilter::is_tautological(response, history_contents) {
             self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
@@ -1422,7 +1572,10 @@ impl Orchestrator {
 
         while retry_count < 3 {
             let proposed_artifacts = Self::parse_artifacts(&current_response);
-            match self.process_proposed_artifacts(proposed_artifacts, artifacts_snapshot).await? {
+            match self
+                .process_proposed_artifacts(proposed_artifacts, artifacts_snapshot)
+                .await?
+            {
                 ArtifactProcessOutcome::Ready(changes, turn_outcome) => {
                     final_prepared = Some((changes, turn_outcome, current_response));
                     break;
@@ -1442,7 +1595,11 @@ impl Orchestrator {
                     if retry_count == 2 {
                         let sigma = sigma_lock.lock().await;
                         let mut topo = self.topology.lock().await;
-                        let retry_cat = sigma.turns.last().and_then(|t| t.task_category).unwrap_or(TaskCategory::Research);
+                        let retry_cat = sigma
+                            .turns
+                            .last()
+                            .and_then(|t| t.task_category)
+                            .unwrap_or(TaskCategory::Research);
                         let directive = topo.maybe_shift(&sigma, sigma.iteration_index, retry_cat);
                         drop(sigma);
                         if directive.is_none() {
@@ -1477,17 +1634,32 @@ impl Orchestrator {
                             let mut resp = String::new();
                             loop {
                                 if *p_rx.borrow() {
-                                    crate::log_warn!(p_rx.changed().await, "Failed to wait for pause state change during retry");
+                                    crate::log_warn!(
+                                        p_rx.changed().await,
+                                        "Failed to wait for pause state change during retry"
+                                    );
                                     continue;
                                 }
-                                match tokio::time::timeout(std::time::Duration::from_secs(120), stream.next()).await {
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(120),
+                                    stream.next(),
+                                )
+                                .await
+                                {
                                     Ok(Some(Ok(chunk))) => {
                                         resp.push_str(&chunk);
                                         event_tx
-                                            .send(StreamEvent::TokenReceived { agent_id: agent_id.clone(), token: chunk })
+                                            .send(StreamEvent::TokenReceived {
+                                                agent_id: agent_id.clone(),
+                                                token: chunk,
+                                            })
                                             .await?;
                                     }
-                                    Err(_) => return Err(anyhow::anyhow!("Agent {agent_id} timed out waiting for response")),
+                                    Err(_) => {
+                                        return Err(anyhow::anyhow!(
+                                            "Agent {agent_id} timed out waiting for response"
+                                        ));
+                                    }
                                     _ => break,
                                 }
                             }
@@ -1495,8 +1667,11 @@ impl Orchestrator {
                         });
                     }
 
-                    let new_proposals: Vec<(String, String)> =
-                        futures::future::join_all(tasks).await.into_iter().flatten().collect();
+                    let new_proposals: Vec<(String, String)> = futures::future::join_all(tasks)
+                        .await
+                        .into_iter()
+                        .flatten()
+                        .collect();
 
                     if new_proposals.is_empty() {
                         break;
@@ -1504,17 +1679,29 @@ impl Orchestrator {
 
                     let text_proposals: Vec<(String, String, f64)> = new_proposals
                         .iter()
-                        .map(|(id, text)| (id.clone(), text.clone(), weights.get(id).copied().unwrap_or(1.0)))
+                        .map(|(id, text)| {
+                            (
+                                id.clone(),
+                                text.clone(),
+                                weights.get(id).copied().unwrap_or(1.0),
+                            )
+                        })
                         .collect();
-                    let syn_text = EnsembleEngine::merge_proposals(text_proposals, TaskCategory::Research, "");
+                    let syn_text =
+                        EnsembleEngine::merge_proposals(text_proposals, TaskCategory::Research, "");
 
-                    let mut art_proposals: BTreeMap<String, (String, Vec<ArtifactDiff>)> = BTreeMap::new();
+                    let mut art_proposals: BTreeMap<String, (String, Vec<ArtifactDiff>)> =
+                        BTreeMap::new();
                     for (_id, text) in &new_proposals {
                         for (name, (lang, content)) in Self::parse_artifacts(text) {
                             let default_art = Arc::new(Artifact::default());
                             let current = artifacts_snapshot.get(&name).unwrap_or(&default_art);
                             let entry = art_proposals.entry(name).or_insert((lang, vec![]));
-                            entry.1.push(DiffEngine::generate_delta(&current.content, &content, current.version));
+                            entry.1.push(DiffEngine::generate_delta(
+                                &current.content,
+                                &content,
+                                current.version,
+                            ));
                         }
                     }
                     let mut syn_arts = String::new();
@@ -1523,7 +1710,10 @@ impl Orchestrator {
                         let current = artifacts_snapshot.get(&name).unwrap_or(&default_art);
                         if let Some(merged) = SynthesisEngine::merge(
                             &current.content,
-                            diffs.into_iter().map(|d| ("Anonymous".to_string(), d)).collect(),
+                            diffs
+                                .into_iter()
+                                .map(|d| ("Anonymous".to_string(), d))
+                                .collect(),
                             &lang,
                         ) {
                             crate::log_warn!(
@@ -1588,7 +1778,11 @@ impl Orchestrator {
                     timestamp: ConversationState::now(),
                     diffs: vec![],
                     certainty: Some(CertaintyAnalyzer::compute(text, 0.1)),
-                    outcome: if id == winner_id { turn_outcome } else { TurnOutcome::Unknown },
+                    outcome: if id == winner_id {
+                        turn_outcome
+                    } else {
+                        TurnOutcome::Unknown
+                    },
                     task_category: Some(TaskCategory::Research),
                     structure: Some(TurnStructure::FreeForm),
                     signature: vec![],
@@ -1617,7 +1811,11 @@ impl Orchestrator {
                     timestamp: ConversationState::now(),
                     diffs: vec![],
                     certainty: Some(CertaintyAnalyzer::compute(response_text, 0.1)),
-                    outcome: if agent_id_obs == winner_id { turn_outcome } else { TurnOutcome::Unknown },
+                    outcome: if agent_id_obs == winner_id {
+                        turn_outcome
+                    } else {
+                        TurnOutcome::Unknown
+                    },
                     task_category: Some(TaskCategory::Research),
                     structure: None,
                     signature: vec![],
@@ -1626,7 +1824,8 @@ impl Orchestrator {
                     diff_quality_score: None,
                     persona_disclosure: None,
                 };
-                let agent_interventions = obs.observe_turn(&agent_turn, pre_recent_turns, &mut surprise);
+                let agent_interventions =
+                    obs.observe_turn(&agent_turn, pre_recent_turns, &mut surprise);
                 interventions.extend(agent_interventions);
             }
             drop(surprise);
@@ -1660,7 +1859,10 @@ impl Orchestrator {
                 persona_disclosure: None,
             };
             let current_quality = QualityScorer::score(&winner_turn);
-            let prior_quality = pre_recent_turns.first().map(QualityScorer::score).unwrap_or(0.5);
+            let prior_quality = pre_recent_turns
+                .first()
+                .map(QualityScorer::score)
+                .unwrap_or(0.5);
             let improved = current_quality > prior_quality;
             {
                 let pending = self.pending_interventions.lock().await;
@@ -1678,7 +1880,10 @@ impl Orchestrator {
                 skips.insert(winner_id.to_string(), pre_turn_idx + 100);
                 self.emit(StreamEvent::TokenReceived {
                     agent_id: "Observer".to_string(),
-                    token: format!("[ELIMINATION] Agent {} removed from pool (Elo < 1200)\n", winner_id),
+                    token: format!(
+                        "[ELIMINATION] Agent {} removed from pool (Elo < 1200)\n",
+                        winner_id
+                    ),
                 })
                 .await?;
             }
@@ -1706,7 +1911,12 @@ impl Orchestrator {
             let topo_cat = topo_turn.task_category.unwrap_or(TaskCategory::Research);
             let quality = RewardVector::from_turn(&topo_turn).weighted_score(topo_cat);
             // Use last ledger entry as a cost proxy; apply_turn_to_state hasn't run yet.
-            let topo_cost = sigma.budget.entries.last().map(|e| e.cost_usd).unwrap_or(0.01);
+            let topo_cost = sigma
+                .budget
+                .entries
+                .last()
+                .map(|e| e.cost_usd)
+                .unwrap_or(0.01);
             let mut topo = self.topology.lock().await;
             topo.record_turn_outcome(turn_outcome, quality, topo_cat, topo_cost, latency_ms);
             if let Some(directive) = topo.maybe_shift(&sigma, sigma.iteration_index, topo_cat) {
@@ -1728,8 +1938,14 @@ impl Orchestrator {
     #[instrument(skip_all, fields(session, turn))]
     pub async fn run_turn(&self, sigma_lock: Arc<Mutex<ConversationState>>) -> Result<bool> {
         // Phase 1: load memory context and detect prior regressions.
-        let (pre_session_id, pre_turn_idx, pre_recent_turns, memory_examples, antipatterns, regression_prefix) =
-            self.prepare_context_from_memory(&sigma_lock).await?;
+        let (
+            pre_session_id,
+            pre_turn_idx,
+            pre_recent_turns,
+            memory_examples,
+            antipatterns,
+            regression_prefix,
+        ) = self.prepare_context_from_memory(&sigma_lock).await?;
         tracing::Span::current().record("session", pre_session_id.as_str());
         tracing::Span::current().record("turn", pre_turn_idx);
         tracing::info!(turn = pre_turn_idx, "turn starting");
@@ -1737,12 +1953,18 @@ impl Orchestrator {
         // Early convergence: skip agent calls when P(C) is high and last turn had no changes.
         {
             let current_p = f64::from_bits(self.completion_probability.load(Ordering::Acquire));
-            let last_turn_had_changes = pre_recent_turns.first().map(|t| !t.diffs.is_empty()).unwrap_or(true);
+            let last_turn_had_changes = pre_recent_turns
+                .first()
+                .map(|t| !t.diffs.is_empty())
+                .unwrap_or(true);
             if current_p > 0.85 && !last_turn_had_changes && pre_turn_idx > 2 {
                 self.emit(StreamEvent::TokenReceived {
                     agent_id: "System".to_string(),
-                    token: format!("[convergence] P(C)={current_p:.2}, no artifact changes, skipping turn\n"),
-                }).await?;
+                    token: format!(
+                        "[convergence] P(C)={current_p:.2}, no artifact changes, skipping turn\n"
+                    ),
+                })
+                .await?;
                 return Ok(true);
             }
         }
@@ -1781,13 +2003,23 @@ impl Orchestrator {
             raw_prompt
         };
 
-        tracing::info!(turn = pre_turn_idx, agents = active_agents.len(), prompt_len = prompt_str.len(), "calling agents");
+        tracing::info!(
+            turn = pre_turn_idx,
+            agents = active_agents.len(),
+            prompt_len = prompt_str.len(),
+            "calling agents"
+        );
         let start_time = Instant::now();
         let prompt_arc: Arc<str> = Arc::from(prompt_str);
 
         // Phase 4: call agents (streaming, caching, control signal handling).
         let final_results = self
-            .call_agents(&sigma_lock, Arc::clone(&prompt_arc), active_agents.clone(), strategy_reduce_agents)
+            .call_agents(
+                &sigma_lock,
+                Arc::clone(&prompt_arc),
+                active_agents.clone(),
+                strategy_reduce_agents,
+            )
             .await?;
 
         // An empty result vec signals a control-signal early exit (Shutdown/Inject/Rewind).
@@ -1797,17 +2029,24 @@ impl Orchestrator {
             return Ok(s.iteration_index > pre_turn_idx);
         }
 
-        let weights = crate::engines::consensus::InfluenceWeightManager::calculate_weights_with_recency(
-            &*sigma_lock.lock().await,
-            0.9,
-        );
+        let weights =
+            crate::engines::consensus::InfluenceWeightManager::calculate_weights_with_recency(
+                &*sigma_lock.lock().await,
+                0.9,
+            );
 
         // Phase 5: synthesise responses into a single text + artifact block.
-        let (response, nash_weight_updates, stall_risk) =
-            self.synthesize_responses(&final_results, &artifacts_snapshot, &weights).await?;
+        let (response, nash_weight_updates, stall_risk) = self
+            .synthesize_responses(&final_results, &artifacts_snapshot, &weights)
+            .await?;
 
         let latency_ms = start_time.elapsed().as_millis() as u64;
-        tracing::info!(turn = pre_turn_idx, latency_ms, responses = final_results.len(), "agents responded");
+        tracing::info!(
+            turn = pre_turn_idx,
+            latency_ms,
+            responses = final_results.len(),
+            "agents responded"
+        );
         let winner_id = "Collective Swarm".to_string();
 
         // Phase 6: security / tautology / fallacy filters.
@@ -1848,7 +2087,9 @@ impl Orchestrator {
             let directives = Self::parse_tool_directives(&final_response);
             let mut tool_outputs = Vec::new();
             for (tool_name, args) in &directives {
-                let output = self.execute_tool_directive(tool_name, args, &sigma_lock).await;
+                let output = self
+                    .execute_tool_directive(tool_name, args, &sigma_lock)
+                    .await;
                 self.emit(StreamEvent::TokenReceived {
                     agent_id: "Tool".to_string(),
                     token: format!("{output}\n"),
@@ -1878,7 +2119,9 @@ impl Orchestrator {
         {
             let quality = match turn_outcome {
                 TurnOutcome::TestsPassed | TurnOutcome::AdvancedConvergence => 1.0,
-                TurnOutcome::RolledBack | TurnOutcome::Rejected | TurnOutcome::VerificationFailed => 0.0,
+                TurnOutcome::RolledBack
+                | TurnOutcome::Rejected
+                | TurnOutcome::VerificationFailed => 0.0,
                 _ => 0.5,
             };
             if strategy_critique {
@@ -1896,7 +2139,10 @@ impl Orchestrator {
                 }
             };
             if !control.is_empty() && !test.is_empty() {
-                let significant = crate::engines::self_improvement::AbTestManager::check_significance(&control, &test);
+                let significant =
+                    crate::engines::self_improvement::AbTestManager::check_significance(
+                        &control, &test,
+                    );
                 let control_mean = control.iter().sum::<f64>() / control.len() as f64;
                 let test_mean = test.iter().sum::<f64>() / test.len() as f64;
                 let adopted = significant && test_mean > control_mean;
@@ -1910,7 +2156,12 @@ impl Orchestrator {
                     confidence_interval: (control_mean.max(0.0), test_mean.min(1.0)),
                 };
                 let mut adjuster = self.runtime_adjuster.lock().await;
-                if adjuster.apply_if_significant("critique_always", if adopted { 1.0 } else { 0.0 }, &report, "") {
+                if adjuster.apply_if_significant(
+                    "critique_always",
+                    if adopted { 1.0 } else { 0.0 },
+                    &report,
+                    "",
+                ) {
                     self.emit(StreamEvent::TokenReceived {
                         agent_id: "System".to_string(),
                         token: format!(
@@ -1924,18 +2175,19 @@ impl Orchestrator {
         }
 
         // Final: commit the turn under the sigma lock.
-        let result = self.commit_turn(
-            &sigma_lock,
-            changes,
-            turn_outcome,
-            &winner_id,
-            &final_response,
-            &prompt_arc,
-            latency_ms,
-            nash_weight_updates,
-            stall_risk,
-        )
-        .await;
+        let result = self
+            .commit_turn(
+                &sigma_lock,
+                changes,
+                turn_outcome,
+                &winner_id,
+                &final_response,
+                &prompt_arc,
+                latency_ms,
+                nash_weight_updates,
+                stall_risk,
+            )
+            .await;
 
         // Clear planning hints only after a successful commit so a failed turn
         // re-injects the same hints on the next attempt.
@@ -1952,8 +2204,8 @@ impl Orchestrator {
         snapshot: &BTreeMap<String, Arc<Artifact>>,
     ) -> Result<ArtifactProcessOutcome> {
         let current_sigma_snap = ConversationState {
-             artifacts: snapshot.clone(),
-             ..Default::default()
+            artifacts: snapshot.clone(),
+            ..Default::default()
         };
         let all_names: Vec<String> = snapshot.keys().cloned().collect();
         let mut changes = Vec::new();
@@ -2007,7 +2259,11 @@ impl Orchestrator {
             if p_fail > 0.5 {
                 return Ok(ArtifactProcessOutcome::Invalid);
             }
-            let mc_variance = if mc_confidence > 0.0 { 1.0 - mc_confidence } else { 0.5 };
+            let mc_variance = if mc_confidence > 0.0 {
+                1.0 - mc_confidence
+            } else {
+                0.5
+            };
 
             let new_metrics = QualityEngine::analyze_artifact(
                 &Artifact {
@@ -2020,11 +2276,14 @@ impl Orchestrator {
             // --- Suggestion 8: Historical Regression Testing ---
             if let Some(gold) = self.gold_state.lock().await.as_ref() {
                 let mut temp_sigma = ConversationState::default();
-                temp_sigma.artifacts.insert(name.clone(), Arc::new(Artifact {
-                     content: new_content.clone(),
-                     metrics: new_metrics.clone(),
-                     ..(**current).clone()
-                }));
+                temp_sigma.artifacts.insert(
+                    name.clone(),
+                    Arc::new(Artifact {
+                        content: new_content.clone(),
+                        metrics: new_metrics.clone(),
+                        ..(**current).clone()
+                    }),
+                );
                 let report = crate::engines::quality::RegressionDetector::detect(gold, &temp_sigma);
                 if report.drift_score > 0.5 {
                     crate::log_warn!(self.emit(StreamEvent::TokenReceived {
@@ -2037,13 +2296,26 @@ impl Orchestrator {
 
             // --- Suggestion 7: RAG-Powered Evidence Anchoring ---
             if let Some(bridge) = self.memory_bridge.lock().await.store.as_ref() {
-                let anchored = crate::engines::reasoning::ReasoningEngine::anchor_evidence_rag(&new_content, &current_sigma_snap, bridge).await;
-                let unanchored_claims: Vec<_> = anchored.iter().filter(|c| c.confidence < 0.4).collect();
+                let anchored = crate::engines::reasoning::ReasoningEngine::anchor_evidence_rag(
+                    &new_content,
+                    &current_sigma_snap,
+                    bridge,
+                )
+                .await;
+                let unanchored_claims: Vec<_> =
+                    anchored.iter().filter(|c| c.confidence < 0.4).collect();
                 if !unanchored_claims.is_empty() {
-                    crate::log_warn!(self.emit(StreamEvent::TokenReceived {
-                        agent_id: "System".to_string(),
-                        token: format!("[warning] {} claims in \"{name}\" lack evidence anchoring\n", unanchored_claims.len()),
-                    }).await, "Failed to emit anchoring warning");
+                    crate::log_warn!(
+                        self.emit(StreamEvent::TokenReceived {
+                            agent_id: "System".to_string(),
+                            token: format!(
+                                "[warning] {} claims in \"{name}\" lack evidence anchoring\n",
+                                unanchored_claims.len()
+                            ),
+                        })
+                        .await,
+                        "Failed to emit anchoring warning"
+                    );
                 }
             }
 
@@ -2063,10 +2335,14 @@ impl Orchestrator {
                     } else {
                         let len = frame.len() as f64;
                         let mean: f64 = frame.iter().map(|&b| b as f64).sum::<f64>() / len;
-                        let variance: f64 = frame.iter().map(|&b| {
-                            let d = b as f64 - mean;
-                            d * d
-                        }).sum::<f64>() / len;
+                        let variance: f64 = frame
+                            .iter()
+                            .map(|&b| {
+                                let d = b as f64 - mean;
+                                d * d
+                            })
+                            .sum::<f64>()
+                            / len;
                         // Max variance for u8 data is 128^2 = 16384; normalise to [0.0, 1.0].
                         (variance / 16384.0_f64).min(1.0)
                     }
@@ -2115,16 +2391,27 @@ impl Orchestrator {
                     metrics: new_metrics.clone(),
                     skeleton: String::new(),
                 };
-                match crate::engines::verification::InvariantChecker::verify_artifact(&temp_art).await {
+                match crate::engines::verification::InvariantChecker::verify_artifact(&temp_art)
+                    .await
+                {
                     Ok(Err(err)) => {
-                        crate::log_warn!(self.emit(StreamEvent::TokenReceived {
-                            agent_id: "System".to_string(),
-                            token: format!("[verus] formal verification failed for \"{name}\":\n{err}\n"),
-                        }).await, "Failed to emit verus error");
-                        return Ok(ArtifactProcessOutcome::Ready(vec![], TurnOutcome::VerificationFailed));
+                        crate::log_warn!(
+                            self.emit(StreamEvent::TokenReceived {
+                                agent_id: "System".to_string(),
+                                token: format!(
+                                    "[verus] formal verification failed for \"{name}\":\n{err}\n"
+                                ),
+                            })
+                            .await,
+                            "Failed to emit verus error"
+                        );
+                        return Ok(ArtifactProcessOutcome::Ready(
+                            vec![],
+                            TurnOutcome::VerificationFailed,
+                        ));
                     }
                     Err(e) => {
-                         tracing::warn!("verus execution error: {:?}", e);
+                        tracing::warn!("verus execution error: {:?}", e);
                     }
                     _ => {}
                 }
@@ -2144,10 +2431,14 @@ impl Orchestrator {
                 {
                     Ok(report) if !report.passed => return Ok(ArtifactProcessOutcome::Invalid),
                     Err(e) => {
-                        crate::log_warn!(self.emit(StreamEvent::TokenReceived {
-                            agent_id: "System".to_string(),
-                            token: format!("[lint] check failed for \"{name}\": {e}\n"),
-                        }).await, "Failed to emit lint error");
+                        crate::log_warn!(
+                            self.emit(StreamEvent::TokenReceived {
+                                agent_id: "System".to_string(),
+                                token: format!("[lint] check failed for \"{name}\": {e}\n"),
+                            })
+                            .await,
+                            "Failed to emit lint error"
+                        );
                         return Ok(ArtifactProcessOutcome::Invalid);
                     }
                     _ => {}
@@ -2194,7 +2485,10 @@ impl Orchestrator {
             *count += 1;
             if *count > 2 {
                 let mut sigma = sigma_lock.lock().await;
-                let w = sigma.agent_weights.entry(agent_id.to_string()).or_insert(1.0);
+                let w = sigma
+                    .agent_weights
+                    .entry(agent_id.to_string())
+                    .or_insert(1.0);
                 *w = (*w * 0.5).max(0.0);
             }
         }
@@ -2205,19 +2499,22 @@ impl Orchestrator {
 
         let mut turn_diffs = Vec::new();
         for change in changes {
-            let artifact_arc = sigma.artifacts.entry(change.name.clone()).or_insert_with(|| {
-                Arc::new(Artifact {
-                    name: change.name.clone(),
-                    language: change.lang.clone(),
-                    content: String::new(),
-                    version: 0,
-                    history: vec![],
-                    ast_versions: BTreeMap::new(),
-                    proof_attachments: vec![],
-                    metrics: ArtifactMetrics::default(),
-                    skeleton: String::new(),
-                })
-            });
+            let artifact_arc = sigma
+                .artifacts
+                .entry(change.name.clone())
+                .or_insert_with(|| {
+                    Arc::new(Artifact {
+                        name: change.name.clone(),
+                        language: change.lang.clone(),
+                        content: String::new(),
+                        version: 0,
+                        history: vec![],
+                        ast_versions: BTreeMap::new(),
+                        proof_attachments: vec![],
+                        metrics: ArtifactMetrics::default(),
+                        skeleton: String::new(),
+                    })
+                });
             let mut artifact = (**artifact_arc).clone();
             artifact.history.push(change.delta.clone());
             artifact.content = change.new_content;
@@ -2227,7 +2524,11 @@ impl Orchestrator {
             artifact.skeleton = change.skeleton;
             artifact.proof_attachments.push(change.proof);
             for (node_id, content) in &change.node_updates {
-                artifact.ast_versions.entry(node_id.clone()).or_default().push((current_i, content.clone()));
+                artifact
+                    .ast_versions
+                    .entry(node_id.clone())
+                    .or_default()
+                    .push((current_i, content.clone()));
             }
             *artifact_arc = Arc::new(artifact);
             for (node_id, _) in &change.node_updates {
@@ -2245,7 +2546,10 @@ impl Orchestrator {
             se.record_prediction(agent_id, certainty);
             let s = se.compute_surprise(agent_id, turn_outcome);
             let current_w = sigma.agent_weights.get(agent_id).copied().unwrap_or(1.0);
-            sigma.agent_weights.insert(agent_id.to_string(), se.calibrate_weight(agent_id, current_w));
+            sigma.agent_weights.insert(
+                agent_id.to_string(),
+                se.calibrate_weight(agent_id, current_w),
+            );
             s
         };
         if surprise > 0.5 && sigma.turns.len() >= 2 {
@@ -2256,9 +2560,16 @@ impl Orchestrator {
             .await?;
         }
 
-        let combined_diff_text: String = turn_diffs.iter().map(|(_, d)| d.diff_text.as_str()).collect::<Vec<_>>().join("\n");
+        let combined_diff_text: String = turn_diffs
+            .iter()
+            .map(|(_, d)| d.diff_text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         let consistency_score = Some(ConsistencyScorer::score(response, &combined_diff_text));
-        let dq_score = { let intell = self.intelligence.lock().await; intell.diff_quality_score(agent_id) };
+        let dq_score = {
+            let intell = self.intelligence.lock().await;
+            intell.diff_quality_score(agent_id)
+        };
 
         let mut turn = Turn {
             index: sigma.iteration_index,
@@ -2269,7 +2580,10 @@ impl Orchestrator {
             certainty: Some(certainty),
             outcome: turn_outcome,
             task_category: Some(TaskCategory::Research),
-            structure: Some(ReasoningEngine::select_structure(TaskCategory::Research, agent_id)),
+            structure: Some(ReasoningEngine::select_structure(
+                TaskCategory::Research,
+                agent_id,
+            )),
             signature: vec![],
             surprise_signal: Some(surprise),
             consistency_score,
@@ -2302,7 +2616,8 @@ impl Orchestrator {
                         event: FiduciaryDutyEvent::PersonaDisclosed(disclosure),
                         session_id: sid,
                         timestamp: ConversationState::now(),
-                    }).await,
+                    })
+                    .await,
                     "fiduciary persona signal emit failed"
                 );
             }
@@ -2315,7 +2630,12 @@ impl Orchestrator {
             };
             let surprise_penalty = (surprise - 0.5).max(0.0) * 0.6;
             let artifact_health = if !sigma.artifacts.is_empty() {
-                sigma.artifacts.values().map(|a| a.metrics.health_score).sum::<f64>() / sigma.artifacts.len() as f64
+                sigma
+                    .artifacts
+                    .values()
+                    .map(|a| a.metrics.health_score)
+                    .sum::<f64>()
+                    / sigma.artifacts.len() as f64
             } else {
                 1.0
             };
@@ -2325,7 +2645,12 @@ impl Orchestrator {
         {
             let avg_quality = if !sigma.turns.is_empty() {
                 let sum: f64 = sigma.turns.iter().filter_map(|t| t.certainty).sum();
-                let count = sigma.turns.iter().filter(|t| t.certainty.is_some()).count().max(1);
+                let count = sigma
+                    .turns
+                    .iter()
+                    .filter(|t| t.certainty.is_some())
+                    .count()
+                    .max(1);
                 sum / count as f64
             } else {
                 0.5
@@ -2338,7 +2663,16 @@ impl Orchestrator {
         {
             let alert_info = {
                 let intell = self.intelligence.lock().await;
-                let recent_turns: Vec<Turn> = sigma.turns.iter().rev().take(5).cloned().collect::<Vec<_>>().into_iter().rev().collect();
+                let recent_turns: Vec<Turn> = sigma
+                    .turns
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
                 intell.detect_regression(agent_id, &recent_turns)
             };
             if let Some(alert) = alert_info {
@@ -2362,23 +2696,32 @@ impl Orchestrator {
             }
         }
 
-        { let mut coll = self.collective.lock().await; coll.update_specialization(&turn); }
+        {
+            let mut coll = self.collective.lock().await;
+            coll.update_specialization(&turn);
+        }
 
-        ComputeManager::manage_budget(&mut sigma, CostEntry {
-            turn_id: turn.index,
-            model_id: agent_id.to_string(),
-            usage: TokenUsage {
-                input_tokens: prompt.len() as u32 / 4,
-                output_tokens: response.len() as u32 / 4,
-                total_tokens: (prompt.len() + response.len()) as u32 / 4,
+        ComputeManager::manage_budget(
+            &mut sigma,
+            CostEntry {
+                turn_id: turn.index,
+                model_id: agent_id.to_string(),
+                usage: TokenUsage {
+                    input_tokens: prompt.len() as u32 / 4,
+                    output_tokens: response.len() as u32 / 4,
+                    total_tokens: (prompt.len() + response.len()) as u32 / 4,
+                },
+                cost_usd: 0.01,
+                latency_ms,
+                timestamp: turn.timestamp,
             },
-            cost_usd: 0.01,
-            latency_ms,
-            timestamp: turn.timestamp,
-        });
+        );
 
         if sigma.turns.len() >= MAX_SESSION_TURNS {
-            return Err(anyhow::anyhow!("Session turn limit ({}) exceeded", MAX_SESSION_TURNS));
+            return Err(anyhow::anyhow!(
+                "Session turn limit ({}) exceeded",
+                MAX_SESSION_TURNS
+            ));
         }
 
         // Fiduciary gate: Care/Autonomy duty — block or signal based on certainty and autonomy level.
@@ -2402,7 +2745,8 @@ impl Orchestrator {
                             event,
                             session_id: sid,
                             timestamp: ConversationState::now(),
-                        }).await,
+                        })
+                        .await,
                         "fiduciary signal emit failed"
                     );
                     if certainty < CARE_CERTAINTY_CRITICAL
@@ -2418,7 +2762,7 @@ impl Orchestrator {
             }
         }
 
-        sigma.turns.push(turn.clone());
+        sigma.push_turn(turn.clone());
         if let Err(e) = self.turn_tx.send(turn.clone()) {
             tracing::debug!(err = %e, "turn broadcast: no active swarm subscribers");
         }
@@ -2442,7 +2786,8 @@ impl Orchestrator {
                         event,
                         session_id: sigma.session_id.clone(),
                         timestamp: ConversationState::now(),
-                    }).await,
+                    })
+                    .await,
                     "fiduciary signal emit failed"
                 );
             }
@@ -2454,7 +2799,9 @@ impl Orchestrator {
 
             // Update EMA of recent quality (Task 8: adaptive evolution rate)
             let new_ema = loop {
-                let old_bits = self.recent_quality_ema.load(std::sync::atomic::Ordering::Acquire);
+                let old_bits = self
+                    .recent_quality_ema
+                    .load(std::sync::atomic::Ordering::Acquire);
                 let old_val = f64::from_bits(old_bits);
                 let candidate = 0.8 * old_val + 0.2 * quality;
                 match self.recent_quality_ema.compare_exchange_weak(
@@ -2469,7 +2816,13 @@ impl Orchestrator {
             };
 
             // Adaptive evolution interval: faster when stalling, slower when improving
-            let evolve_interval = if new_ema > 0.7 { 10u32 } else if new_ema > 0.4 { 5 } else { 2 };
+            let evolve_interval = if new_ema > 0.7 {
+                10u32
+            } else if new_ema > 0.4 {
+                5
+            } else {
+                2
+            };
 
             let mut evolver = self.prompt_evolver.lock().await;
             // Feed back to the specific template that was rendered, not the agent name
@@ -2485,21 +2838,33 @@ impl Orchestrator {
             }
         }
 
-        if matches!(turn_outcome, TurnOutcome::TestsPassed | TurnOutcome::AdvancedConvergence)
-            && let Some(certainty) = turn.certainty && certainty > 0.7
+        if matches!(
+            turn_outcome,
+            TurnOutcome::TestsPassed | TurnOutcome::AdvancedConvergence
+        ) && let Some(certainty) = turn.certainty
+            && certainty > 0.7
         {
             let seed_cat = turn.task_category.unwrap_or(TaskCategory::Research);
             let mut evolver = self.prompt_evolver.lock().await;
             evolver.seed_from_successful_turn(prompt, seed_cat);
         }
 
-        if matches!(turn_outcome, TurnOutcome::TestsPassed | TurnOutcome::Compiled) {
+        if matches!(
+            turn_outcome,
+            TurnOutcome::TestsPassed | TurnOutcome::Compiled
+        ) {
             for (name, artifact) in &sigma.artifacts {
-                if let Ok(improved) = crate::engines::self_improvement::SelfCodeModifier::propose_improvement(name, &artifact.content)
-                    && improved != artifact.content && AstValidator::validate(&improved, &artifact.language).is_ok()
-                        && let Err(e) = self.file_writer.write_artifact(name, &improved).await {
-                            warn!(artifact = %name, error = %e, "self-improvement write failed");
-                        }
+                if let Ok(improved) =
+                    crate::engines::self_improvement::SelfCodeModifier::propose_improvement(
+                        name,
+                        &artifact.content,
+                    )
+                    && improved != artifact.content
+                    && AstValidator::validate(&improved, &artifact.language).is_ok()
+                    && let Err(e) = self.file_writer.write_artifact(name, &improved).await
+                {
+                    warn!(artifact = %name, error = %e, "self-improvement write failed");
+                }
             }
         }
 
@@ -2507,7 +2872,11 @@ impl Orchestrator {
         sigma.state_hash = HashChain::compute(&sigma, &prev_hash)?;
 
         sigma.agent_weights = match turn.task_category {
-            Some(cat) => crate::engines::consensus::InfluenceWeightManager::calculate_weights_for_category(&sigma, cat, 0.9),
+            Some(cat) => {
+                crate::engines::consensus::InfluenceWeightManager::calculate_weights_for_category(
+                    &sigma, cat, 0.9,
+                )
+            }
             None => crate::engines::consensus::InfluenceWeightManager::calculate_weights(&sigma),
         }
         .into_iter()
@@ -2530,16 +2899,27 @@ impl Orchestrator {
 
         if stall_risk > 0.6 {
             let mut coll = self.collective.lock().await;
-            if coll.meta_optimizer.select_best(TaskCategory::Research) == MetaStrategy::DirectImplementation {
-                coll.meta_optimizer.record(MetaStrategy::DebateAndCritique, 0.6);
-                tracing::info!(stall_risk, "stall detected: switching meta-strategy to DebateAndCritique");
+            if coll.meta_optimizer.select_best(TaskCategory::Research)
+                == MetaStrategy::DirectImplementation
+            {
+                coll.meta_optimizer
+                    .record(MetaStrategy::DebateAndCritique, 0.6);
+                tracing::info!(
+                    stall_risk,
+                    "stall detected: switching meta-strategy to DebateAndCritique"
+                );
             }
         }
 
         let current_p = f64::from_bits(self.completion_probability.load(Ordering::Acquire));
-        let measurement = if response.contains("OPTIMAL") || response.contains("CONVERGED") { 1.0 } else { certainty * 0.8 };
+        let measurement = if response.contains("OPTIMAL") || response.contains("CONVERGED") {
+            1.0
+        } else {
+            certainty * 0.8
+        };
         let next_p = KalmanConvergence::new(current_p).update_adaptive(measurement, certainty);
-        self.completion_probability.store(next_p.to_bits(), Ordering::Release);
+        self.completion_probability
+            .store(next_p.to_bits(), Ordering::Release);
         sigma.completion_probability = next_p;
         tracing::info!(
             turn = turn.index,
@@ -2552,7 +2932,11 @@ impl Orchestrator {
         self.emit(StreamEvent::ConvergenceUpdated {
             p: next_p,
             certainty,
-            agent_weights: sigma.agent_weights.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            agent_weights: sigma
+                .agent_weights
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
         })
         .await?;
 
@@ -2633,11 +3017,13 @@ impl Orchestrator {
                 to_name: new_name.clone(),
                 reason,
                 synthesized: false,
-            }).await?;
+            })
+            .await?;
             self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
                 token: format!("[MODE → {}]\n", new_name),
-            }).await?;
+            })
+            .await?;
             sigma = sigma_lock.lock().await;
             sigma.mode_active_turns = 0;
         }
@@ -2646,7 +3032,9 @@ impl Orchestrator {
         sigma.novel_signal = None;
 
         // Surprise amplification: compute novel signal for next turn.
-        if sigma.mode_library.current().surprise_handling == crate::types::mode::SurpriseHandling::Amplify {
+        if sigma.mode_library.current().surprise_handling
+            == crate::types::mode::SurpriseHandling::Amplify
+        {
             let mut scorer = crate::engines::novelty::NoveltyScorer::new();
             for t in sigma.turns.iter().rev().skip(1).take(5) {
                 scorer.absorb(&t.content);
@@ -2661,7 +3049,8 @@ impl Orchestrator {
 
         // Rejection loop: when OPTIMAL fires in RejectionLoop mode, inject rejection prompt.
         if response.contains("OPTIMAL")
-            && sigma.mode_library.current().loop_structure == crate::types::mode::LoopStructure::RejectionLoop
+            && sigma.mode_library.current().loop_structure
+                == crate::types::mode::LoopStructure::RejectionLoop
             && !sigma.rejection_loop_active
         {
             sigma.rejection_loop_active = true;
@@ -2673,9 +3062,23 @@ impl Orchestrator {
             );
         } else if sigma.rejection_loop_active {
             if response.contains("REJECT_FRAME:") {
-                let new_seed = response.find("REJECT_FRAME:").map(|i| response[i + 13..].lines().next().unwrap_or("").trim().to_string()).unwrap_or_default();
+                let new_seed = response
+                    .find("REJECT_FRAME:")
+                    .map(|i| {
+                        response[i + 13..]
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string()
+                    })
+                    .unwrap_or_default();
                 sigma.rejection_loop_active = false;
-                sigma.novel_signal = if new_seed.is_empty() { None } else { Some(new_seed) };
+                sigma.novel_signal = if new_seed.is_empty() {
+                    None
+                } else {
+                    Some(new_seed)
+                };
                 let old_name = sigma.mode_library.current_name().to_string();
                 sigma.mode_library.switch_to_name("Generative");
                 let new_name = sigma.mode_library.current_name().to_string();
@@ -2686,11 +3089,13 @@ impl Orchestrator {
                     to_name: new_name.clone(),
                     reason: "Rejection frame found — switching to Generative".to_string(),
                     synthesized: false,
-                }).await?;
+                })
+                .await?;
                 self.emit(StreamEvent::TokenReceived {
                     agent_id: "System".to_string(),
                     token: format!("[MODE → {}]\n", new_name),
-                }).await?;
+                })
+                .await?;
                 sigma = sigma_lock.lock().await;
             } else if response.contains("FRAME_EXHAUSTED") {
                 sigma.rejection_loop_active = false;
@@ -2700,8 +3105,21 @@ impl Orchestrator {
         // Mode synthesis: track active turns and inject synthesis prompt when stalled.
         {
             let avg_certainty = if !sigma.turns.is_empty() {
-                let sum: f64 = sigma.turns.iter().rev().take(6).filter_map(|t| t.certainty).sum();
-                let count = sigma.turns.iter().rev().take(6).filter(|t| t.certainty.is_some()).count().max(1);
+                let sum: f64 = sigma
+                    .turns
+                    .iter()
+                    .rev()
+                    .take(6)
+                    .filter_map(|t| t.certainty)
+                    .sum();
+                let count = sigma
+                    .turns
+                    .iter()
+                    .rev()
+                    .take(6)
+                    .filter(|t| t.certainty.is_some())
+                    .count()
+                    .max(1);
                 sum / count as f64
             } else {
                 1.0
@@ -2737,7 +3155,11 @@ impl Orchestrator {
         // Try to parse a mode synthesized by the agent from this response.
         if let Some(new_mode) = crate::types::mode::ModeLibrary::try_parse_synthesized(
             response,
-            format!("Synthesized after {} turns in {}", sigma.mode_active_turns, sigma.mode_library.current_name()),
+            format!(
+                "Synthesized after {} turns in {}",
+                sigma.mode_active_turns,
+                sigma.mode_library.current_name()
+            ),
         ) {
             let old_name = sigma.mode_library.current_name().to_string();
             let new_name = new_mode.name.clone();
@@ -2750,23 +3172,29 @@ impl Orchestrator {
                 to_name: new_name.clone(),
                 reason: "Mode synthesized by agent".to_string(),
                 synthesized: true,
-            }).await?;
+            })
+            .await?;
             self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
                 token: format!("[MODE SYNTHESIZED → {}]\n", new_name),
-            }).await?;
+            })
+            .await?;
             sigma = sigma_lock.lock().await;
         }
 
         if let Err(e) = InvariantChecker::check_all(&sigma) {
             sigma.artifacts = artifact_snapshot;
-            if let Some(t) = sigma.turns.last_mut() { t.outcome = TurnOutcome::RolledBack; }
+            if let Some(t) = sigma.turns.last_mut() {
+                t.outcome = TurnOutcome::RolledBack;
+            }
             let should_skip = {
                 let mut counters = self.rollback_counters.lock().await;
                 let count = counters.entry(agent_id.to_string()).or_insert(0);
                 *count += 1;
                 let exceeded = *count >= 3;
-                if exceeded { *count = 0; }
+                if exceeded {
+                    *count = 0;
+                }
                 exceeded
             };
             self.emit(StreamEvent::TokenReceived {
@@ -2784,15 +3212,31 @@ impl Orchestrator {
                 skips.insert(agent_id.to_string(), sigma.iteration_index + 1);
             }
             turn.outcome = TurnOutcome::RolledBack;
-            { let intell = self.intelligence.lock().await; intell.update_profile_with_latency(&turn, 0.0, latency_ms); }
-            { let mut ctx = self.session_ctx.lock().await; ctx.record_turn(TurnOutcome::RolledBack); }
+            {
+                let intell = self.intelligence.lock().await;
+                intell.update_profile_with_latency(&turn, 0.0, latency_ms);
+            }
+            {
+                let mut ctx = self.session_ctx.lock().await;
+                ctx.record_turn(TurnOutcome::RolledBack);
+            }
             return Ok(None);
         }
-        { let mut counters = self.rollback_counters.lock().await; counters.insert(agent_id.to_string(), 0); }
+        {
+            let mut counters = self.rollback_counters.lock().await;
+            counters.insert(agent_id.to_string(), 0);
+        }
         self.state_manager.checkpoint_async(&sigma).await?;
         self.emit(StreamEvent::CheckpointWritten(current_i)).await?;
 
-        Ok(Some((turn, quality_score, certainty, surprise, current_i, artifact_snapshot)))
+        Ok(Some((
+            turn,
+            quality_score,
+            certainty,
+            surprise,
+            current_i,
+            artifact_snapshot,
+        )))
     }
 
     /// Sub-phase of `commit_turn`: file I/O, verification, post-commit state updates, and
@@ -2814,7 +3258,12 @@ impl Orchestrator {
             let io: Vec<(String, Arc<Artifact>)> = turn
                 .diffs
                 .iter()
-                .filter_map(|(name, _)| sigma.artifacts.get(name).map(|a| (name.clone(), Arc::clone(a))))
+                .filter_map(|(name, _)| {
+                    sigma
+                        .artifacts
+                        .get(name)
+                        .map(|a| (name.clone(), Arc::clone(a)))
+                })
                 .collect();
             let all = sigma.artifacts.clone();
             let diffs = turn.diffs.clone();
@@ -2834,7 +3283,9 @@ impl Orchestrator {
                 Ok(WriteOutcome::VerificationFailed(stderr)) => {
                     self.emit(StreamEvent::TokenReceived {
                         agent_id: "System".to_string(),
-                        token: format!("[write] {name}: verification failed, original restored\n{stderr}"),
+                        token: format!(
+                            "[write] {name}: verification failed, original restored\n{stderr}"
+                        ),
                     })
                     .await?;
                 }
@@ -2857,23 +3308,36 @@ impl Orchestrator {
             let status = if *passed { "PASS" } else { "FAIL" };
             self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
-                token: format!("[verify] {} [{}]\n{}\n", tool_name, status, Self::truncate_str(output, 500)),
+                token: format!(
+                    "[verify] {} [{}]\n{}\n",
+                    tool_name,
+                    status,
+                    Self::truncate_str(output, 500)
+                ),
             })
             .await?;
         }
         if !verification_results.is_empty() && verification_results.iter().all(|(_, _, p)| *p) {
             turn.outcome = TurnOutcome::TestsPassed;
             let current_p = f64::from_bits(self.completion_probability.load(Ordering::Acquire));
-            self.completion_probability.store((current_p + 0.15).min(1.0).to_bits(), Ordering::Release);
+            self.completion_probability
+                .store((current_p + 0.15).min(1.0).to_bits(), Ordering::Release);
         }
 
         // Re-acquire lock for remaining state updates.
         let mut sigma = sigma_lock.lock().await;
-        sigma.last_verification = verification_results.iter()
+        sigma.last_verification = verification_results
+            .iter()
             .map(|(name, output, passed)| (name.clone(), output.clone(), *passed))
             .collect();
-        { let intell = self.intelligence.lock().await; intell.update_profile_with_latency(&turn, quality_score, latency_ms); }
-        { let mut ctx = self.session_ctx.lock().await; ctx.record_turn(turn.outcome); }
+        {
+            let intell = self.intelligence.lock().await;
+            intell.update_profile_with_latency(&turn, quality_score, latency_ms);
+        }
+        {
+            let mut ctx = self.session_ctx.lock().await;
+            ctx.record_turn(turn.outcome);
+        }
         self.swarm.broadcast_turn(turn.clone())?;
 
         {
@@ -2885,7 +3349,10 @@ impl Orchestrator {
             && !auditor_tx.is_closed()
             && let Err(e) = auditor_tx.send(sigma.clone()).await
         {
-            self.emit(StreamEvent::Error(format!("auditor send failed, auditor task dead: {e}"))).await?;
+            self.emit(StreamEvent::Error(format!(
+                "auditor send failed, auditor task dead: {e}"
+            )))
+            .await?;
         }
 
         if let Some(ref mut root) = sigma.goal_tree.root {
@@ -2906,24 +3373,33 @@ impl Orchestrator {
         }
 
         self.emit(StreamEvent::ArtifactsUpdated(
-            sigma.artifacts.iter().map(|(name, a)| crate::types::events::ArtifactSnapshot {
-                name: name.clone(),
-                skeleton: a.skeleton.clone(),
-                version: a.version,
-                diff_count: a.history.len(),
-            }).collect()
+            sigma
+                .artifacts
+                .iter()
+                .map(|(name, a)| crate::types::events::ArtifactSnapshot {
+                    name: name.clone(),
+                    skeleton: a.skeleton.clone(),
+                    version: a.version,
+                    diff_count: a.history.len(),
+                })
+                .collect(),
         ))
         .await?;
 
         self.emit(StreamEvent::TokenReceived {
             agent_id: "System".to_string(),
-            token: format!("\n[Turn Complete | P(C): {:.2} | Hash: {:02x?}]\n", next_p, &sigma.state_hash[..4]),
+            token: format!(
+                "\n[Turn Complete | P(C): {:.2} | Hash: {:02x?}]\n",
+                next_p,
+                &sigma.state_hash[..4]
+            ),
         })
         .await?;
         self.emit(StreamEvent::TurnComplete(turn.clone())).await?;
 
         {
-            let mut audit_rx: MutexGuard<'_, mpsc::UnboundedReceiver<AuditAlert>> = self.audit_rx.lock().await;
+            let mut audit_rx: MutexGuard<'_, mpsc::UnboundedReceiver<AuditAlert>> =
+                self.audit_rx.lock().await;
             while let Ok(alert) = audit_rx.try_recv() {
                 // Only act on alerts for the current iteration; stale alerts are not indicative of tampering.
                 if alert.iteration_index == sigma.iteration_index {
@@ -2941,7 +3417,10 @@ impl Orchestrator {
 
         {
             let session_id = sigma.session_id.clone();
-            let compiled = matches!(turn.outcome, TurnOutcome::Compiled | TurnOutcome::TestsPassed | TurnOutcome::AdvancedConvergence);
+            let compiled = matches!(
+                turn.outcome,
+                TurnOutcome::Compiled | TurnOutcome::TestsPassed | TurnOutcome::AdvancedConvergence
+            );
             let content_key = Self::truncate_str(response, 500).to_string();
             let preview = Self::truncate_str(response, 200).to_string();
             let metadata = serde_json::json!({"content": preview, "outcome": format!("{:?}", turn.outcome), "agent": agent_id}).to_string();
@@ -2969,7 +3448,9 @@ impl Orchestrator {
         if next_p > 0.70 && next_p <= 0.85 {
             self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
-                token: format!("[convergence] p={next_p:.2}, moderate confidence, continuing refinement"),
+                token: format!(
+                    "[convergence] p={next_p:.2}, moderate confidence, continuing refinement"
+                ),
             })
             .await?;
         } else if next_p > 0.85 && next_p <= 0.95 {
@@ -2987,18 +3468,28 @@ impl Orchestrator {
             let exec_summary = ConvergenceReport::generate(&sigma);
             self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
-                token: format!("[self-improve] {:?} | [analytics] {:?} | [release] {}", eval, report, exec_summary),
+                token: format!(
+                    "[self-improve] {:?} | [analytics] {:?} | [release] {}",
+                    eval, report, exec_summary
+                ),
             })
             .await?;
             if let Some(mortem) = PostMortemGenerator::generate(&sigma) {
                 let bridge = self.memory_bridge.lock().await;
-                if let Err(e) = bridge.store_failure_lesson_async(&sigma.session_id, &mortem).await {
+                if let Err(e) = bridge
+                    .store_failure_lesson_async(&sigma.session_id, &mortem)
+                    .await
+                {
                     warn!(session = %sigma.session_id, error = %e, "failed to store post-mortem");
                 }
             }
-            let mut session_store = MemoryStore::new(&format!("/tmp/crosstalk-{}", sigma.session_id));
+            let mut session_store =
+                MemoryStore::new(&format!("/tmp/crosstalk-{}", sigma.session_id));
             session_store.init().await?;
-            self.session_memory_map.lock().await.insert(sigma.session_id.clone(), Arc::new(session_store));
+            self.session_memory_map
+                .lock()
+                .await
+                .insert(sigma.session_id.clone(), Arc::new(session_store));
         }
 
         Ok(is_converged)
@@ -3050,31 +3541,62 @@ impl Orchestrator {
         .await
     }
 
-    async fn run_verification(&self, artifacts: &BTreeMap<String, Arc<Artifact>>, diffs: &[(String, crate::types::artifact::ArtifactDiff)]) -> Vec<(String, String, bool)> {
+    async fn run_verification(
+        &self,
+        artifacts: &BTreeMap<String, Arc<Artifact>>,
+        diffs: &[(String, crate::types::artifact::ArtifactDiff)],
+    ) -> Vec<(String, String, bool)> {
         let workspace = &self.file_writer.root;
-        let modified_names: std::collections::HashSet<&str> = diffs.iter().map(|(name, _)| name.as_str()).collect();
-        let modified_artifacts: Vec<&Arc<Artifact>> = artifacts.values()
+        let modified_names: std::collections::HashSet<&str> =
+            diffs.iter().map(|(name, _)| name.as_str()).collect();
+        let modified_artifacts: Vec<&Arc<Artifact>> = artifacts
+            .values()
             .filter(|a| modified_names.contains(a.name.as_str()))
             .filter(|a| !a.name.contains(':'))
             .collect();
         let mut results = Vec::new();
         let tool_sets: Vec<(&str, serde_json::Value)> = {
             let mut tools = Vec::new();
-            let has_rust = modified_artifacts.iter().any(|a| matches!(a.language.to_lowercase().as_str(), "rust" | "rs"));
+            let has_rust = modified_artifacts
+                .iter()
+                .any(|a| matches!(a.language.to_lowercase().as_str(), "rust" | "rs"));
             if has_rust && workspace.join("Cargo.toml").exists() {
                 tools.push(("cargo", serde_json::json!({"args": ["check"]})));
-                tools.push(("cargo", serde_json::json!({"args": ["test", "--no-fail-fast"]})));
+                tools.push((
+                    "cargo",
+                    serde_json::json!({"args": ["test", "--no-fail-fast"]}),
+                ));
             }
-            for a in modified_artifacts.iter().filter(|a| a.language.to_lowercase() == "python" && a.name.ends_with(".py")) {
-                tools.push(("python3", serde_json::json!({"args": ["-m", "py_compile", &a.name]})));
+            for a in modified_artifacts
+                .iter()
+                .filter(|a| a.language.to_lowercase() == "python" && a.name.ends_with(".py"))
+            {
+                tools.push((
+                    "python3",
+                    serde_json::json!({"args": ["-m", "py_compile", &a.name]}),
+                ));
             }
             tools
         };
         for (cmd, args) in tool_sets {
-            let label = format!("{} {}", cmd, args["args"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" ")).unwrap_or_default());
+            let label = format!(
+                "{} {}",
+                cmd,
+                args["args"]
+                    .as_array()
+                    .map(|a| a
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" "))
+                    .unwrap_or_default()
+            );
             match self.tool_call("orchestrator", cmd, args).await {
                 Ok(result) => {
-                    let is_error = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let is_error = result
+                        .get("isError")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     let output = result.get("content")
                         .and_then(|c| c.as_array())
                         .and_then(|a| a.first())
@@ -3099,7 +3621,9 @@ impl Orchestrator {
         let mut p = String::with_capacity(32_000);
 
         // Use evolved template as base if available, preferring select_for_agent over cache lookup
-        let task_category = sigma.turns.last()
+        let task_category = sigma
+            .turns
+            .last()
             .and_then(|t| t.task_category)
             .unwrap_or(TaskCategory::Research);
         let category_key = format!("{task_category:?}");
@@ -3110,7 +3634,9 @@ impl Orchestrator {
             let obs = self.observer.lock().await;
             if !evolver.population.is_empty() {
                 let first_agent = self.agents.first().map(|a| a.name()).unwrap_or("unknown");
-                evolver.select_for_agent(first_agent, &obs.elo_ratings).cloned()
+                evolver
+                    .select_for_agent(first_agent, &obs.elo_ratings)
+                    .cloned()
             } else {
                 drop(evolver);
                 drop(obs);
@@ -3195,7 +3721,10 @@ impl Orchestrator {
         };
 
         for artifact in sigma.artifacts.values() {
-            p.push_str(&format!("--- Artifact: {} [v{}] ({}) ---\n", artifact.name, artifact.version, artifact.language));
+            p.push_str(&format!(
+                "--- Artifact: {} [v{}] ({}) ---\n",
+                artifact.name, artifact.version, artifact.language
+            ));
             if artifact.version == 0 {
                 let content = &artifact.content;
                 if !artifact.skeleton.is_empty() && content.len() > artifact_budget {
@@ -3203,7 +3732,15 @@ impl Orchestrator {
                     p.push_str(&artifact.skeleton);
                     let remaining = artifact_budget.saturating_sub(artifact.skeleton.len());
                     if remaining > 200 {
-                        crate::log_warn!(writeln!(p, "\nKey excerpt ({} of {} chars):", remaining, content.len()), "Failed to write key excerpt header");
+                        crate::log_warn!(
+                            writeln!(
+                                p,
+                                "\nKey excerpt ({} of {} chars):",
+                                remaining,
+                                content.len()
+                            ),
+                            "Failed to write key excerpt header"
+                        );
                         p.push_str(&content[..remaining.min(content.len())]);
                     }
                 } else if content.len() <= artifact_budget {
@@ -3212,7 +3749,14 @@ impl Orchestrator {
                 } else {
                     p.push_str("Content (truncated):\n");
                     p.push_str(&content[..artifact_budget.min(content.len())]);
-                    crate::log_warn!(writeln!(p, "\n... ({} more chars)", content.len().saturating_sub(artifact_budget)), "Failed to write truncation notice");
+                    crate::log_warn!(
+                        writeln!(
+                            p,
+                            "\n... ({} more chars)",
+                            content.len().saturating_sub(artifact_budget)
+                        ),
+                        "Failed to write truncation notice"
+                    );
                 }
             } else {
                 p.push_str("Skeleton:\n");
@@ -3263,7 +3807,16 @@ impl Orchestrator {
             let questions = if signals.questions.is_empty() {
                 String::new()
             } else {
-                format!(" open_questions=[{}]", signals.questions.iter().take(3).cloned().collect::<Vec<_>>().join("; "))
+                format!(
+                    " open_questions=[{}]",
+                    signals
+                        .questions
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
             };
             let code_count = signals.code_blocks.len();
             let code_tag = if code_count > 0 {
@@ -3271,38 +3824,52 @@ impl Orchestrator {
             } else {
                 String::new()
             };
-            let certainty_tag = t.certainty.map(|c| format!(" certainty={c:.2}")).unwrap_or_default();
-            crate::log_warn!(writeln!(
-                p,
-                "Turn {} by {} ({}){}{}{}{}{}: {}",
-                t.index,
-                t.model_id,
-                outcome_tag,
-                certainty_tag,
-                decisions,
-                problems,
-                questions,
-                code_tag,
-                Self::truncate_str(&t.content, 150),
-            ), "Failed to write history summary");
+            let certainty_tag = t
+                .certainty
+                .map(|c| format!(" certainty={c:.2}"))
+                .unwrap_or_default();
+            crate::log_warn!(
+                writeln!(
+                    p,
+                    "Turn {} by {} ({}){}{}{}{}{}: {}",
+                    t.index,
+                    t.model_id,
+                    outcome_tag,
+                    certainty_tag,
+                    decisions,
+                    problems,
+                    questions,
+                    code_tag,
+                    Self::truncate_str(&t.content, 150),
+                ),
+                "Failed to write history summary"
+            );
         }
         if !sigma.last_verification.is_empty() {
             p.push_str("\nVerification Results from Last Turn:\n");
             for (tool, output, passed) in &sigma.last_verification {
                 let status = if *passed { "PASS" } else { "FAIL" };
                 let snippet = Self::truncate_str(output, 300);
-                crate::log_warn!(writeln!(p, "  {} [{}]: {}", tool, status, snippet), "Failed to write verification result");
+                crate::log_warn!(
+                    writeln!(p, "  {} [{}]: {}", tool, status, snippet),
+                    "Failed to write verification result"
+                );
             }
         }
 
         if !sigma.last_tool_outputs.is_empty() {
             p.push_str("\nTool Results from Previous Turn:\n");
             for (name, output) in &sigma.last_tool_outputs {
-                crate::log_warn!(writeln!(p, "  [{}]: {}", name, Self::truncate_str(output, 500)), "Failed to write tool result");
+                crate::log_warn!(
+                    writeln!(p, "  [{}]: {}", name, Self::truncate_str(output, 500)),
+                    "Failed to write tool result"
+                );
             }
         }
 
-        if sigma.mode_library.current().convergence_direction == crate::types::mode::ConvergenceDirection::TowardAgreement {
+        if sigma.mode_library.current().convergence_direction
+            == crate::types::mode::ConvergenceDirection::TowardAgreement
+        {
             p.push_str(
                 "\n[INSTRUCTIONS]\n\
                  1. Address any open questions or problems from prior turns before proposing new changes.\n\
@@ -3322,23 +3889,39 @@ impl Orchestrator {
         let mode_prefix = sigma.mode_library.current().prompt_prefix.clone();
         let base = format!("{}\n\n{}", mode_prefix, p);
         if let Some(ref signal) = sigma.novel_signal {
-            format!("[NOVEL SIGNAL — build on this, do not ignore it]\n{}\n\n{}", signal, base)
+            format!(
+                "[NOVEL SIGNAL — build on this, do not ignore it]\n{}\n\n{}",
+                signal, base
+            )
         } else {
             base
         }
     }
 
-    fn divergent_context_for_role(role: &str, artifacts: &std::collections::HashMap<String, std::sync::Arc<crate::types::artifact::Artifact>>) -> String {
-        if artifacts.is_empty() { return String::new(); }
+    fn divergent_context_for_role(
+        role: &str,
+        artifacts: &std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::types::artifact::Artifact>,
+        >,
+    ) -> String {
+        if artifacts.is_empty() {
+            return String::new();
+        }
         let focus = match role {
             "Skeptic" | "StressTest" => "the weakest claims and most uncertain statements",
-            "Architect" | "Generative" => "the overall structure and what is missing or could be extended",
+            "Architect" | "Generative" => {
+                "the overall structure and what is missing or could be extended"
+            }
             "Verifier" => "formal definitions, theorems, and proof sketches",
             "Historian" => "references to prior work and historical context",
             r if r.contains("Devil") => "the assumptions that the authors take for granted",
             _ => "the most important sections for your analysis",
         };
-        format!("\n\n[FOCUS] Your divergent context assignment: concentrate on {} in the provided documents. Other agents are focusing on different aspects.", focus)
+        format!(
+            "\n\n[FOCUS] Your divergent context assignment: concentrate on {} in the provided documents. Other agents are focusing on different aspects.",
+            focus
+        )
     }
 
     fn lang_to_ext(lang: &str) -> &'static str {
@@ -3397,7 +3980,10 @@ impl Orchestrator {
             // Strip trailing :suffix after filename (e.g. "file.py:71" or "file.py:ClassName.method")
             while let Some(colon) = n.rfind(':') {
                 let suffix = &n[colon + 1..];
-                if suffix.chars().all(|c| c.is_ascii_digit()) || !suffix.contains('.') || suffix.starts_with(|c: char| c.is_uppercase()) {
+                if suffix.chars().all(|c| c.is_ascii_digit())
+                    || !suffix.contains('.')
+                    || suffix.starts_with(|c: char| c.is_uppercase())
+                {
                     n.truncate(colon);
                 } else {
                     break;
@@ -3500,7 +4086,10 @@ impl Orchestrator {
         let mut directives = Vec::new();
         for line in response.lines() {
             let line = line.trim();
-            if let Some(rest) = line.strip_prefix("[TOOL:").and_then(|s| s.strip_suffix(']')) {
+            if let Some(rest) = line
+                .strip_prefix("[TOOL:")
+                .and_then(|s| s.strip_suffix(']'))
+            {
                 let rest = rest.trim();
                 if let Some(paren) = rest.find('(') {
                     let name = rest[..paren].trim().to_string();
@@ -3516,7 +4105,12 @@ impl Orchestrator {
 
     /// Execute a parsed tool directive, returning the tool output as a string.
     /// Only `memory_query` and a whitelist of safe `shell_exec` commands are allowed.
-    async fn execute_tool_directive(&self, tool_name: &str, args: &str, sigma_lock: &Arc<Mutex<ConversationState>>) -> String {
+    async fn execute_tool_directive(
+        &self,
+        tool_name: &str,
+        args: &str,
+        sigma_lock: &Arc<Mutex<ConversationState>>,
+    ) -> String {
         match tool_name {
             "memory_query" => {
                 let (sid, turn_idx) = {
@@ -3525,7 +4119,10 @@ impl Orchestrator {
                 };
                 let summary = {
                     let mut bridge = self.memory_bridge.lock().await;
-                    bridge.recall_relevant_summary(&sid, args, 3, turn_idx).await.unwrap_or_default()
+                    bridge
+                        .recall_relevant_summary(&sid, args, 3, turn_idx)
+                        .await
+                        .unwrap_or_default()
                 };
                 if summary.is_empty() {
                     "[memory_query] No results found.".to_string()
@@ -3535,10 +4132,22 @@ impl Orchestrator {
             }
             "shell_exec" => {
                 const ALLOWED_PREFIXES: &[&str] = &[
-                    "git log", "git status", "git diff", "git show",
-                    "cargo check", "cargo test", "cargo clippy",
-                    "ls ", "cat ", "head ", "tail ", "wc ", "grep ",
-                    "find ", "diff ", "file ",
+                    "git log",
+                    "git status",
+                    "git diff",
+                    "git show",
+                    "cargo check",
+                    "cargo test",
+                    "cargo clippy",
+                    "ls ",
+                    "cat ",
+                    "head ",
+                    "tail ",
+                    "wc ",
+                    "grep ",
+                    "find ",
+                    "diff ",
+                    "file ",
                 ];
                 let trimmed = args.trim();
                 if !ALLOWED_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
@@ -3546,7 +4155,9 @@ impl Orchestrator {
                 }
                 const INJECTION_CHARS: &[char] = &[';', '|', '&', '$', '`', '>', '<', '(', ')'];
                 if trimmed.contains(INJECTION_CHARS) {
-                    return format!("[shell_exec] Command contains disallowed characters: {trimmed}");
+                    return format!(
+                        "[shell_exec] Command contains disallowed characters: {trimmed}"
+                    );
                 }
                 let cwd = self.file_writer.root.as_path();
                 match tokio::time::timeout(
@@ -3564,7 +4175,10 @@ impl Orchestrator {
                         let stderr = String::from_utf8_lossy(&out.stderr);
                         let truncated = stdout.chars().take(2000).collect::<String>();
                         if !stderr.is_empty() {
-                            format!("[shell_exec output]:\n{truncated}\n[stderr]: {}", stderr.chars().take(500).collect::<String>())
+                            format!(
+                                "[shell_exec output]:\n{truncated}\n[stderr]: {}",
+                                stderr.chars().take(500).collect::<String>()
+                            )
                         } else {
                             format!("[shell_exec output]:\n{truncated}")
                         }
@@ -3578,7 +4192,10 @@ impl Orchestrator {
                     return "[write_file] Expected: path\\ncontent".to_string();
                 };
                 let path_str = path_str.trim();
-                if path_str.contains("..") || path_str.starts_with('/') || path_str.starts_with('\\') {
+                if path_str.contains("..")
+                    || path_str.starts_with('/')
+                    || path_str.starts_with('\\')
+                {
                     return "[write_file] Path traversal not allowed".to_string();
                 }
                 let target = self.file_writer.root.join(path_str);
@@ -3596,19 +4213,28 @@ impl Orchestrator {
                         if let Ok(canonical_target) = target.canonicalize() {
                             if !canonical_target.starts_with(&canonical_root) {
                                 let _ = tokio::fs::remove_file(&target).await;
-                                return "[write_file] Path escapes workspace after resolution".to_string();
+                                return "[write_file] Path escapes workspace after resolution"
+                                    .to_string();
                             }
                         }
                         tracing::info!(path = %target.display(), bytes = content.len(), "file written via tool directive");
                         let git_msg = Self::git_stage_file(&self.file_writer.root, &target).await;
-                        format!("[write_file] Wrote {} ({} bytes){}", target.display(), content.len(), git_msg)
+                        format!(
+                            "[write_file] Wrote {} ({} bytes){}",
+                            target.display(),
+                            content.len(),
+                            git_msg
+                        )
                     }
                     Err(e) => format!("[write_file] Error: {e}"),
                 }
             }
             "read_file" => {
                 let path_str = args.trim();
-                if path_str.contains("..") || path_str.starts_with('/') || path_str.starts_with('\\') {
+                if path_str.contains("..")
+                    || path_str.starts_with('/')
+                    || path_str.starts_with('\\')
+                {
                     return "[read_file] Path traversal not allowed".to_string();
                 }
                 let target = self.file_writer.root.join(path_str);
@@ -3812,28 +4438,32 @@ impl Orchestrator {
         self.rewind(index)
     }
 
-    
-
-
     pub async fn finalize_session(&self, sigma_lock: Arc<Mutex<ConversationState>>) -> Result<()> {
         let sigma = sigma_lock.lock().await;
         let eval = SelfImprovementEngine::evaluate_session(&sigma);
         self.emit(StreamEvent::TokenReceived {
             agent_id: "System".to_string(),
-            token: format!("
+            token: format!(
+                "
 [Self-Improvement] Session Evaluation: convergence_p={:.2}, failure_rate={:.2}
-", 
-                           eval.metrics.get("convergence_p").unwrap_or(&0.0),
-                           eval.metrics.get("failure_rate").unwrap_or(&0.0))
-        }).await?;
+",
+                eval.metrics.get("convergence_p").unwrap_or(&0.0),
+                eval.metrics.get("failure_rate").unwrap_or(&0.0)
+            ),
+        })
+        .await?;
 
         if let Some(pm) = PostMortemGenerator::generate(&sigma) {
-             self.emit(StreamEvent::TokenReceived {
+            self.emit(StreamEvent::TokenReceived {
                 agent_id: "System".to_string(),
-                token: format!("
+                token: format!(
+                    "
 [Self-Improvement] Post-Mortem: detected root cause {:?}
-", pm.root_cause)
-            }).await?;
+",
+                    pm.root_cause
+                ),
+            })
+            .await?;
         }
 
         {
@@ -3846,7 +4476,12 @@ impl Orchestrator {
                 prompt_library: &mut templates,
                 calibration: &mut calibration,
             };
-            learner.run(&sigma, PostMortemGenerator::generate(&sigma), 0.5, sigma.completion_probability);
+            learner.run(
+                &sigma,
+                PostMortemGenerator::generate(&sigma),
+                0.5,
+                sigma.completion_probability,
+            );
         }
 
         // Persist Elo ratings for cross-session continuity.
@@ -3866,7 +4501,8 @@ impl Orchestrator {
                 outcome: None,
                 is_negative: false,
             };
-            self.memory_store.sessions
+            self.memory_store
+                .sessions
                 .entry("elo_ratings".to_string())
                 .or_default()
                 .push(record);
@@ -3879,7 +4515,8 @@ impl Orchestrator {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            self.memory_store.sessions
+            self.memory_store
+                .sessions
                 .entry("prompt_population".to_string())
                 .or_default()
                 .push(MemoryRecord {
@@ -3901,7 +4538,8 @@ impl Orchestrator {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            self.memory_store.sessions
+            self.memory_store
+                .sessions
                 .entry("topology_scores".to_string())
                 .or_default()
                 .push(MemoryRecord {
@@ -3923,7 +4561,8 @@ impl Orchestrator {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            self.memory_store.sessions
+            self.memory_store
+                .sessions
                 .entry("collective_profiles".to_string())
                 .or_default()
                 .push(MemoryRecord {
@@ -3945,7 +4584,8 @@ impl Orchestrator {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            self.memory_store.sessions
+            self.memory_store
+                .sessions
                 .entry("ranker_weights".to_string())
                 .or_default()
                 .push(MemoryRecord {
@@ -3966,11 +4606,15 @@ impl Orchestrator {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let task_summary = sigma.turns.first()
+            let task_summary = sigma
+                .turns
+                .first()
                 .map(|t| t.content.chars().take(200).collect::<String>())
                 .unwrap_or_default();
             let topo = self.topology.lock().await;
-            let topology_sequence: Vec<String> = topo.history.iter()
+            let topology_sequence: Vec<String> = topo
+                .history
+                .iter()
                 .map(|(_, t, _)| format!("{t:?}"))
                 .collect();
             drop(topo);
@@ -3983,14 +4627,22 @@ impl Orchestrator {
             }
             .to_string();
             let obs = self.observer.lock().await;
-            let winning_model = obs.ranked_agents()
+            let winning_model = obs
+                .ranked_agents()
                 .into_iter()
                 .next()
                 .map(|(id, _)| id)
                 .unwrap_or_default();
             drop(obs);
-            let quality_trajectory: Vec<f64> = sigma.turns.iter().rev().take(10)
-                .map(|t| RewardVector::from_turn(t).weighted_score(t.task_category.unwrap_or(TaskCategory::Research)))
+            let quality_trajectory: Vec<f64> = sigma
+                .turns
+                .iter()
+                .rev()
+                .take(10)
+                .map(|t| {
+                    RewardVector::from_turn(t)
+                        .weighted_score(t.task_category.unwrap_or(TaskCategory::Research))
+                })
                 .collect();
             let lesson = SessionLesson {
                 task_summary,
@@ -4002,7 +4654,8 @@ impl Orchestrator {
                 timestamp: ts,
             };
             if let Ok(lesson_json) = serde_json::to_string(&lesson) {
-                self.memory_store.sessions
+                self.memory_store
+                    .sessions
                     .entry("session_lessons".to_string())
                     .or_default()
                     .push(MemoryRecord {
@@ -4032,7 +4685,8 @@ impl Orchestrator {
                         event,
                         session_id: sigma.session_id.clone(),
                         timestamp: ConversationState::now(),
-                    }).await,
+                    })
+                    .await,
                     "data minimizer fiduciary signal failed"
                 );
             }
@@ -4042,8 +4696,9 @@ impl Orchestrator {
     }
 
     pub fn get_completion_probability(&self) -> f64 {
-        f64::from_bits(self.completion_probability.load(std::sync::atomic::Ordering::Acquire))
+        f64::from_bits(
+            self.completion_probability
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
     }
 }
-
-

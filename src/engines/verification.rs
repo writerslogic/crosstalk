@@ -1,4 +1,5 @@
-use crate::types::conversation::ConversationState;
+use crate::types::conversation::{ConversationState, Turn};
+use crate::types::fiduciary::FiduciaryDutyEvent;
 use anyhow::{Context, Result, anyhow};
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
@@ -75,8 +76,9 @@ impl InvariantChecker {
     /// Returns Ok(()) if verification passes, or an error with Verus output if it fails.
     pub async fn verify_all_with_verus() -> Result<()> {
         // Resolve verus to an absolute path at call time to prevent PATH manipulation attacks.
-        let verus_bin = which::which("verus")
-            .context("verus binary not found in PATH; install verus to enable formal verification")?;
+        let verus_bin = which::which("verus").context(
+            "verus binary not found in PATH; install verus to enable formal verification",
+        )?;
 
         let proof_files = [
             "verus/state.rs",
@@ -85,8 +87,10 @@ impl InvariantChecker {
         ];
 
         for file in proof_files {
-            if !Path::new(file).exists() {
-                return Err(anyhow!("Verus proof file not found: {}", file));
+            match tokio::fs::try_exists(file).await {
+                Ok(true) => {}
+                Ok(false) => return Err(anyhow!("Verus proof file not found: {}", file)),
+                Err(e) => return Err(anyhow!("Cannot access Verus proof file '{}': {}", file, e)),
             }
 
             let output = tokio::process::Command::new(&verus_bin)
@@ -111,27 +115,43 @@ impl InvariantChecker {
     }
 
     /// Suggestion: Recursive Formal Verification (Verus-in-the-Loop)
-    pub async fn verify_artifact(artifact: &crate::types::artifact::Artifact) -> Result<Result<(), String>> {
+    pub async fn verify_artifact(
+        artifact: &crate::types::artifact::Artifact,
+    ) -> Result<Result<(), String>> {
         if !artifact.content.contains("verus!") {
             return Ok(Ok(())); // No formal specs to verify
         }
 
-        let verus_bin = which::which("verus")
-            .context("verus binary not found in PATH; install verus to enable formal verification")?;
+        let verus_bin = which::which("verus").context(
+            "verus binary not found in PATH; install verus to enable formal verification",
+        )?;
 
-        let temp_dir = std::env::temp_dir().join("crosstalk-verus");
-        tokio::fs::create_dir_all(&temp_dir).await?;
-
-        // Restrict directory to owner-only to prevent symlink/TOCTOU attacks.
+        let temp_dir = std::env::temp_dir().join(format!("crosstalk-verus-{}", std::process::id()));
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o700);
-            std::fs::set_permissions(&temp_dir, perms)
-                .context("failed to restrict permissions on verus temp dir")?;
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&temp_dir)
+                .context("failed to create restricted verus temp dir")?;
         }
+        #[cfg(not(unix))]
+        tokio::fs::create_dir_all(&temp_dir).await?;
 
-        let temp_file = temp_dir.join(format!("verify_{}.rs", artifact.name.replace('/', "_")));
+        let safe_name: String = artifact
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(64)
+            .collect();
+        let temp_file = temp_dir.join(format!("verify_{safe_name}.rs"));
         tokio::fs::write(&temp_file, &artifact.content).await?;
 
         let output = tokio::process::Command::new(&verus_bin)
@@ -149,7 +169,6 @@ impl InvariantChecker {
         }
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub struct AuditAlert {
@@ -177,18 +196,26 @@ impl ContinuousAuditor {
                         last_hash = sigma.state_hash;
                     }
                     Ok(expected_hash) => {
-                        if alert_tx.send(AuditAlert {
-                            iteration_index: sigma.iteration_index,
-                            expected_hash,
-                            actual_hash: sigma.state_hash,
-                            timestamp: ConversationState::now(),
-                        }).is_err() {
-                            tracing::warn!(turn = sigma.iteration_index, "audit alert channel closed");
+                        if alert_tx
+                            .send(AuditAlert {
+                                iteration_index: sigma.iteration_index,
+                                expected_hash,
+                                actual_hash: sigma.state_hash,
+                                timestamp: ConversationState::now(),
+                            })
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                turn = sigma.iteration_index,
+                                "audit alert channel closed"
+                            );
                             break;
                         }
                         // Do NOT update last_hash; preserve last valid anchor
                     }
-                    Err(e) => { tracing::error!(error = %e, "hash chain computation failed"); }
+                    Err(e) => {
+                        tracing::error!(error = %e, "hash chain computation failed");
+                    }
                 }
             }
         });
@@ -353,5 +380,43 @@ impl ProofExporter {
          theorem artifact_version_consistency (version historyLen : Nat)\n\
              (h : version = historyLen) : version = historyLen := h\n"
             .to_string()
+    }
+}
+
+/// Appends a signed account entry to sled for every committed turn, satisfying
+/// the Account fiduciary duty. Each entry chains over the prior `state_hash`.
+pub struct DecisionLedger;
+
+impl DecisionLedger {
+    /// Build an `AccountEvent` that commits the turn's content and rationale
+    /// into the hash chain. `rationale` is the reasoning context used to
+    /// produce the turn (prompt excerpt, strategy name, etc.).
+    pub fn commit_turn(turn: &Turn, prior_hash: &[u8; 32], rationale: &str) -> FiduciaryDutyEvent {
+        let mut hasher = Sha256::new();
+        hasher.update(rationale.as_bytes());
+        let rationale_hash: [u8; 32] = hasher.finalize().into();
+
+        FiduciaryDutyEvent::DecisionCommitted {
+            turn_index: turn.index,
+            decision_excerpt: turn.content.chars().take(512).collect(),
+            rationale_hash,
+            chain_link: *prior_hash,
+        }
+    }
+
+    /// Persist a decision account entry to sled under
+    /// `fiduciary:account:{session_id}:{principal_id}:{turn_index}` and flush.
+    pub fn persist(
+        db: &sled::Db,
+        session_id: &str,
+        principal_id: &str,
+        turn_index: u32,
+        event: &FiduciaryDutyEvent,
+    ) -> Result<()> {
+        let key = format!("fiduciary:account:{session_id}:{principal_id}:{turn_index}");
+        let value = serde_json::to_vec(event)?;
+        db.insert(key.as_bytes(), value.as_slice())?;
+        db.flush()?;
+        Ok(())
     }
 }

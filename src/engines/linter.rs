@@ -1,8 +1,8 @@
-use anyhow::{bail, Context, Result};
 use crate::engines::sandbox::SandboxResult;
 use crate::types::artifact::Artifact;
-use std::process::Command;
+use anyhow::{Context, Result, bail};
 use std::path::Path;
+use std::process::Command;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -70,7 +70,11 @@ impl LinterGuard {
         nix_env: Option<&std::collections::HashMap<String, String>>,
     ) -> Result<LintReport> {
         if result.exit_code != 0 {
-            bail!("Sandbox failed (exit code {}): {}", result.exit_code, result.stderr);
+            bail!(
+                "Sandbox failed (exit code {}): {}",
+                result.exit_code,
+                result.stderr
+            );
         }
 
         let mut errors: Vec<Diagnostic> = Vec::new();
@@ -83,38 +87,74 @@ impl LinterGuard {
                 line: None,
                 column: None,
             });
-            return Ok(LintReport { passed: false, errors, ..Default::default() });
+            return Ok(LintReport {
+                passed: false,
+                errors,
+                ..Default::default()
+            });
         }
 
-        let canonical_root = std::fs::canonicalize(workspace_root)
-            .with_context(|| format!("failed to canonicalize workspace root: {}", workspace_root))?;
+        let canonical_root = tokio::fs::canonicalize(workspace_root)
+            .await
+            .with_context(|| {
+                format!("failed to canonicalize workspace root: {}", workspace_root)
+            })?;
 
         // Only run clippy if workspace has a Cargo.toml
-        if canonical_root.join("Cargo.toml").exists() {
+        if tokio::fs::try_exists(canonical_root.join("Cargo.toml"))
+            .await
+            .unwrap_or(false)
+        {
             let mut cmd = if let Some(env) = nix_env {
                 let mut c = Command::new("nix");
-                c.args(["develop", "-c", "cargo", "clippy", "--all-targets", "--", "-D", "warnings"]);
-                for (k, v) in env { c.env(k, v); }
+                c.args([
+                    "develop",
+                    "-c",
+                    "cargo",
+                    "clippy",
+                    "--all-targets",
+                    "--",
+                    "-D",
+                    "warnings",
+                ]);
+                for (k, v) in env {
+                    c.env(k, v);
+                }
                 c
             } else {
                 let mut c = Command::new("cargo");
                 c.args(["clippy", "--all-targets", "--", "-D", "warnings"]);
                 c
             };
+            cmd.current_dir(&canonical_root);
 
-            let clippy = cmd.current_dir(&canonical_root).output()?;
+            let clippy = tokio::task::spawn_blocking(move || cmd.output())
+                .await
+                .context("clippy spawn_blocking task failed")?
+                .context("failed to run clippy")?;
             if !clippy.status.success() {
                 errors.push(Diagnostic {
                     severity: Severity::Error,
                     code: None,
-                    message: String::from_utf8_lossy(&clippy.stderr).to_string(),
+                    message: {
+                        let raw = String::from_utf8_lossy(&clippy.stderr);
+                        if raw.len() > 8192 {
+                            format!("{}... (truncated)", &raw[..8192])
+                        } else {
+                            raw.to_string()
+                        }
+                    },
                     line: None,
                     column: None,
                 });
             }
         }
 
-        Ok(LintReport { passed: errors.is_empty(), errors, ..Default::default() })
+        Ok(LintReport {
+            passed: errors.is_empty(),
+            errors,
+            ..Default::default()
+        })
     }
 
     /// Lint a single artifact using heuristic checks (no external tooling).
@@ -182,7 +222,7 @@ impl LinterGuard {
 
         Ok(ArtifactLintReport {
             skipped: false,
-            passed: diagnostics.iter().all(|d| d.severity < Severity::Error),
+            passed: diagnostics.is_empty(),
             diagnostics,
         })
     }
@@ -200,7 +240,8 @@ impl LinterGuard {
                     description: format!("Remove unused import: {}", diag.message),
                     replacement: String::new(),
                 });
-            } else if code == "clippy::needless_return" || diag.message.contains("needless_return") {
+            } else if code == "clippy::needless_return" || diag.message.contains("needless_return")
+            {
                 // Strip leading "return " and trailing ";"
                 let expr = diag
                     .message

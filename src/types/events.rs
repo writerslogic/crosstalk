@@ -1,4 +1,5 @@
 use crate::types::conversation::Turn;
+use crate::types::fiduciary::FiduciaryDutyEvent;
 
 #[derive(Debug, Clone)]
 pub struct ArtifactSnapshot {
@@ -36,6 +37,18 @@ pub enum StreamEvent {
     },
     CheckpointWritten(u32),
     Error(String),
+    FiduciarySignal {
+        principal_id: String,
+        event: FiduciaryDutyEvent,
+        session_id: String,
+        timestamp: u64,
+    },
+    ModeTransition {
+        from_name: String,
+        to_name: String,
+        reason: String,
+        synthesized: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -45,7 +58,9 @@ pub enum ControlSignal {
     Rewind(u32),
     Shutdown,
     Inject(String),
-    LockCode(String), // artifact name
+    LockCode(String),  // artifact name
     MuteAgent(String), // agent id
-    DampenSwarm(f64), // dampening factor
+    DampenSwarm(f64),  // dampening factor
+    CycleMode,
+    SetModeByName(String),
 }

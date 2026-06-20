@@ -1,5 +1,5 @@
-use crosstalk::engines::reasoning::SynthesisEngine;
 use crosstalk::engines::diff::DiffEngine;
+use crosstalk::engines::reasoning::SynthesisEngine;
 
 #[test]
 fn test_synthesis_engine_fails_to_add_new_function() {
@@ -42,13 +42,25 @@ fn helper2() {
     let diff2 = DiffEngine::generate_delta(base, v2, 0);
     let diff3 = DiffEngine::generate_delta(base, v3, 0);
 
-    let merged = SynthesisEngine::merge(base, vec![("agent1".to_string(), diff1), ("agent2".to_string(), diff2), ("agent3".to_string(), diff3)], "rust")
-        .expect("Should merge successfully");
+    let merged = SynthesisEngine::merge(
+        base,
+        vec![
+            ("agent1".to_string(), diff1),
+            ("agent2".to_string(), diff2),
+            ("agent3".to_string(), diff3),
+        ],
+        "rust",
+    )
+    .expect("Should merge successfully");
 
     // EXPECTATION: Since 2 out of 3 agents agreed on helper1, it SHOULD be in the output.
     // BUG: Current implementation only iterates over base_blocks, so it will MISS helper1.
-    assert!(merged.contains("fn helper1()"), "Merged output should contain helper1 but got:
-{}", merged);
+    assert!(
+        merged.contains("fn helper1()"),
+        "Merged output should contain helper1 but got:
+{}",
+        merged
+    );
 }
 
 #[test]
@@ -74,11 +86,23 @@ fn old_unused() {}
     let diff2 = DiffEngine::generate_delta(base, v2, 0);
     let diff3 = DiffEngine::generate_delta(base, v3, 0);
 
-    let merged = SynthesisEngine::merge(base, vec![("agent1".to_string(), diff1), ("agent2".to_string(), diff2), ("agent3".to_string(), diff3)], "rust")
-        .expect("Should merge successfully");
+    let merged = SynthesisEngine::merge(
+        base,
+        vec![
+            ("agent1".to_string(), diff1),
+            ("agent2".to_string(), diff2),
+            ("agent3".to_string(), diff3),
+        ],
+        "rust",
+    )
+    .expect("Should merge successfully");
 
     // EXPECTATION: Since 2 out of 3 agents deleted it, it SHOULD be gone.
     // BUG: Current implementation will likely keep it because it only processes 'changes' relative to base.
-    assert!(!merged.contains("fn old_unused()"), "Merged output should NOT contain old_unused but got:
-{}", merged);
+    assert!(
+        !merged.contains("fn old_unused()"),
+        "Merged output should NOT contain old_unused but got:
+{}",
+        merged
+    );
 }

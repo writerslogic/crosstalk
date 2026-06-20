@@ -107,16 +107,24 @@ impl AstValidator {
                 continue;
             }
             if let Some(q) = in_string {
-                if ch == '\\' { i += 2; continue; }
-                if ch == q { in_string = None; }
+                if ch == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if ch == q {
+                    in_string = None;
+                }
                 i += 1;
                 continue;
             }
             if ch == '#' {
-                while i < len && chars[i] != '\n' { i += 1; }
+                while i < len && chars[i] != '\n' {
+                    i += 1;
+                }
                 continue;
             }
-            if (ch == '"' || ch == '\'') && i + 2 < len && chars[i + 1] == ch && chars[i + 2] == ch {
+            if (ch == '"' || ch == '\'') && i + 2 < len && chars[i + 1] == ch && chars[i + 2] == ch
+            {
                 in_triple = Some(ch);
                 i += 3;
                 continue;
@@ -333,7 +341,10 @@ impl AstValidator {
                 language: "rust".to_string(),
                 line: 0,
                 column: 0,
-                message: format!("Tree-sitter parser returned None ({} bytes input)", content.len()),
+                message: format!(
+                    "Tree-sitter parser returned None ({} bytes input)",
+                    content.len()
+                ),
             })?;
 
         let root_node = tree.root_node();

@@ -192,9 +192,7 @@ impl GoalTree {
         let mut in_stack = std::collections::HashSet::new();
         for id in dep_graph.keys().cloned().collect::<Vec<_>>() {
             if Self::dfs_cycle(&id, &dep_graph, &mut visited, &mut in_stack) {
-                return Err(format!(
-                    "dependency cycle detected involving goal '{id}'"
-                ));
+                return Err(format!("dependency cycle detected involving goal '{id}'"));
             }
         }
         Ok(())
@@ -225,8 +223,8 @@ impl GoalTree {
         visited.insert(id.to_string());
         in_stack.insert(id.to_string());
         if let Some(deps) = graph.get(id) {
-            for dep in deps.clone() {
-                if Self::dfs_cycle(&dep, graph, visited, in_stack) {
+            for dep in deps {
+                if Self::dfs_cycle(dep, graph, visited, in_stack) {
                     return true;
                 }
             }

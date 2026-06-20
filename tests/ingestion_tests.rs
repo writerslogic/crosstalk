@@ -1,6 +1,6 @@
+use crosstalk::engines::compute::ComputeManager;
 use crosstalk::types::conversation::ConversationState;
 use crosstalk::ui::visualization::GodView;
-use crosstalk::engines::compute::ComputeManager;
 
 #[test]
 fn ingest_file_sets_skeleton_and_metrics() {
@@ -14,7 +14,10 @@ fn ingest_file_sets_skeleton_and_metrics() {
     let art = sigma.artifacts.get("src/main.rs").unwrap();
     assert_eq!(art.version, 0);
     assert_eq!(art.language, "rust");
-    assert!(!art.skeleton.is_empty(), "skeleton should be computed on ingestion");
+    assert!(
+        !art.skeleton.is_empty(),
+        "skeleton should be computed on ingestion"
+    );
     assert!(art.content.contains("fn main()"));
 }
 
@@ -78,8 +81,16 @@ fn godview_compute_metrics_increments_frame() {
 fn godview_metrics_reflect_state() {
     let mut gv = GodView::new();
     let mut sigma = ConversationState::new("test");
-    sigma.ingest_file("a.rs".to_string(), "rust".to_string(), "fn a() {}".to_string());
-    sigma.ingest_file("b.rs".to_string(), "rust".to_string(), "fn b() {}".to_string());
+    sigma.ingest_file(
+        "a.rs".to_string(),
+        "rust".to_string(),
+        "fn a() {}".to_string(),
+    );
+    sigma.ingest_file(
+        "b.rs".to_string(),
+        "rust".to_string(),
+        "fn b() {}".to_string(),
+    );
     let m = gv.compute_metrics(&sigma);
     assert_eq!(m.artifact_count, 2);
     assert_eq!(m.turn_count, 0);
@@ -91,7 +102,10 @@ fn inference_cache_hit_and_miss() {
     assert!(cache.get("prompt1", "model1").is_none());
     assert_eq!(cache.misses, 1);
     cache.insert("prompt1", "model1", "response1".to_string(), 1.0);
-    assert_eq!(cache.get("prompt1", "model1"), Some("response1".to_string()));
+    assert_eq!(
+        cache.get("prompt1", "model1"),
+        Some("response1".to_string())
+    );
     assert_eq!(cache.hits, 1);
 }
 
@@ -107,49 +121,83 @@ async fn compute_manager_starts_monitor() {
 #[test]
 fn ingest_file_rust_extension() {
     let mut sigma = ConversationState::new("test");
-    sigma.ingest_file("lib.rs".to_string(), "rust".to_string(), "pub fn x() {}".to_string());
+    sigma.ingest_file(
+        "lib.rs".to_string(),
+        "rust".to_string(),
+        "pub fn x() {}".to_string(),
+    );
     assert_eq!(sigma.artifacts.get("lib.rs").unwrap().language, "rust");
 }
 
 #[test]
 fn ingest_file_javascript_extension() {
     let mut sigma = ConversationState::new("test");
-    sigma.ingest_file("app.js".to_string(), "javascript".to_string(), "const x = 1;".to_string());
-    assert_eq!(sigma.artifacts.get("app.js").unwrap().language, "javascript");
+    sigma.ingest_file(
+        "app.js".to_string(),
+        "javascript".to_string(),
+        "const x = 1;".to_string(),
+    );
+    assert_eq!(
+        sigma.artifacts.get("app.js").unwrap().language,
+        "javascript"
+    );
 }
 
 #[test]
 fn ingest_file_typescript_extension() {
     let mut sigma = ConversationState::new("test");
-    sigma.ingest_file("app.ts".to_string(), "typescript".to_string(), "let x: number = 1;".to_string());
-    assert_eq!(sigma.artifacts.get("app.ts").unwrap().language, "typescript");
+    sigma.ingest_file(
+        "app.ts".to_string(),
+        "typescript".to_string(),
+        "let x: number = 1;".to_string(),
+    );
+    assert_eq!(
+        sigma.artifacts.get("app.ts").unwrap().language,
+        "typescript"
+    );
 }
 
 #[test]
 fn ingest_file_shell_extension() {
     let mut sigma = ConversationState::new("test");
-    sigma.ingest_file("run.sh".to_string(), "shell".to_string(), "#!/bin/bash\necho hi".to_string());
+    sigma.ingest_file(
+        "run.sh".to_string(),
+        "shell".to_string(),
+        "#!/bin/bash\necho hi".to_string(),
+    );
     assert_eq!(sigma.artifacts.get("run.sh").unwrap().language, "shell");
 }
 
 #[test]
 fn ingest_file_toml_extension() {
     let mut sigma = ConversationState::new("test");
-    sigma.ingest_file("Cargo.toml".to_string(), "toml".to_string(), "[package]\nname = \"x\"".to_string());
+    sigma.ingest_file(
+        "Cargo.toml".to_string(),
+        "toml".to_string(),
+        "[package]\nname = \"x\"".to_string(),
+    );
     assert_eq!(sigma.artifacts.get("Cargo.toml").unwrap().language, "toml");
 }
 
 #[test]
 fn ingest_file_go_extension() {
     let mut sigma = ConversationState::new("test");
-    sigma.ingest_file("main.go".to_string(), "go".to_string(), "package main".to_string());
+    sigma.ingest_file(
+        "main.go".to_string(),
+        "go".to_string(),
+        "package main".to_string(),
+    );
     assert_eq!(sigma.artifacts.get("main.go").unwrap().language, "go");
 }
 
 #[test]
 fn ingest_file_cpp_extension() {
     let mut sigma = ConversationState::new("test");
-    sigma.ingest_file("main.cpp".to_string(), "cpp".to_string(), "#include <iostream>".to_string());
+    sigma.ingest_file(
+        "main.cpp".to_string(),
+        "cpp".to_string(),
+        "#include <iostream>".to_string(),
+    );
     assert_eq!(sigma.artifacts.get("main.cpp").unwrap().language, "cpp");
 }
 
@@ -160,7 +208,11 @@ fn ingest_file_with_git_path_component_still_ingests() {
     // should_skip filters at directory walk time, not at ingest_file level.
     // ingest_file itself does not filter; we verify it accepts any path string.
     let mut sigma = ConversationState::new("test");
-    sigma.ingest_file(".git/config".to_string(), "toml".to_string(), "[core]".to_string());
+    sigma.ingest_file(
+        ".git/config".to_string(),
+        "toml".to_string(),
+        "[core]".to_string(),
+    );
     assert!(sigma.artifacts.contains_key(".git/config"));
 }
 
@@ -185,11 +237,7 @@ fn distill_output_respects_budget_with_many_artifacts() {
     // Create many large artifacts to exceed budget
     for i in 0..20 {
         let large_content = "x".repeat(5000);
-        sigma.ingest_file(
-            format!("file{i}.rs"),
-            "rust".to_string(),
-            large_content,
-        );
+        sigma.ingest_file(format!("file{i}.rs"), "rust".to_string(), large_content);
     }
     // Add turns so distill has something to work with
     for i in 0..10u32 {
@@ -207,6 +255,7 @@ fn distill_output_respects_budget_with_many_artifacts() {
             surprise_signal: None,
             consistency_score: None,
             diff_quality_score: None,
+            persona_disclosure: None,
         });
     }
 
@@ -252,6 +301,7 @@ fn distill_small_state_includes_all_turns() {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     });
 
     let output = ContextDistiller::distill(&sigma, 50000);

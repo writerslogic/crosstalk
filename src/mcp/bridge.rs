@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
 use crate::types::mcp::ToolResult;
+use anyhow::{Context, Result};
 use serde_json::json;
 use std::collections::HashMap;
 use std::process::Command;
@@ -50,9 +50,13 @@ pub struct CliBridge;
 impl CliBridge {
     pub async fn call(binary: &str, args: Vec<String>, current_dir: &str) -> Result<ToolResult> {
         if binary.is_empty()
-            || !binary.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || !binary
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         {
-            return Err(anyhow::anyhow!("invalid binary name (must be [a-zA-Z0-9_-]+): {binary}"));
+            return Err(anyhow::anyhow!(
+                "invalid binary name (must be [a-zA-Z0-9_-]+): {binary}"
+            ));
         }
 
         // Reject traversal components then canonicalize to prevent path traversal.
@@ -65,7 +69,8 @@ impl CliBridge {
                 "invalid current_dir (contains '..'): {current_dir}"
             ));
         }
-        let canonical_dir = std::fs::canonicalize(dir_path)
+        let canonical_dir = tokio::fs::canonicalize(dir_path)
+            .await
             .with_context(|| format!("failed to canonicalize current_dir: {current_dir}"))?;
 
         const OUTPUT_LIMIT: usize = 10 * 1024 * 1024; // 10 MiB per stream
@@ -92,24 +97,26 @@ impl CliBridge {
                 return Err(anyhow::anyhow!(
                     "TimeoutError: command exceeded {}s",
                     TIMEOUT_SECS
-                ))
+                ));
             }
         };
 
-        let stdout = String::from_utf8_lossy(
-            &output.stdout[..output.stdout.len().min(OUTPUT_LIMIT)],
-        )
-        .to_string();
-        let stderr = String::from_utf8_lossy(
-            &output.stderr[..output.stderr.len().min(OUTPUT_LIMIT)],
-        )
-        .to_string();
+        let stdout =
+            String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(OUTPUT_LIMIT)])
+                .to_string();
+        let stderr =
+            String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(OUTPUT_LIMIT)])
+                .to_string();
 
         Ok(ToolResult {
             tool_name: binary.to_string(),
             success: output.status.success(),
             output: stdout,
-            error: if stderr.is_empty() { None } else { Some(stderr) },
+            error: if stderr.is_empty() {
+                None
+            } else {
+                Some(stderr)
+            },
             elapsed_ms: start.elapsed().as_millis() as u64,
         })
     }
@@ -131,9 +138,9 @@ impl CliBridge {
             }
         }
 
-        let output = cmd.output().map_err(|e| {
-            anyhow::anyhow!("binary not found: {} ({})", binary, e)
-        })?;
+        let output = cmd
+            .output()
+            .map_err(|e| anyhow::anyhow!("binary not found: {} ({})", binary, e))?;
 
         let success = output.status.success();
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -143,7 +150,11 @@ impl CliBridge {
             tool_name: binary.to_string(),
             success,
             output: stdout,
-            error: if stderr.is_empty() { None } else { Some(stderr) },
+            error: if stderr.is_empty() {
+                None
+            } else {
+                Some(stderr)
+            },
             elapsed_ms: start.elapsed().as_millis() as u64,
         })
     }
@@ -168,9 +179,9 @@ impl CliBridge {
             }
         }
 
-        let child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!("binary not found: {} ({})", binary, e)
-        })?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("binary not found: {} ({})", binary, e))?;
 
         let timeout = tokio::time::Duration::from_secs(timeout_secs);
         match tokio::time::timeout(timeout, child.wait_with_output()).await {
@@ -182,14 +193,19 @@ impl CliBridge {
                     tool_name: binary.to_string(),
                     success,
                     output: stdout,
-                    error: if stderr.is_empty() { None } else { Some(stderr) },
+                    error: if stderr.is_empty() {
+                        None
+                    } else {
+                        Some(stderr)
+                    },
                     elapsed_ms: start.elapsed().as_millis() as u64,
                 })
             }
             Ok(Err(e)) => Err(anyhow::anyhow!("process error: {}", e)),
-            Err(_) => {
-                Err(anyhow::anyhow!("TimeoutError: command exceeded {}s", timeout_secs))
-            }
+            Err(_) => Err(anyhow::anyhow!(
+                "TimeoutError: command exceeded {}s",
+                timeout_secs
+            )),
         }
     }
 
@@ -211,10 +227,13 @@ impl CliBridge {
             let mut rest = line;
             while let Some(idx) = rest.find("--") {
                 rest = &rest[idx + 2..];
-                let flag_end = rest.find(|c: char| !c.is_alphanumeric() && c != '-' && c != '_').unwrap_or(rest.len());
+                let flag_end = rest
+                    .find(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                    .unwrap_or(rest.len());
                 let flag = &rest[..flag_end];
                 if !flag.is_empty() && seen.insert(flag.to_string()) {
-                    let takes_value = rest[flag_end..].starts_with('=') || rest[flag_end..].starts_with("[=");
+                    let takes_value =
+                        rest[flag_end..].starts_with('=') || rest[flag_end..].starts_with("[=");
                     flags.push(FlagDef {
                         long: flag.to_string(),
                         short: None,
@@ -232,7 +251,10 @@ impl CliBridge {
         })
     }
 
-    fn resolve_binary(binary: &str, env_override: Option<&HashMap<String, String>>) -> Result<String> {
+    fn resolve_binary(
+        binary: &str,
+        env_override: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
         // If absolute path, check existence directly
         if binary.starts_with('/') {
             if std::path::Path::new(binary).exists() {
@@ -247,13 +269,18 @@ impl CliBridge {
             for dir in path_val.split(':') {
                 let candidate = std::path::Path::new(dir).join(binary);
                 if candidate.exists() {
-                    return Ok(candidate.to_str().unwrap_or(binary).to_string());
+                    return candidate.to_str().map(|s| s.to_string()).ok_or_else(|| {
+                        anyhow::anyhow!("binary path is not valid UTF-8: {}", binary)
+                    });
                 }
             }
         }
         // Fallback to which
         match which::which(binary) {
-            Ok(p) => Ok(p.to_str().unwrap_or(binary).to_string()),
+            Ok(p) => p
+                .to_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| anyhow::anyhow!("binary path is not valid UTF-8: {}", binary)),
             Err(_) => Err(anyhow::anyhow!("binary not found: {}", binary)),
         }
     }
@@ -280,7 +307,11 @@ impl CargoBridge {
 
     pub fn clippy(opts: &HashMap<String, String>) -> Vec<String> {
         let mut args = vec!["clippy".to_string()];
-        if opts.get("deny_warnings").map(|v| v == "true").unwrap_or(false) {
+        if opts
+            .get("deny_warnings")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+        {
             args.extend(["--".to_string(), "-D".to_string(), "warnings".to_string()]);
         }
         args

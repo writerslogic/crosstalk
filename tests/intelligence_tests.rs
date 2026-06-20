@@ -60,6 +60,7 @@ fn test_quality_scorer_handles_certainty() {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     };
     let s1 = QualityScorer::score(&turn);
     turn.certainty = Some(0.1);
@@ -84,6 +85,7 @@ async fn test_intelligence_update_profile() {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     };
     engine.update_profile(&turn, 0.9);
     let p = engine.profiles.get("m1").unwrap();

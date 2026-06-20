@@ -151,7 +151,10 @@ impl ContextPruner {
             .collect()
     }
 
-    fn collect_prunable_goals(node: &GoalNode, heap: &mut std::collections::BinaryHeap<PrunableGoal>) {
+    fn collect_prunable_goals(
+        node: &GoalNode,
+        heap: &mut std::collections::BinaryHeap<PrunableGoal>,
+    ) {
         heap.push(PrunableGoal {
             criticality: node.children.len() as u32 + 1,
             assigned_turn: node.assigned_turn,
@@ -416,11 +419,25 @@ impl SessionManager {
         Ok(())
     }
 
+    fn validate_session_id(session_id: &str) -> Result<()> {
+        if session_id.is_empty()
+            || !session_id
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(anyhow!(
+                "invalid session_id: must be non-empty alphanumeric/underscore/hyphen"
+            ));
+        }
+        Ok(())
+    }
+
     pub fn save_with_checksum(
         &self,
         session_id: &str,
         state: &ConversationState,
     ) -> Result<[u8; 32]> {
+        Self::validate_session_id(session_id)?;
         let bytes = serde_json::to_vec(state)?;
         let checksum: [u8; 32] = Sha256::digest(&bytes).into();
         let tree = self.db.open_tree(Self::TREE_NAME)?;
@@ -436,6 +453,7 @@ impl SessionManager {
         session_id: &str,
         expected: &[u8; 32],
     ) -> Result<ConversationState> {
+        Self::validate_session_id(session_id)?;
         let tree = self.db.open_tree(Self::TREE_NAME)?;
         let bytes = tree
             .get(session_id.as_bytes())?
@@ -464,6 +482,7 @@ impl SessionManager {
     }
 
     pub fn hibernate(&self, session_name: &str, state: &ConversationState) -> Result<String> {
+        Self::validate_session_id(session_name)?;
         let timestamp = ConversationState::now();
         let key = format!("hibernate:{}:{}", session_name, timestamp);
         self.save(&key, state)?;
@@ -473,7 +492,6 @@ impl SessionManager {
     pub fn resume(&self, hibernate_key: &str) -> Result<ConversationState> {
         self.load(hibernate_key)
     }
-
 }
 
 pub struct BranchRegistry {
@@ -544,7 +562,9 @@ impl SubSwarmGenerator {
         let child_count = node.children.len();
         let heuristic_difficulty = (title_words as f64 * 0.1 + child_count as f64 * 0.2).min(1.0);
 
-        if (node.difficulty_score.unwrap_or(0.0) > 0.8 || heuristic_difficulty > 0.7) && node.status != GoalStatus::Complete {
+        if (node.difficulty_score.unwrap_or(0.0) > 0.8 || heuristic_difficulty > 0.7)
+            && node.status != GoalStatus::Complete
+        {
             out.push(crate::engines::swarm::SubTask {
                 id: node.id.clone(),
                 description: node.title.clone(),

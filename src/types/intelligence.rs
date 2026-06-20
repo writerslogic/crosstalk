@@ -128,6 +128,10 @@ impl PromptTemplate {
     /// Record a quality score for a specific turn/outcome.
     pub fn record_performance(&mut self, outcome_id: String, quality: f64) {
         self.performance_history.push((outcome_id, quality));
+        if self.performance_history.len() > 1000 {
+            self.performance_history
+                .drain(..self.performance_history.len() - 1000);
+        }
     }
 
     /// Mean quality across all recorded performance observations (0.5 if none).

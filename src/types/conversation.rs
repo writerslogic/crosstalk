@@ -176,8 +176,8 @@ impl ConversationState {
             tracing::warn!(file = %name, bytes = content.len(), "ingest_file: file exceeds 10 MB limit; skipping");
             return;
         }
-        use crate::types::artifact::Artifact;
         use crate::engines::validation::AstValidator;
+        use crate::types::artifact::Artifact;
         let skeleton = AstValidator::generate_skeleton(&content, &language);
         let artifact = Artifact {
             name: name.clone(),
@@ -191,8 +191,23 @@ impl ConversationState {
             skeleton,
         };
         let all_names: Vec<String> = self.artifacts.keys().cloned().collect();
-        let metrics = crate::engines::quality::QualityEngine::analyze_artifact(&artifact, &all_names);
-        self.artifacts.insert(name, std::sync::Arc::new(Artifact { metrics, ..artifact }));
+        let metrics =
+            crate::engines::quality::QualityEngine::analyze_artifact(&artifact, &all_names);
+        self.artifacts.insert(
+            name,
+            std::sync::Arc::new(Artifact {
+                metrics,
+                ..artifact
+            }),
+        );
+    }
+
+    pub fn push_turn(&mut self, turn: Turn) {
+        const MAX_TURNS: usize = 200;
+        self.turns.push(turn);
+        if self.turns.len() > MAX_TURNS {
+            self.turns.drain(..self.turns.len() - MAX_TURNS);
+        }
     }
 
     pub fn now() -> u64 {

@@ -6,7 +6,9 @@ pub struct DiffEngine;
 
 impl DiffEngine {
     pub fn calculate_similarity(a: &str, b: &str) -> f64 {
-        if a == b { return 1.0; }
+        if a == b {
+            return 1.0;
+        }
         let emb_a = crate::engines::memory::embed_text(a);
         let emb_b = crate::engines::memory::embed_text(b);
         crate::engines::memory::cosine_sim(&emb_a, &emb_b) as f64
@@ -45,10 +47,9 @@ impl DiffEngine {
                 if base_idx < base_lines.len() {
                     base_idx += 1;
                 }
-            } else if line.starts_with('-')
-                && base_idx < base_lines.len() {
-                    base_idx += 1;
-                }
+            } else if line.starts_with('-') && base_idx < base_lines.len() {
+                base_idx += 1;
+            }
         }
         for line in base_lines.iter().skip(base_idx) {
             result.push_str(line);

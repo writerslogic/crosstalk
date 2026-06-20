@@ -311,8 +311,10 @@ fn test_failure_predictor_detection() {
     // Test context that should trigger the warning
     let current_context = "Implementing a function that uses CompilationError handling";
 
-    let warning =
-        FailurePredictor::proactive_warning(current_context, std::slice::from_ref(&failure_signature));
+    let warning = FailurePredictor::proactive_warning(
+        current_context,
+        std::slice::from_ref(&failure_signature),
+    );
 
     assert!(
         warning.is_some(),
@@ -370,6 +372,7 @@ fn test_lesson_extraction() {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     };
 
     let lessons = LessonExtractor::extract(&[turn]);
@@ -414,6 +417,7 @@ fn test_lesson_extraction_filters_failed_turns() {
             surprise_signal: None,
             consistency_score: None,
             diff_quality_score: None,
+            persona_disclosure: None,
         },
         Turn {
             index: 2,
@@ -430,6 +434,7 @@ fn test_lesson_extraction_filters_failed_turns() {
             surprise_signal: None,
             consistency_score: None,
             diff_quality_score: None,
+            persona_disclosure: None,
         },
         Turn {
             index: 3,
@@ -446,6 +451,7 @@ fn test_lesson_extraction_filters_failed_turns() {
             surprise_signal: None,
             consistency_score: None,
             diff_quality_score: None,
+            persona_disclosure: None,
         },
     ];
 
@@ -482,6 +488,7 @@ fn test_context_distiller_outcome_weighting() {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     });
 
     state.turns.push(Turn {
@@ -499,6 +506,7 @@ fn test_context_distiller_outcome_weighting() {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     });
 
     let distilled = ContextDistiller::distill(&state, 2000);
@@ -706,6 +714,7 @@ fn make_turn(index: u32, content: &str, outcome: TurnOutcome) -> Turn {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     }
 }
 
@@ -1362,7 +1371,7 @@ fn test_category_weights_generalist_dampened() {
 // local_embed_text and local_cosine_similarity direct tests
 // ============================================================================
 
-use crosstalk::engines::memory::{local_embed_text, local_cosine_similarity};
+use crosstalk::engines::memory::{local_cosine_similarity, local_embed_text};
 
 #[test]
 fn local_embed_text_deterministic() {

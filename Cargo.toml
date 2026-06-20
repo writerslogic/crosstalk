@@ -1,7 +1,15 @@
+[workspace]
+members = ["crosstalk-eval"]
+
 [package]
 name = "crosstalk"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.87"
+
+[[bin]]
+name = "crosstalk"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.102"

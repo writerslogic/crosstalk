@@ -4,12 +4,12 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::Rng;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
-use sha2::Digest;
 
 static AWS_REGEX: OnceLock<Regex> = OnceLock::new();
 static GH_REGEX: OnceLock<Regex> = OnceLock::new();
@@ -49,7 +49,7 @@ impl SecretScanner {
         let mut findings = Vec::new();
         for (line_idx, line) in content.lines().enumerate() {
             let line_num = line_idx + 1;
-            
+
             if let Some(m) = aws_regex().find(line) {
                 findings.push(SecretFinding {
                     line: line_num,
@@ -79,7 +79,9 @@ impl SecretScanner {
     }
 
     fn calculate_entropy(s: &str) -> f64 {
-        if s.is_empty() { return 0.0; }
+        if s.is_empty() {
+            return 0.0;
+        }
         let mut freq = HashMap::new();
         for c in s.chars() {
             *freq.entry(c).or_insert(0) += 1;
@@ -98,16 +100,26 @@ pub struct ShellSanity;
 
 impl ShellSanity {
     const ALLOWED_BINS: &'static [&'static str] = &[
-        "cargo", "rustc", "git", "ls", "cat", "grep", "rustfmt", "clippy", "tree-sitter"
+        "cargo",
+        "rustc",
+        "git",
+        "ls",
+        "cat",
+        "grep",
+        "rustfmt",
+        "clippy",
+        "tree-sitter",
     ];
 
     const DANGEROUS_PATTERNS: &'static [&'static str] = &[
-        "rm -rf /", "rm -rf ~", "curl", "wget", "nc", "netcat", "dd", "mkfs"
+        "rm -rf /", "rm -rf ~", "curl", "wget", "nc", "netcat", "dd", "mkfs",
     ];
 
     pub fn validate(cmd: &str) -> Result<(), String> {
         let tokens = Self::tokenize(cmd);
-        if tokens.is_empty() { return Ok(()); }
+        if tokens.is_empty() {
+            return Ok(());
+        }
 
         let bin = &tokens[0];
         let bin_name = Path::new(bin)
@@ -116,7 +128,10 @@ impl ShellSanity {
             .unwrap_or(bin);
 
         if !Self::ALLOWED_BINS.contains(&bin_name) {
-            return Err(format!("Binary '{}' is not on the Sovereign allowlist", bin_name));
+            return Err(format!(
+                "Binary '{}' is not on the Sovereign allowlist",
+                bin_name
+            ));
         }
 
         let full_cmd = tokens.join(" ");
@@ -127,7 +142,11 @@ impl ShellSanity {
         }
 
         for token in &tokens {
-            if token.contains('>') || token.contains('|') || token.contains('&') || token.contains(';') {
+            if token.contains('>')
+                || token.contains('|')
+                || token.contains('&')
+                || token.contains(';')
+            {
                 return Err("Command contains restricted operators (>, |, &, ;)".to_string());
             }
             if token.contains("/dev/") || token.contains("/etc/") {
@@ -151,7 +170,11 @@ impl ShellSanity {
             } else if c == '\\' {
                 escaped = true;
             } else if let Some(q) = in_quote {
-                if c == q { in_quote = None; } else { current.push(c); }
+                if c == q {
+                    in_quote = None;
+                } else {
+                    current.push(c);
+                }
             } else if c == '\'' || c == '\"' {
                 in_quote = Some(c);
             } else if c.is_whitespace() {
@@ -163,7 +186,9 @@ impl ShellSanity {
                 current.push(c);
             }
         }
-        if !current.is_empty() { tokens.push(current); }
+        if !current.is_empty() {
+            tokens.push(current);
+        }
         tokens
     }
 }
@@ -212,21 +237,31 @@ impl TurnSigner {
         clean.signature = vec![];
         let data = serde_json::to_vec(&clean)
             .map_err(|e| anyhow::anyhow!("failed to serialize turn for verification: {e}"))?;
-        let sig_bytes: &[u8; 64] = turn.signature.as_slice().try_into()
-            .map_err(|_| anyhow::anyhow!(
+        let sig_bytes: &[u8; 64] = turn.signature.as_slice().try_into().map_err(|_| {
+            anyhow::anyhow!(
                 "invalid signature length: expected 64 bytes, got {}",
                 turn.signature.len()
-            ))?;
+            )
+        })?;
         let sig = Signature::from_bytes(sig_bytes);
         let verifying_key: VerifyingKey = (&self.signing_key).into();
         Ok(verifying_key.verify(&data, &sig).is_ok())
     }
 }
 
-impl Default for TurnSigner { fn default() -> Self { Self::new() } }
+impl Default for TurnSigner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum RiskLevel { Low, Medium, High, Critical }
+pub enum RiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
 
 pub struct ZeroTrustPolicy {
     rules: Vec<(String, Option<String>, RiskLevel)>,
@@ -244,11 +279,16 @@ impl ZeroTrustPolicy {
     }
 
     pub fn classify(&self, tool: &str, args: &str) -> RiskLevel {
-        let tool_bin = Path::new(tool).file_name().and_then(|s| s.to_str()).unwrap_or(tool);
+        let tool_bin = Path::new(tool)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(tool);
         for (tool_pat, arg_pat, risk) in &self.rules {
             if tool_bin.contains(tool_pat) {
                 if let Some(a) = arg_pat {
-                    if args.contains(a) { return risk.clone(); }
+                    if args.contains(a) {
+                        return risk.clone();
+                    }
                 } else {
                     return risk.clone();
                 }
@@ -258,7 +298,11 @@ impl ZeroTrustPolicy {
     }
 }
 
-impl Default for ZeroTrustPolicy { fn default() -> Self { Self::new() } }
+impl Default for ZeroTrustPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
@@ -275,7 +319,9 @@ pub struct AuditLogger {
 }
 
 impl AuditLogger {
-    pub fn new(db: Arc<sled::Db>, signer: Arc<TurnSigner>) -> Self { Self { db, signer } }
+    pub fn new(db: Arc<sled::Db>, signer: Arc<TurnSigner>) -> Self {
+        Self { db, signer }
+    }
 
     pub fn log(&self, event: &str, risk_level: RiskLevel, actor: &str) -> anyhow::Result<()> {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
