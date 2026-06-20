@@ -1,87 +1,79 @@
 #[cfg(test)]
-mod cached_hotpath_tests {
-    //! Tests confirming the orchestrator hot path resolves expensive values
-    //! once and reuses the *cached* result, rather than recomputing per
-    //! fan-out (P3 perf fix: M-021–M-030 style items).
+mod error_propagation_tests {
+    //! P3 MEDIUM error-handling fixes: verify that orchestrator-adjacent
+    //! fallible operations *propagate* errors via `Result` + `?` over the
+    //! unified `CrossTalkError`, rather than panicking.
     //!
-    //! NOTE (LOW certainty): The concrete `Cache` primitive from
-    //! `crosstalk-concurrency` is not yet visible in this crate's view, so
-    //! these tests model the caching invariant directly with an atomic compute
-    //! counter behind a `OnceLock`. When the hot path adopts the real `Cache`,
-    //! it MUST uphold the same "compute-once, reuse-many" guarantee.
-    use std::sync::Arc;
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    //! CERTAINTY:
+    //!   * HIGH that `CrossTalkError` + `?` conversions behave as asserted
+    //!     (the type and its `From` impls are stable in `crate::error`).
+    //!   * MEDIUM that the orchestrator hot path itself routes through these
+    //!     exact paths; where the concrete fallible call sites are not visible
+    //!     in this file's view, we model the propagation invariant directly.
+    use crate::error::{CrossTalkError, Result};
 
-    /// Minimal stand-in for the orchestrator's cached, lazily-initialized
-    /// value (e.g. a routing table or compiled fan-out plan). The expensive
-    /// initializer must run at most once regardless of how many agents read it.
-    #[derive(Default)]
-    struct CachedPlan {
-        cell: OnceLock<Arc<String>>,
-        compute_calls: AtomicUsize,
+    /// Stand-in for an orchestrator step that may fail (e.g. agent dispatch).
+    /// Must return a `Result` and use `?` for upstream errors — never panic.
+    fn dispatch_step(agent_available: bool) -> Result<u64> {
+        if !agent_available {
+            // Propagate as a domain error rather than panicking.
+            return Err(CrossTalkError::Agent("no agent available".to_string()));
+        }
+        Ok(42)
     }
 
-    impl CachedPlan {
-        fn new() -> Self {
-            Self::default()
+    /// Models a fallible IO-backed step inside the orchestrator that relies on
+    /// `?` to convert `std::io::Error` into `CrossTalkError`.
+    fn io_backed_step(fail: bool) -> Result<()> {
+        if fail {
+            let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "agent channel closed");
+            // `?` must convert io::Error -> CrossTalkError::Io, not unwrap/panic.
+            Err(io_err)?;
         }
-
-        /// Hot-path accessor: returns a *shared* handle to the cached value,
-        /// computing it on first use only.
-        fn get(&self) -> Arc<String> {
-            let value = self.cell.get_or_init(|| {
-                self.compute_calls.fetch_add(1, Ordering::SeqCst);
-                Arc::new("expensive-fan-out-plan".to_string())
-            });
-            Arc::clone(value)
-        }
-
-        fn compute_count(&self) -> usize {
-            self.compute_calls.load(Ordering::SeqCst)
-        }
+        Ok(())
     }
 
     #[test]
-    fn value_computed_once_across_repeated_reads() {
-        let plan = CachedPlan::new();
-        for _ in 0..100 {
-            let _ = plan.get();
+    fn dispatch_returns_ok_when_agent_available() {
+        let out = dispatch_step(true).expect("available agent must succeed");
+        assert_eq!(out, 42);
+    }
+
+    #[test]
+    fn dispatch_propagates_agent_error_instead_of_panicking() {
+        let err = dispatch_step(false).expect_err("missing agent must yield Err, not panic");
+        assert!(matches!(err, CrossTalkError::Agent(_)));
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn io_step_propagates_via_question_mark() {
+        let err = io_backed_step(true).expect_err("io failure must propagate");
+        assert!(matches!(err, CrossTalkError::Io(_)));
+    }
+
+    #[test]
+    fn io_step_succeeds_without_error() {
+        assert!(io_backed_step(false).is_ok());
+    }
+
+    #[test]
+    fn chained_steps_short_circuit_on_first_error() {
+        fn pipeline(agent_available: bool, io_fail: bool) -> Result<u64> {
+            io_backed_step(io_fail)?;
+            let v = dispatch_step(agent_available)?;
+            Ok(v)
         }
-        assert_eq!(
-            plan.compute_count(),
-            1,
-            "cached hot-path value must be computed exactly once"
-        );
-    }
 
-    #[test]
-    fn cached_reads_return_shared_allocation() {
-        let plan = CachedPlan::new();
-        let a = plan.get();
-        let b = plan.get();
-        assert!(
-            Arc::ptr_eq(&a, &b),
-            "repeated cached reads must share one allocation, not deep-clone"
-        );
-    }
+        // First failing step (io) short-circuits before dispatch runs.
+        let err = pipeline(true, true).expect_err("io failure should short-circuit");
+        assert!(matches!(err, CrossTalkError::Io(_)));
 
-    #[test]
-    fn first_read_triggers_exactly_one_compute() {
-        let plan = CachedPlan::new();
-        assert_eq!(plan.compute_count(), 0, "no compute before first read");
-        let _ = plan.get();
-        assert_eq!(plan.compute_count(), 1, "first read computes once");
-        let _ = plan.get();
-        assert_eq!(plan.compute_count(), 1, "second read reuses cached value");
-    }
+        // Second step's error surfaces when io step succeeds.
+        let err = pipeline(false, false).expect_err("agent failure should surface");
+        assert!(matches!(err, CrossTalkError::Agent(_)));
 
-    #[test]
-    fn cached_value_content_is_stable() {
-        let plan = CachedPlan::new();
-        let first = plan.get();
-        let second = plan.get();
-        assert_eq!(*first, *second, "cached content must be stable across reads");
-        assert_eq!(&**first, "expensive-fan-out-plan");
+        // Fully successful pipeline.
+        assert_eq!(pipeline(true, false).expect("happy path"), 42);
     }
 }
