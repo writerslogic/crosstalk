@@ -12,6 +12,10 @@ pub mod sharded;
 // CERTAIN: Re-export the primary cancellation type for ergonomic access.
 pub use cancel::CancelScope;
 
+// CERTAIN: Re-export the cache primitive so callers (embed_text, metacognition)
+// can route through a single shared type.
+pub use cache::{Cache, CacheConfig};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -35,5 +39,13 @@ mod tests {
     fn cancel_scope_is_reexported() {
         let _scope = CancelScope::new();
         assert!(!_scope.is_cancelled());
+    }
+
+    // CERTAIN: Confirms the Cache re-export is part of the public API.
+    #[test]
+    fn cache_is_reexported() {
+        let _cfg = CacheConfig::default();
+        let _cache: Cache<u32, u32> = Cache::default();
+        assert!(_cfg.capacity > 0);
     }
 }
