@@ -109,7 +109,6 @@ impl AsyncExecutor {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

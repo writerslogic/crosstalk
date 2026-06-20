@@ -120,10 +120,10 @@ impl PostMortemGenerator {
         for t in failed_turns {
             *agent_failures.entry(&t.model_id).or_default() += 1;
         }
-        if let Some((_, &count)) = agent_failures.iter().max_by_key(|(_, c)| **c) {
-            if count as f64 / failed_turns.len() as f64 > 0.7 {
-                return FailureCause::AgentCapabilityLimit;
-            }
+        if let Some((_, &count)) = agent_failures.iter().max_by_key(|(_, c)| **c)
+            && count as f64 / failed_turns.len() as f64 > 0.7
+        {
+            return FailureCause::AgentCapabilityLimit;
         }
 
         // Check for verification failures (type/syntax errors)
@@ -166,12 +166,11 @@ impl PostMortemGenerator {
         }
 
         // Check if the initial task is vague
-        if let Some(first) = sigma.turns.first() {
-            if first.content.split_whitespace().count() < 20 {
-                missing.push(
-                    "Task description is very brief; consider providing more detail".to_string(),
-                );
-            }
+        if let Some(first) = sigma.turns.first()
+            && first.content.split_whitespace().count() < 20
+        {
+            missing
+                .push("Task description is very brief; consider providing more detail".to_string());
         }
 
         // Check for repeated similar failures

@@ -484,7 +484,6 @@ impl SweBenchEnvironment for SwebenchHarnessEnv {
 /// <last N/2 bytes>
 /// ```
 #[allow(dead_code)]
-#[allow(clippy::incompatible_msrv)]
 fn truncate_output(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_owned();

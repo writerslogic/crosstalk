@@ -228,7 +228,6 @@ where
     }
 }
 
-
 #[cfg(test)]
 mod recall_arc_sharing_tests {
     use super::*;

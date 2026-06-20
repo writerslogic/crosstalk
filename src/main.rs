@@ -190,8 +190,11 @@ fn is_likely_text(path: &std::path::Path) -> bool {
 /// Returns the worker guard (which must be kept alive for the process lifetime
 /// so buffered logs are flushed on shutdown), the path of the active log file,
 /// and the run timestamp (reused as the default session id).
-fn init_logging()
--> anyhow::Result<(tracing_appender::non_blocking::WorkerGuard, std::path::PathBuf, String)> {
+fn init_logging() -> anyhow::Result<(
+    tracing_appender::non_blocking::WorkerGuard,
+    std::path::PathBuf,
+    String,
+)> {
     let log_dir = std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| {
         std::env::var("HOME")
             .map(|h| format!("{h}/.local/state"))
@@ -435,15 +438,15 @@ async fn main() -> anyhow::Result<()> {
                 valid_agents.push(agent);
             } else {
                 let name = agent.name().to_string();
-                if has_openrouter && !name.starts_with("openrouter:") {
-                    if let Ok(fallback) = ModelFactory::create_openrouter_fallback(&name) {
-                        if crosstalk::core::factory::validate_agent(fallback.as_ref()).await {
-                            tracing::info!(agent = %name, "native provider failed, using OpenRouter fallback");
-                            print_status(&format!("Agent {name}: using OpenRouter fallback"));
-                            valid_agents.push(fallback);
-                            continue;
-                        }
-                    }
+                if has_openrouter
+                    && !name.starts_with("openrouter:")
+                    && let Ok(fallback) = ModelFactory::create_openrouter_fallback(&name)
+                    && crosstalk::core::factory::validate_agent(fallback.as_ref()).await
+                {
+                    tracing::info!(agent = %name, "native provider failed, using OpenRouter fallback");
+                    print_status(&format!("Agent {name}: using OpenRouter fallback"));
+                    valid_agents.push(fallback);
+                    continue;
                 }
                 tracing::warn!(agent = %name, "agent validation failed, removing");
                 print_status(&format!("Agent {name}: validation failed, skipping"));
@@ -801,13 +804,12 @@ async fn main() -> anyhow::Result<()> {
             let target = ws_root
                 .map(|ws| ws.join(name))
                 .unwrap_or_else(|| std::path::PathBuf::from(name));
-            if let Some(ref root) = canonical_root {
-                if let Ok(ct) = target.canonicalize() {
-                    if !ct.starts_with(root) {
-                        tracing::warn!(artifact = %name, "artifact path escapes workspace");
-                        continue;
-                    }
-                }
+            if let Some(ref root) = canonical_root
+                && let Ok(ct) = target.canonicalize()
+                && !ct.starts_with(root)
+            {
+                tracing::warn!(artifact = %name, "artifact path escapes workspace");
+                continue;
             }
             if target.exists() && artifact.version > 1 {
                 match tokio::fs::write(&target, &artifact.content).await {

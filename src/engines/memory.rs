@@ -70,10 +70,10 @@ fn embed_cache_key(text: &str) -> u64 {
 
 pub fn embed_text(text: &str) -> Vec<f32> {
     let key = embed_cache_key(text);
-    if let Ok(cache) = EMBED_CACHE.lock() {
-        if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
-            return cache[pos].1.clone();
-        }
+    if let Ok(cache) = EMBED_CACHE.lock()
+        && let Some(pos) = cache.iter().position(|(k, _)| *k == key)
+    {
+        return cache[pos].1.clone();
     }
 
     let result = embed_text_uncached(text);
@@ -428,10 +428,10 @@ impl MemoryBridge {
         if records.len() > Self::MAX_RECORDS_PER_SESSION {
             records.drain(..records.len() - Self::MAX_RECORDS_PER_SESSION);
         }
-        if self.sessions.len() > Self::MAX_SESSIONS {
-            if let Some(oldest) = self.sessions.keys().next().cloned() {
-                self.sessions.remove(&oldest);
-            }
+        if self.sessions.len() > Self::MAX_SESSIONS
+            && let Some(oldest) = self.sessions.keys().next().cloned()
+        {
+            self.sessions.remove(&oldest);
         }
     }
 

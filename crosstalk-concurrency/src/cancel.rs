@@ -99,7 +99,6 @@ impl Default for CancelScope {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

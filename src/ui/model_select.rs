@@ -285,14 +285,14 @@ pub fn auto_select_models(task: &str) -> Vec<String> {
         .filter(|s| !is_blocked_model(s))
         .collect();
 
-    if env::var("ANTHROPIC_API_KEY").is_ok() {
-        if let Some(base_model) = selected.iter().find(|s| s.contains("claude")).cloned() {
-            for role in DEBATE_ROLES {
-                if selected.len() >= 7 {
-                    break;
-                }
-                selected.push(format!("{}#{}", base_model, role));
+    if env::var("ANTHROPIC_API_KEY").is_ok()
+        && let Some(base_model) = selected.iter().find(|s| s.contains("claude")).cloned()
+    {
+        for role in DEBATE_ROLES {
+            if selected.len() >= 7 {
+                break;
             }
+            selected.push(format!("{}#{}", base_model, role));
         }
     }
 
@@ -326,14 +326,14 @@ pub async fn auto_select_models_dynamic(task: &str) -> Vec<String> {
         }
     }
 
-    if env::var("ANTHROPIC_API_KEY").is_ok() {
-        if let Some(base_model) = selected.iter().find(|s| s.contains("claude")).cloned() {
-            for role in DEBATE_ROLES {
-                if selected.len() >= 7 {
-                    break;
-                }
-                selected.push(format!("{}#{}", base_model, role));
+    if env::var("ANTHROPIC_API_KEY").is_ok()
+        && let Some(base_model) = selected.iter().find(|s| s.contains("claude")).cloned()
+    {
+        for role in DEBATE_ROLES {
+            if selected.len() >= 7 {
+                break;
             }
+            selected.push(format!("{}#{}", base_model, role));
         }
     }
 
@@ -1108,35 +1108,35 @@ pub async fn run_api_key_setup() -> Result<()> {
             break;
         }
 
-        if event::poll(std::time::Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+        if event::poll(std::time::Duration::from_millis(50))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Tab | KeyCode::Down => {
+                    focused = (focused + 1) % PROVIDER_KEYS.len();
                 }
-                match key.code {
-                    KeyCode::Tab | KeyCode::Down => {
-                        focused = (focused + 1) % PROVIDER_KEYS.len();
-                    }
-                    KeyCode::BackTab | KeyCode::Up => {
-                        focused = focused.checked_sub(1).unwrap_or(PROVIDER_KEYS.len() - 1);
-                    }
-                    KeyCode::Enter => {
-                        if inputs.iter().any(|v| !v.is_empty()) {
-                            saved = true;
-                            done = true;
-                        }
-                    }
-                    KeyCode::Esc => {
+                KeyCode::BackTab | KeyCode::Up => {
+                    focused = focused.checked_sub(1).unwrap_or(PROVIDER_KEYS.len() - 1);
+                }
+                KeyCode::Enter => {
+                    if inputs.iter().any(|v| !v.is_empty()) {
+                        saved = true;
                         done = true;
                     }
-                    KeyCode::Char(c) => {
-                        inputs[focused].push(c);
-                    }
-                    KeyCode::Backspace => {
-                        inputs[focused].pop();
-                    }
-                    _ => {}
                 }
+                KeyCode::Esc => {
+                    done = true;
+                }
+                KeyCode::Char(c) => {
+                    inputs[focused].push(c);
+                }
+                KeyCode::Backspace => {
+                    inputs[focused].pop();
+                }
+                _ => {}
             }
         }
     }

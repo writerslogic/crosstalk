@@ -1177,14 +1177,13 @@ impl Orchestrator {
                             Ok(val) => final_results.push(val),
                             Err(e) => {
                                 let msg = e.to_string();
-                                if msg.contains("timed out") {
-                                    if let Some(name) = msg.strip_prefix("Agent ").and_then(|s| s.split_whitespace().next()) {
+                                if msg.contains("timed out")
+                                    && let Some(name) = msg.strip_prefix("Agent ").and_then(|s| s.split_whitespace().next()) {
                                         let turn = sigma_lock.lock().await.iteration_index;
                                         self.skip_until.lock().await.insert(name.to_string(), turn + 3);
                                         self.emit(StreamEvent::Error(format!("Agent {} timed out, skipping for 3 turns", name))).await?;
                                         continue;
                                     }
-                                }
                                 self.emit(StreamEvent::Error(format!("Agent dropped: {}", e))).await?;
                             }
                         }
@@ -3038,10 +3037,10 @@ impl Orchestrator {
                 scorer.absorb(&t.content);
             }
             let novel = scorer.top_novel_sentences(response, 1);
-            if let Some((sentence, score)) = novel.into_iter().next() {
-                if score > 0.3 {
-                    sigma.novel_signal = Some(sentence);
-                }
+            if let Some((sentence, score)) = novel.into_iter().next()
+                && score > 0.3
+            {
+                sigma.novel_signal = Some(sentence);
             }
         }
 
@@ -4197,10 +4196,10 @@ impl Orchestrator {
                     return "[write_file] Path traversal not allowed".to_string();
                 }
                 let target = self.file_writer.root.join(path_str);
-                if let Some(parent) = target.parent() {
-                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                        return format!("[write_file] Cannot create directory: {e}");
-                    }
+                if let Some(parent) = target.parent()
+                    && let Err(e) = tokio::fs::create_dir_all(parent).await
+                {
+                    return format!("[write_file] Cannot create directory: {e}");
                 }
                 let canonical_root = match self.file_writer.root.canonicalize() {
                     Ok(r) => r,
@@ -4208,18 +4207,18 @@ impl Orchestrator {
                 };
                 match tokio::fs::write(&target, content).await {
                     Ok(()) => {
-                        if let Ok(canonical_target) = target.canonicalize() {
-                            if !canonical_target.starts_with(&canonical_root) {
-                                if let Err(e) = tokio::fs::remove_file(&target).await {
-                                    tracing::error!(
-                                        path = %target.display(),
-                                        err = %e,
-                                        "failed to remove workspace-escaping file; it may persist on disk"
-                                    );
-                                }
-                                return "[write_file] Path escapes workspace after resolution"
-                                    .to_string();
+                        if let Ok(canonical_target) = target.canonicalize()
+                            && !canonical_target.starts_with(&canonical_root)
+                        {
+                            if let Err(e) = tokio::fs::remove_file(&target).await {
+                                tracing::error!(
+                                    path = %target.display(),
+                                    err = %e,
+                                    "failed to remove workspace-escaping file; it may persist on disk"
+                                );
                             }
+                            return "[write_file] Path escapes workspace after resolution"
+                                .to_string();
                         }
                         tracing::info!(path = %target.display(), bytes = content.len(), "file written via tool directive");
                         let git_msg = Self::git_stage_file(&self.file_writer.root, &target).await;
@@ -4242,12 +4241,11 @@ impl Orchestrator {
                     return "[read_file] Path traversal not allowed".to_string();
                 }
                 let target = self.file_writer.root.join(path_str);
-                if let Ok(canonical) = target.canonicalize() {
-                    if let Ok(canonical_root) = self.file_writer.root.canonicalize() {
-                        if !canonical.starts_with(&canonical_root) {
-                            return "[read_file] Path escapes workspace".to_string();
-                        }
-                    }
+                if let Ok(canonical) = target.canonicalize()
+                    && let Ok(canonical_root) = self.file_writer.root.canonicalize()
+                    && !canonical.starts_with(&canonical_root)
+                {
+                    return "[read_file] Path escapes workspace".to_string();
                 }
                 match tokio::fs::read_to_string(&target).await {
                     Ok(content) => {
