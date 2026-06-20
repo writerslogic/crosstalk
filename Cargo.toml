@@ -1,5 +1,5 @@
 [workspace]
-members = ["crosstalk-eval"]
+members = ["crosstalk-eval", "crosstalk-concurrency"]
 
 [package]
 name = "crosstalk"
