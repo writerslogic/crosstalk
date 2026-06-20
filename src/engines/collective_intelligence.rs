@@ -239,7 +239,11 @@ impl EnsembleEngine {
             return String::new();
         }
         if proposals.len() == 1 {
-            return proposals.into_iter().next().unwrap().1;
+            return proposals
+                .into_iter()
+                .next()
+                .expect("len == 1 checked above")
+                .1;
         }
 
         // For Code Generation, use high-fidelity AST merging

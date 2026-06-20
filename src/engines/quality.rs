@@ -291,7 +291,7 @@ impl QualityTrendAnalyzer {
             return None;
         }
         let first = &h[0];
-        let last = h.last().unwrap();
+        let last = h.last().expect("len >= 2 checked above");
         let turns = (last.turn_id as f64 - first.turn_id as f64).max(1.0);
         Some((last.score - first.score) / turns)
     }
@@ -578,7 +578,7 @@ impl CompletionScorer {
         if !stalled {
             return None;
         }
-        let last = recent.last().unwrap();
+        let last = recent.last().expect("len >= 4 checked above");
         let (blocker_type, suggested_action) = if last.tests_passing < 0.5 {
             (
                 BlockerType::FailingTest,
