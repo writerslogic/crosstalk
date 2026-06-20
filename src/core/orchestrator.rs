@@ -473,17 +473,15 @@ impl Orchestrator {
             let p = self.principal.lock().await;
             p.constraints.allowed_tool_categories.clone()
         };
-        let mut gw = self.mcp_gateway.lock().await;
-        gw.set_principal_allowed_categories(categories);
-        gw.dispatch(
-            agent_id,
-            "tools/call",
-            serde_json::json!({
-                "name": name,
-                "arguments": args
-            }),
-        )
-        .await
+        // Authorize under the gateway lock (fast, in-memory), then release the
+        // lock before running the tool so concurrent tool calls do not
+        // serialize on the gateway (H-019).
+        let authorized = {
+            let mut gw = self.mcp_gateway.lock().await;
+            gw.set_principal_allowed_categories(categories);
+            gw.authorize_tool_call(agent_id, name, &args)?
+        };
+        McpGateway::execute_authorized(authorized).await
     }
 
     #[instrument(skip_all, fields(session, turn))]

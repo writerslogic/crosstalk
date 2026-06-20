@@ -23,6 +23,17 @@ pub struct McpGateway {
     principal_allowed_categories: Vec<String>,
 }
 
+/// An authorized but not-yet-executed tool call.
+///
+/// Returned by [`McpGateway::authorize_tool_call`] and consumed by
+/// [`McpGateway::execute_authorized`]. It carries only the data needed to run
+/// the tool, so execution can proceed after the gateway lock is released.
+pub struct AuthorizedToolCall {
+    name: String,
+    cli_args: Vec<String>,
+    workspace_root: String,
+}
+
 impl McpGateway {
     /// Create a gateway with no workspace root (for tests).
     pub fn new() -> Self {
@@ -275,7 +286,22 @@ impl McpGateway {
         }
     }
 
-    async fn call_tool(&mut self, agent_id: &str, name: &str, args: Value) -> Result<Value> {
+    /// Authorize a `tools/call` request without executing it.
+    ///
+    /// Runs every in-memory policy check (principal consent, permissions,
+    /// confirmation gate, timeout state, tool lookup) and returns the data
+    /// needed to run the tool. This is the only part of a tool call that needs
+    /// `&mut self`, and it performs no I/O. Callers that hold the gateway under
+    /// a lock can therefore drop the lock immediately after authorization and
+    /// run the (slow, subprocess-backed) execution concurrently via
+    /// [`McpGateway::execute_authorized`], so one in-flight tool call no longer
+    /// serializes every other MCP request.
+    pub fn authorize_tool_call(
+        &mut self,
+        agent_id: &str,
+        name: &str,
+        args: &Value,
+    ) -> Result<AuthorizedToolCall> {
         // Principal consent check (Loyalty/Controllability duty).
         {
             let category = self
@@ -298,7 +324,7 @@ impl McpGateway {
 
         // Permission check
         self.permissions
-            .check_with_reason(agent_id, name, &args)
+            .check_with_reason(agent_id, name, args)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         // Critical-tool confirmation gate
@@ -310,10 +336,7 @@ impl McpGateway {
         if needs_confirmation {
             match self.confirmation_override {
                 Some(true) => { /* confirmed */ }
-                Some(false) => {
-                    return Err(anyhow::anyhow!("Tool {:?} not confirmed by operator", name));
-                }
-                None => {
+                Some(false) | None => {
                     return Err(anyhow::anyhow!("Tool {:?} not confirmed by operator", name));
                 }
             }
@@ -342,7 +365,20 @@ impl McpGateway {
             }
         }
 
-        let tool_result = CliBridge::call(name, cli_args, &self.workspace_root).await?;
+        Ok(AuthorizedToolCall {
+            name: name.to_string(),
+            cli_args,
+            workspace_root: self.workspace_root.clone(),
+        })
+    }
+
+    /// Execute a previously authorized tool call.
+    ///
+    /// Performs the actual subprocess invocation. This is intentionally a free
+    /// function (no `self`) so it can run after the caller has released any
+    /// gateway lock, allowing concurrent tool execution.
+    pub async fn execute_authorized(call: AuthorizedToolCall) -> Result<Value> {
+        let tool_result = CliBridge::call(&call.name, call.cli_args, &call.workspace_root).await?;
 
         Ok(json!({
             "content": [{
@@ -355,6 +391,11 @@ impl McpGateway {
             }],
             "isError": !tool_result.success
         }))
+    }
+
+    async fn call_tool(&mut self, agent_id: &str, name: &str, args: Value) -> Result<Value> {
+        let authorized = self.authorize_tool_call(agent_id, name, &args)?;
+        Self::execute_authorized(authorized).await
     }
 
     pub fn set_nix_env(&mut self, env: Option<HashMap<String, String>>) {
