@@ -5,13 +5,13 @@
 //! Bayesian confidence tracking and Elo-based selection pressure.
 
 use crate::engines::memory::{cosine_sim, local_embed_text};
-use crate::engines::reasoning::FallacyDetector;
+use crate::engines::reasoning::{FallacyDetector, sanitize_directive_content};
 use crate::engines::surprise::SurpriseEngine;
-use crate::types::conversation::{Turn, TurnOutcome};
+use crate::types::conversation::{TaskCategory, Turn, TurnOutcome};
 use crate::types::security::FallacyReport;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 const DEFAULT_CONCESSION_THRESHOLD: f64 = 0.20;
 const DEFAULT_DEADLOCK_THRESHOLD: u32 = 5;
@@ -72,10 +72,10 @@ pub struct Assumption {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub enum AssumptionBasis {
-    Empirical,    // backed by data/code/tests
-    Theoretical,  // backed by reasoning
-    Heuristic,    // rules of thumb
-    Ungrounded,   // no stated basis
+    Empirical,   // backed by data/code/tests
+    Theoretical, // backed by reasoning
+    Heuristic,   // rules of thumb
+    Ungrounded,  // no stated basis
 }
 
 impl Default for EpistemicState {
@@ -190,7 +190,7 @@ pub enum InterventionSeverity {
     Mandatory,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InterventionSource {
     FallacyDetection,
     EpistemicCollapse,
@@ -214,8 +214,11 @@ pub struct ObserverMetrics {
 pub struct MetacognitiveObserver {
     /// Per-agent epistemic state tracking.
     pub agent_states: FxHashMap<String, EpistemicState>,
-    /// Per-agent Elo ratings for selection pressure.
+    /// Per-agent Elo ratings for selection pressure (overall average across categories).
     pub elo_ratings: FxHashMap<String, f64>,
+    /// Per-agent per-category Elo: index maps TaskCategory variants
+    /// [CodeGeneration=0, Debugging=1, Architecture=2, Refactoring=3, Research=4, Testing=5, General=6].
+    elo_by_category: FxHashMap<String, [f64; 7]>,
     /// Per-agent Beta-posterior calibration: (alpha, beta).
     /// alpha counts high-certainty turns that were verified correct.
     /// beta counts high-certainty turns that were verified wrong.
@@ -234,6 +237,9 @@ pub struct MetacognitiveObserver {
     deadlock_threshold: u32,
     /// Per-agent intervention outcome history: (source, improved).
     intervention_outcomes: FxHashMap<String, Vec<(InterventionSource, bool)>>,
+    /// Thompson sampling Beta(α, β) parameters per intervention source.
+    source_alpha: FxHashMap<InterventionSource, u32>,
+    source_beta: FxHashMap<InterventionSource, u32>,
     /// Cumulative metrics for this session.
     metrics: ObserverMetrics,
     /// Per-agent running confidence sum and sample count for avg_confidence tracking.
@@ -245,6 +251,7 @@ impl MetacognitiveObserver {
         Self {
             agent_states: FxHashMap::default(),
             elo_ratings: FxHashMap::default(),
+            elo_by_category: FxHashMap::default(),
             calibration: std::collections::HashMap::new(),
             intervention_history: VecDeque::with_capacity(INTERVENTION_HISTORY_CAP),
             concession_threshold: DEFAULT_CONCESSION_THRESHOLD,
@@ -252,6 +259,8 @@ impl MetacognitiveObserver {
             turns_since_progress: 0,
             deadlock_threshold: DEFAULT_DEADLOCK_THRESHOLD,
             intervention_outcomes: FxHashMap::default(),
+            source_alpha: FxHashMap::default(),
+            source_beta: FxHashMap::default(),
             metrics: ObserverMetrics::default(),
             confidence_accum: FxHashMap::default(),
         }
@@ -276,7 +285,7 @@ impl MetacognitiveObserver {
         self.decay_confidence(CONFIDENCE_DECAY_RATE, &FxHashMap::default());
 
         // 3. Fallacy detection with corrective injection.
-        self.detect_and_inject_fallacy_corrections(turn, &mut interventions);
+        self.detect_and_inject_fallacy_corrections(turn, all_recent_turns, &mut interventions);
 
         // 4. Epistemic collapse detection.
         self.detect_epistemic_collapse(turn, &epistemic, &mut interventions);
@@ -289,7 +298,8 @@ impl MetacognitiveObserver {
 
         // 7. Surprise-calibrated Elo update.
         let surprise_val = surprise.compute_surprise(&turn.model_id, turn.outcome);
-        self.update_elo(&turn.model_id, turn.outcome, all_recent_turns, surprise_val);
+        let turn_category = turn.task_category.unwrap_or(TaskCategory::Research);
+        self.update_elo(&turn.model_id, turn.outcome, surprise_val, turn_category);
 
         // 8. Progress tracking and topology shift recommendation.
         self.update_progress_and_topology(turn, &mut interventions);
@@ -327,9 +337,10 @@ impl MetacognitiveObserver {
     fn detect_and_inject_fallacy_corrections(
         &mut self,
         turn: &Turn,
+        prior_turns: &[Turn],
         interventions: &mut Vec<Intervention>,
     ) {
-        let fallacies = FallacyDetector::scan(&turn.content);
+        let fallacies = FallacyDetector::scan(&turn.content, prior_turns);
         for fallacy in &fallacies {
             if self.intervention_suppressed(&turn.model_id, InterventionSource::FallacyDetection) {
                 continue;
@@ -355,13 +366,20 @@ impl MetacognitiveObserver {
         {
             interventions.push(Intervention {
                 target_agent: turn.model_id.clone(),
-                directive: format!(
-                    "Your epistemic confidence has dropped to {:.0}%. \
-                     You must publicly concede the points where your assumptions were defeated: {:?}. \
-                     Refocus on your remaining strong positions.",
-                    epistemic.confidence * 100.0,
-                    epistemic.defeated
-                ),
+                directive: {
+                    let safe_defeated: Vec<String> = epistemic.defeated
+                        .iter()
+                        .take(20)
+                        .map(|d| sanitize_directive_content(d))
+                        .collect();
+                    format!(
+                        "Your epistemic confidence has dropped to {:.0}%. \
+                         You must publicly concede the points where your assumptions were defeated: {:?}. \
+                         Refocus on your remaining strong positions.",
+                        epistemic.confidence * 100.0,
+                        safe_defeated
+                    )
+                },
                 severity: InterventionSeverity::Mandatory,
                 source: InterventionSource::EpistemicCollapse,
             });
@@ -456,8 +474,7 @@ impl MetacognitiveObserver {
                 .semantic_embeddings
                 .iter()
                 .filter(|(id, prev)| {
-                    id == &turn.model_id
-                        && cosine_sim(prev, &embedding) > REPETITION_SIM_SAME_AGENT
+                    id == &turn.model_id && cosine_sim(prev, &embedding) > REPETITION_SIM_SAME_AGENT
                 })
                 .count()
                 >= REPETITION_SAME_AGENT_COUNT;
@@ -515,6 +532,10 @@ impl MetacognitiveObserver {
     /// Post-processing: remove duplicate interventions (same agent+source seen
     /// in the last INTERVENTION_DEDUP_WINDOW history entries), record survivors.
     fn dedup_and_record_interventions(&mut self, interventions: &mut Vec<Intervention>) {
+        // Suppress sources with pessimistic Thompson sample (< 0.2) before recording.
+        interventions.retain(|i| !self.intervention_suppressed(&i.target_agent, i.source));
+
+        // Dedup: skip interventions recently issued to the same agent from the same source.
         interventions.retain(|i| {
             let key = (i.target_agent.clone(), i.source);
             let dominated = self
@@ -534,6 +555,41 @@ impl MetacognitiveObserver {
                 false
             }
         });
+
+        // For the same target_agent, keep only the intervention with the highest Thompson sample.
+        let mut best_per_agent: FxHashMap<String, (f64, usize)> = FxHashMap::default();
+        for (idx, i) in interventions.iter().enumerate() {
+            let q = self.sample_source_quality(i.source);
+            let entry = best_per_agent
+                .entry(i.target_agent.clone())
+                .or_insert((f64::NEG_INFINITY, idx));
+            if q > entry.0 {
+                *entry = (q, idx);
+            }
+        }
+        let keep: HashSet<usize> = best_per_agent.values().map(|(_, i)| *i).collect();
+        let mut idx = 0;
+        interventions.retain(|_| {
+            let keep_it = keep.contains(&idx);
+            idx += 1;
+            keep_it
+        });
+    }
+
+    /// Global success rate for a given intervention source across all agents.
+    /// Returns 1.0 (optimistic prior) when no history exists for that source.
+    pub fn source_success_rate(&self, source: InterventionSource) -> f64 {
+        let matching: Vec<bool> = self
+            .intervention_outcomes
+            .values()
+            .flat_map(|v| v.iter())
+            .filter(|(s, _)| *s == source)
+            .map(|(_, ok)| *ok)
+            .collect();
+        if matching.is_empty() {
+            return 1.0;
+        }
+        matching.iter().filter(|&&ok| ok).count() as f64 / matching.len() as f64
     }
 
     // ── Remaining public / private methods ───────────────────────────
@@ -562,10 +618,31 @@ impl MetacognitiveObserver {
         source: InterventionSource,
         improved: bool,
     ) {
-        self.intervention_outcomes
+        let outcomes = self
+            .intervention_outcomes
             .entry(agent_id.to_string())
-            .or_default()
-            .push((source, improved));
+            .or_default();
+        outcomes.push((source, improved));
+        if outcomes.len() > 500 {
+            outcomes.drain(..outcomes.len() - 500);
+        }
+        if improved {
+            *self.source_alpha.entry(source).or_insert(1) += 1;
+        } else {
+            *self.source_beta.entry(source).or_insert(1) += 1;
+        }
+    }
+
+    /// Thompson sample from Beta(α, β) for the given intervention source.
+    /// Returns a value in (0, 1) representing estimated source quality.
+    pub fn sample_source_quality(&self, source: InterventionSource) -> f64 {
+        let alpha = *self.source_alpha.get(&source).unwrap_or(&1) as f64;
+        let beta = *self.source_beta.get(&source).unwrap_or(&1) as f64;
+        // Simple Beta approximation: mean + small noise scaled by variance
+        let mean = alpha / (alpha + beta);
+        let variance = (alpha * beta) / ((alpha + beta).powi(2) * (alpha + beta + 1.0));
+        let noise = (rand::random::<f64>() - 0.5) * variance.sqrt();
+        (mean + noise).clamp(0.0, 1.0)
     }
 
     /// Fraction of interventions for `agent_id` that led to improvement.
@@ -583,8 +660,8 @@ impl MetacognitiveObserver {
 
     /// Returns true when interventions for this agent should be withheld
     /// because the success rate has fallen below the suppression floor.
-    fn intervention_suppressed(&self, agent_id: &str, _source: InterventionSource) -> bool {
-        self.intervention_success_rate(agent_id) < 0.3
+    fn intervention_suppressed(&self, _agent_id: &str, source: InterventionSource) -> bool {
+        self.sample_source_quality(source) < 0.2
     }
 
     /// Compose a corrective prompt for a detected fallacy.
@@ -612,14 +689,15 @@ impl MetacognitiveObserver {
                 "Remove the fallacious reasoning and reconstruct \
                  your argument from valid premises only. \
                  (evidence: \"{}\", confidence: {:.0}%)",
-                fallacy.evidence_span,
+                sanitize_directive_content(&fallacy.evidence_span),
                 fallacy.confidence * 100.0
             )
         };
 
         format!(
             "METACOGNITIVE CORRECTION: Your argument contains a {} fallacy. {}",
-            fallacy.fallacy_type, specific
+            sanitize_directive_content(&fallacy.fallacy_type),
+            specific
         )
     }
 
@@ -654,7 +732,8 @@ impl MetacognitiveObserver {
     /// nothing to calibrate against.
     pub fn update_calibration(&mut self, agent_id: &str, certainty: f64, verified: bool) {
         if certainty > 0.7 {
-            let entry = self.calibration
+            let entry = self
+                .calibration
                 .entry(agent_id.to_string())
                 .or_insert((1.0, 1.0));
             if verified {
@@ -681,8 +760,8 @@ impl MetacognitiveObserver {
         &mut self,
         agent_id: &str,
         outcome: TurnOutcome,
-        _recent: &[Turn],
         surprise_val: f64,
+        task_category: TaskCategory,
     ) {
         let k = 32.0; // standard Elo K-factor
         let rating = *self.elo_ratings.get(agent_id).unwrap_or(&1500.0);
@@ -692,7 +771,9 @@ impl MetacognitiveObserver {
             TurnOutcome::Compiled | TurnOutcome::AdvancedConvergence => 0.75,
             TurnOutcome::Unknown => 0.5,
             TurnOutcome::Stalled => 0.25,
-            TurnOutcome::RolledBack | TurnOutcome::Rejected | TurnOutcome::VerificationFailed => 0.0,
+            TurnOutcome::RolledBack | TurnOutcome::Rejected | TurnOutcome::VerificationFailed => {
+                0.0
+            }
         };
 
         // Update calibration: the turn's certainty is the epistemic state's
@@ -718,11 +799,50 @@ impl MetacognitiveObserver {
         let new_rating = rating + k * amplifier * (score - expected);
 
         self.elo_ratings.insert(agent_id.to_string(), new_rating);
+
+        // Update the per-category slot and recompute overall average.
+        let slot: usize = match task_category {
+            TaskCategory::CodeGeneration => 0,
+            TaskCategory::Debugging => 1,
+            TaskCategory::Architecture => 2,
+            TaskCategory::Refactoring => 3,
+            TaskCategory::Research => 4,
+            TaskCategory::Testing => 5,
+            TaskCategory::General => 6,
+        };
+        let slots = self
+            .elo_by_category
+            .entry(agent_id.to_string())
+            .or_insert([1500.0; 7]);
+        slots[slot] = new_rating;
+        let avg = slots.iter().sum::<f64>() / 7.0;
+        self.elo_ratings.insert(agent_id.to_string(), avg);
+    }
+
+    /// Return the category-specific Elo for `agent_id` (defaults to 1500.0 if unseen).
+    pub fn elo_for_category(&self, agent_id: &str, category: TaskCategory) -> f64 {
+        let slot: usize = match category {
+            TaskCategory::CodeGeneration => 0,
+            TaskCategory::Debugging => 1,
+            TaskCategory::Architecture => 2,
+            TaskCategory::Refactoring => 3,
+            TaskCategory::Research => 4,
+            TaskCategory::Testing => 5,
+            TaskCategory::General => 6,
+        };
+        self.elo_by_category
+            .get(agent_id)
+            .map(|slots| slots[slot])
+            .unwrap_or(1500.0)
     }
 
     /// Get agents sorted by Elo (highest first) for selection pressure.
     pub fn ranked_agents(&self) -> Vec<(String, f64)> {
-        let mut ranked: Vec<_> = self.elo_ratings.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let mut ranked: Vec<_> = self
+            .elo_ratings
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         ranked
     }
@@ -731,8 +851,12 @@ impl MetacognitiveObserver {
     /// Agents below the kill threshold after sufficient turns are eliminated.
     pub fn should_eliminate(&self, agent_id: &str, min_turns: u32) -> bool {
         let rating = *self.elo_ratings.get(agent_id).unwrap_or(&1500.0);
-        let turns: u32 = self.elo_ratings.len() as u32 * min_turns;
-        turns >= min_turns * 3 && rating < 1200.0
+        let agent_turns = self
+            .confidence_accum
+            .get(agent_id)
+            .map(|&(_, c)| c as u32)
+            .unwrap_or(0);
+        agent_turns >= min_turns && rating < 1200.0
     }
 
     /// Get the epistemic state for an agent (for prompt injection).
@@ -748,17 +872,24 @@ impl MetacognitiveObserver {
     /// Serialize Elo ratings to JSON for persistence.
     pub fn export_elo_ratings(&self) -> String {
         serde_json::to_string(
-            &self.elo_ratings.iter().map(|(k, v)| (k.clone(), *v)).collect::<Vec<_>>(),
+            &self
+                .elo_ratings
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect::<Vec<_>>(),
         )
         .unwrap_or_default()
     }
 
     /// Load Elo ratings from a prior session.
     pub fn import_elo_ratings(&mut self, json: &str) {
-        if let Ok(ratings) = serde_json::from_str::<Vec<(String, f64)>>(json) {
-            for (agent_id, elo) in ratings {
-                self.elo_ratings.insert(agent_id, elo);
+        match serde_json::from_str::<Vec<(String, f64)>>(json) {
+            Ok(ratings) => {
+                for (agent_id, elo) in ratings {
+                    self.elo_ratings.insert(agent_id, elo);
+                }
             }
+            Err(e) => tracing::warn!(err = %e, "failed to parse Elo ratings; starting fresh"),
         }
     }
 

@@ -21,6 +21,7 @@ fn make_turn(index: u32, outcome: TurnOutcome) -> Turn {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     }
 }
 
@@ -41,11 +42,11 @@ fn commit_turn_updates_turn_index() {
 }
 
 #[test]
-fn commit_turn_clears_buffer() {
+fn commit_turn_appends_separator() {
     let mut app = App::new("s1");
     app.push_token("test_agent", "some tokens");
     app.commit_turn(&make_turn(0, TurnOutcome::Compiled));
-    assert!(app.streaming_buffer.is_empty());
+    assert!(app.streaming_buffer.contains("--- Turn 0"));
 }
 
 #[test]

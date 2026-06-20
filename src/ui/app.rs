@@ -135,7 +135,10 @@ impl App {
         };
 
         self.streaming_buffer.push_str(&prefix);
-        let sanitized_token: String = token.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect();
+        let sanitized_token: String = token
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+            .collect();
         self.streaming_buffer.push_str(&sanitized_token);
         const BUF_CAP: usize = 50 * 1024;
         if self.streaming_buffer.len() > BUF_CAP {
@@ -194,9 +197,20 @@ impl App {
 
         // Update per-artifact change history for entropy computation
         for (artifact_name, diff) in &turn.diffs {
-            let added = diff.diff_text.lines().filter(|l| l.starts_with('+')).count();
-            let removed = diff.diff_text.lines().filter(|l| l.starts_with('-')).count();
-            self.push_event(format!("  [diff] {} (+{}, -{})", artifact_name, added, removed));
+            let added = diff
+                .diff_text
+                .lines()
+                .filter(|l| l.starts_with('+'))
+                .count();
+            let removed = diff
+                .diff_text
+                .lines()
+                .filter(|l| l.starts_with('-'))
+                .count();
+            self.push_event(format!(
+                "  [diff] {} (+{}, -{})",
+                artifact_name, added, removed
+            ));
 
             let entry = self
                 .artifact_change_history

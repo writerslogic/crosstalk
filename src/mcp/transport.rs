@@ -1,9 +1,8 @@
 use anyhow::Result;
-use tokio::net::{UnixListener, UnixStream};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use serde_json::{json, Value};
-use std::fs;
+use serde_json::{Value, json};
 use std::path::Path;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
 
 const MAX_CONSECUTIVE_PARSE_ERRORS: u32 = 10;
 
@@ -13,13 +12,22 @@ pub struct McpTransport {
 
 impl McpTransport {
     pub fn new(path: &str) -> Self {
-        Self { socket_path: path.to_string() }
+        Self {
+            socket_path: path.to_string(),
+        }
     }
 
     pub async fn listen(&self) -> Result<UnixListener> {
         let path = Path::new(&self.socket_path);
-        if path.exists() {
-            crate::log_warn!(fs::remove_file(path), "failed to remove socket file");
+        if match tokio::fs::try_exists(path).await {
+            Ok(exists) => exists,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(anyhow::anyhow!("failed to check socket path: {e}")),
+        } {
+            crate::log_warn!(
+                tokio::fs::remove_file(path).await,
+                "failed to remove socket file"
+            );
         }
         UnixListener::bind(path).map_err(|e| anyhow::anyhow!(e))
     }
@@ -31,7 +39,10 @@ impl McpTransport {
 
         while let Some(line) = lines.next_line().await? {
             let request: Value = match serde_json::from_str(&line) {
-                Ok(v) => { consecutive_errors = 0; v }
+                Ok(v) => {
+                    consecutive_errors = 0;
+                    v
+                }
                 Err(e) => {
                     consecutive_errors += 1;
                     let err_resp = json!({

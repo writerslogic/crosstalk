@@ -12,6 +12,7 @@ fn xml_escape(s: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
             c => out.push(c),
         }
     }
@@ -146,7 +147,12 @@ impl GodView {
             0.0
         };
         let avg_surprise = if turn_count > 0 {
-            sigma.turns.iter().filter_map(|t| t.surprise_signal).sum::<f64>() / turn_count as f64
+            sigma
+                .turns
+                .iter()
+                .filter_map(|t| t.surprise_signal)
+                .sum::<f64>()
+                / turn_count as f64
         } else {
             0.0
         };
@@ -267,7 +273,11 @@ impl GodView {
         };
 
         // 1. Create a texture to render into
-        let size = wgpu::Extent3d { width: 512, height: 512, depth_or_array_layers: 1 };
+        let size = wgpu::Extent3d {
+            width: 512,
+            height: 512,
+            depth_or_array_layers: 1,
+        };
         let texture_desc = wgpu::TextureDescriptor {
             size,
             mip_level_count: 1,
@@ -291,7 +301,9 @@ impl GodView {
         });
 
         // 3. Render Pass (Simplified placeholder for actual artifact rendering)
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Headless Encoder") });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Headless Encoder"),
+        });
         {
             let mut _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Headless Render Pass"),
@@ -299,7 +311,12 @@ impl GodView {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.1, g: 0.2, b: 0.3, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.1,
+                            g: 0.2,
+                            b: 0.3,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -351,6 +368,9 @@ pub struct LatentMapper;
 impl LatentMapper {
     #[must_use]
     pub fn project_to_3d(content: &str) -> [f32; 3] {
+        if content.is_empty() {
+            return [0.0, 0.0, 0.0];
+        }
         let emb = crate::engines::memory::embed_text(content);
         if emb.len() >= 3 {
             // Normalize the first 3 components of the embedding to [-1, 1]

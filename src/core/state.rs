@@ -53,8 +53,14 @@ impl StateManager {
     /// Rewind :: σ_t ← σ_{t-k}
     pub fn restore(&self, index: u32) -> Result<Option<ConversationState>> {
         let key = format!("state:{}", index);
-        match self.db.get(key.as_bytes()).context("sled read failed for state checkpoint")? {
-            Some(data) => Ok(Some(serde_json::from_slice(&data).context("failed to deserialize state checkpoint")?)),
+        match self
+            .db
+            .get(key.as_bytes())
+            .context("sled read failed for state checkpoint")?
+        {
+            Some(data) => Ok(Some(
+                serde_json::from_slice(&data).context("failed to deserialize state checkpoint")?,
+            )),
             None => Ok(None),
         }
     }
@@ -140,7 +146,9 @@ fn run_migrations(db: &Db) -> Result<()> {
     let stored: u64 = match db.get(SCHEMA_KEY)? {
         None => 0,
         Some(v) => {
-            let arr: [u8; 8] = v.as_ref().try_into()
+            let arr: [u8; 8] = v
+                .as_ref()
+                .try_into()
                 .context("SCHEMA_KEY corrupted: invalid byte length")?;
             u64::from_le_bytes(arr)
         }

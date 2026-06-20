@@ -105,7 +105,10 @@ fn divergence_warning_triggered_for_flaky_module() {
         stats.std_dev
     );
     // Verify that the divergence flag is consistent with the threshold
-    assert_eq!(stats.divergence_warning, stats.std_dev > DIVERGENCE_THRESHOLD);
+    assert_eq!(
+        stats.divergence_warning,
+        stats.std_dev > DIVERGENCE_THRESHOLD
+    );
 }
 
 // ----------------------------------------------------------------

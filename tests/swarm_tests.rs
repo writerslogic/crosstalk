@@ -211,11 +211,7 @@ fn merge_gate_minority_approves_no_quorum() {
 struct AlwaysGrantNetwork;
 
 impl crosstalk::engines::swarm::RaftNetwork for AlwaysGrantNetwork {
-    async fn request_vote(
-        &self,
-        _term: u64,
-        _candidate_id: Arc<str>,
-    ) -> anyhow::Result<bool> {
+    async fn request_vote(&self, _term: u64, _candidate_id: Arc<str>) -> anyhow::Result<bool> {
         Ok(true)
     }
 }
@@ -223,11 +219,7 @@ impl crosstalk::engines::swarm::RaftNetwork for AlwaysGrantNetwork {
 struct AlwaysDenyNetwork;
 
 impl crosstalk::engines::swarm::RaftNetwork for AlwaysDenyNetwork {
-    async fn request_vote(
-        &self,
-        _term: u64,
-        _candidate_id: Arc<str>,
-    ) -> anyhow::Result<bool> {
+    async fn request_vote(&self, _term: u64, _candidate_id: Arc<str>) -> anyhow::Result<bool> {
         Ok(false)
     }
 }
@@ -301,6 +293,7 @@ async fn broadcast_turn_succeeds() {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     };
     let result = ctrl.broadcast_turn(turn);
     assert!(result.is_ok(), "broadcast_turn should succeed");

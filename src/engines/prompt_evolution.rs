@@ -99,9 +99,10 @@ impl PromptEvolver {
         // When the tournament covers the whole population, skip random sampling
         // and return the global best directly (avoids with-replacement misses).
         if k >= self.population.len() {
-            return self.population.iter().max_by(|a, b| {
-                a.mean_performance().total_cmp(&b.mean_performance())
-            });
+            return self
+                .population
+                .iter()
+                .max_by(|a, b| a.mean_performance().total_cmp(&b.mean_performance()));
         }
         let mut rng = rand::rng();
         let mut best_idx = rng.random_range(0..self.population.len());
@@ -122,10 +123,14 @@ impl PromptEvolver {
     /// `_x` suffix, version 0, and an empty performance history.
     pub fn crossover(parent_a: &PromptTemplate, parent_b: &PromptTemplate) -> PromptTemplate {
         // Sentence-level crossover preserves semantic coherence.
-        let sentences_a: Vec<&str> = parent_a.template_text.split(". ")
+        let sentences_a: Vec<&str> = parent_a
+            .template_text
+            .split(". ")
             .chain(parent_a.template_text.split(".\n"))
             .collect();
-        let sentences_b: Vec<&str> = parent_b.template_text.split(". ")
+        let sentences_b: Vec<&str> = parent_b
+            .template_text
+            .split(". ")
             .chain(parent_b.template_text.split(".\n"))
             .collect();
 
@@ -142,7 +147,11 @@ impl PromptEvolver {
             let b_chars: Vec<char> = parent_b.template_text.chars().collect();
             let ca = a_chars.len() / 2;
             let cb = b_chars.len() / 2;
-            format!("{}{}", a_chars[..ca].iter().collect::<String>(), b_chars[cb..].iter().collect::<String>())
+            format!(
+                "{}{}",
+                a_chars[..ca].iter().collect::<String>(),
+                b_chars[cb..].iter().collect::<String>()
+            )
         };
 
         let mut variables = parent_a.variables.clone();
@@ -206,9 +215,8 @@ impl PromptEvolver {
             return Vec::new();
         }
 
-        self.population.sort_by(|a, b| {
-            b.mean_performance().total_cmp(&a.mean_performance())
-        });
+        self.population
+            .sort_by(|a, b| b.mean_performance().total_cmp(&a.mean_performance()));
 
         let elite_n = self.elite_count.min(self.population.len());
         let mut next_gen: Vec<PromptTemplate> = self.population[..elite_n].to_vec();
@@ -320,9 +328,8 @@ impl PromptEvolver {
         if self.population.len() <= self.elite_count {
             return;
         }
-        self.population.sort_by(|a, b| {
-            b.mean_performance().total_cmp(&a.mean_performance())
-        });
+        self.population
+            .sort_by(|a, b| b.mean_performance().total_cmp(&a.mean_performance()));
 
         let elite_n = self.elite_count.min(self.population.len());
         let (elite, rest) = self.population.split_at(elite_n);
@@ -370,7 +377,9 @@ pub struct ClosedLoopFeedback;
 
 impl ClosedLoopFeedback {
     #[must_use]
-    pub fn generate_corrective_directive(profile: &crate::types::intelligence::AgentProfile) -> Option<String> {
+    pub fn generate_corrective_directive(
+        profile: &crate::types::intelligence::AgentProfile,
+    ) -> Option<String> {
         if profile.total_turns < 2 {
             return None;
         }
@@ -380,19 +389,24 @@ impl ClosedLoopFeedback {
         if profile.compilation_success_rate < 0.4 && profile.total_turns > 3 {
             directives.push("CRITICAL: Your recent proposals have consistently failed to compile. Verify structural syntax and type signatures before responding.");
         } else if profile.compilation_success_rate < 0.6 && profile.total_turns > 3 {
-            directives.push("WARNING: High failure rate detected. Use a conservative implementation strategy.");
+            directives.push(
+                "WARNING: High failure rate detected. Use a conservative implementation strategy.",
+            );
         }
 
         // Category-specific feedback based on capability scores
         for (cat, &score) in &profile.capabilities {
             if score < 0.3 && profile.total_turns > 5 {
                 let hint = match cat {
-                    crate::types::conversation::TaskCategory::CodeGeneration =>
-                        "Your code generation accuracy is low. Produce minimal, targeted diffs rather than large rewrites.",
-                    crate::types::conversation::TaskCategory::Research =>
-                        "Your research analysis has been shallow. Cite specific evidence and explore counterarguments.",
-                    crate::types::conversation::TaskCategory::Debugging =>
-                        "Your debugging accuracy is low. Reproduce the bug first, then propose a focused fix.",
+                    crate::types::conversation::TaskCategory::CodeGeneration => {
+                        "Your code generation accuracy is low. Produce minimal, targeted diffs rather than large rewrites."
+                    }
+                    crate::types::conversation::TaskCategory::Research => {
+                        "Your research analysis has been shallow. Cite specific evidence and explore counterarguments."
+                    }
+                    crate::types::conversation::TaskCategory::Debugging => {
+                        "Your debugging accuracy is low. Reproduce the bug first, then propose a focused fix."
+                    }
                     _ => continue,
                 };
                 directives.push(hint);

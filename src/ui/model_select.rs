@@ -95,8 +95,16 @@ pub async fn fetch_openrouter_top_models(limit: usize) -> Vec<String> {
 
     let blocked_substrings: [&str; 0] = [];
     let preferred_providers = [
-        "anthropic", "openai", "google", "x-ai", "deepseek", "qwen",
-        "mistralai", "meta-llama", "minimax", "xiaomi",
+        "anthropic",
+        "openai",
+        "google",
+        "x-ai",
+        "deepseek",
+        "qwen",
+        "mistralai",
+        "meta-llama",
+        "minimax",
+        "xiaomi",
     ];
 
     let mut candidates: Vec<(String, i64)> = data
@@ -144,20 +152,38 @@ enum TaskCategory {
 
 fn classify_task(task: &str) -> TaskCategory {
     let t = task.to_lowercase();
-    if t.contains("code") || t.contains("implement") || t.contains("function")
-        || t.contains("bug") || t.contains("debug") || t.contains("rust")
-        || t.contains("python") || t.contains("fix") || t.contains("refactor")
-        || t.contains("compile") || t.contains("test") || t.contains("lint")
+    if t.contains("code")
+        || t.contains("implement")
+        || t.contains("function")
+        || t.contains("bug")
+        || t.contains("debug")
+        || t.contains("rust")
+        || t.contains("python")
+        || t.contains("fix")
+        || t.contains("refactor")
+        || t.contains("compile")
+        || t.contains("test")
+        || t.contains("lint")
     {
         TaskCategory::Code
-    } else if t.contains("math") || t.contains("proof") || t.contains("reason")
-        || t.contains("logic") || t.contains("analyze") || t.contains("calculate")
-        || t.contains("derive") || t.contains("solve")
+    } else if t.contains("math")
+        || t.contains("proof")
+        || t.contains("reason")
+        || t.contains("logic")
+        || t.contains("analyze")
+        || t.contains("calculate")
+        || t.contains("derive")
+        || t.contains("solve")
     {
         TaskCategory::Reasoning
-    } else if t.contains("write") || t.contains("essay") || t.contains("story")
-        || t.contains("creative") || t.contains("poem") || t.contains("draft")
-        || t.contains("summarize") || t.contains("explain")
+    } else if t.contains("write")
+        || t.contains("essay")
+        || t.contains("story")
+        || t.contains("creative")
+        || t.contains("poem")
+        || t.contains("draft")
+        || t.contains("summarize")
+        || t.contains("explain")
     {
         TaskCategory::Creative
     } else {
@@ -165,7 +191,13 @@ fn classify_task(task: &str) -> TaskCategory {
     }
 }
 
-const DEBATE_ROLES: &[&str] = &["Skeptic", "Architect", "Verifier", "Historian", "Devil's Advocate"];
+const DEBATE_ROLES: &[&str] = &[
+    "Skeptic",
+    "Architect",
+    "Verifier",
+    "Historian",
+    "Devil's Advocate",
+];
 
 /// Models known to produce low-quality output, hallucinate excessively,
 /// or fail to follow instructions reliably. Filtered from all selection paths.
@@ -174,27 +206,60 @@ const DEBATE_ROLES: &[&str] = &["Skeptic", "Architect", "Verifier", "Historian",
 /// following, or models that consistently fail multi-turn synthesis tasks.
 const BLOCKED_MODELS: &[&str] = &[
     // OpenAI legacy
-    "gpt-3.5", "gpt-4-turbo", "gpt-4-0314", "gpt-4-0613", "gpt-4.1",
-    "gpt-4o-mini", "o1-mini",
+    "gpt-3.5",
+    "gpt-4-turbo",
+    "gpt-4-0314",
+    "gpt-4-0613",
+    "gpt-4.1",
+    "gpt-4o-mini",
+    "o1-mini",
     // Anthropic legacy
-    "claude-instant", "claude-2", "claude-3-haiku", "claude-3-sonnet",
+    "claude-instant",
+    "claude-2",
+    "claude-3-haiku",
+    "claude-3-sonnet",
     // Google legacy
-    "gemini-1.0", "gemini-1.5-flash-8b", "palm-2",
+    "gemini-1.0",
+    "gemini-1.5-flash-8b",
+    "palm-2",
     // Meta small models (instruction following too weak for synthesis)
-    "llama-2", "llama-3-8b", "llama-3.1-8b", "llama-3.2-1b", "llama-3.2-3b",
+    "llama-2",
+    "llama-3-8b",
+    "llama-3.1-8b",
+    "llama-3.2-1b",
+    "llama-3.2-3b",
     // Mistral small models
-    "mistral-tiny", "mistral-small", "mistral-7b", "mixtral-8x7b",
+    "mistral-tiny",
+    "mistral-small",
+    "mistral-7b",
+    "mixtral-8x7b",
     // Microsoft small models
-    "phi-2", "phi-3", "phi-3-mini", "phi-3.5-mini",
+    "phi-2",
+    "phi-3",
+    "phi-3-mini",
+    "phi-3.5-mini",
     // Cohere legacy
-    "command-r", "command-light", "command-r-plus-04-2024",
+    "command-r",
+    "command-light",
+    "command-r-plus-04-2024",
     // Google small models
-    "gemma-2b", "gemma-7b", "gemma-2-2b",
+    "gemma-2b",
+    "gemma-7b",
+    "gemma-2-2b",
     // Qwen small models
-    "qwen-2.5-7b", "qwen-2.5-14b", "qwen-2-7b",
+    "qwen-2.5-7b",
+    "qwen-2.5-14b",
+    "qwen-2-7b",
     // Other weak models
-    "yi-6b", "yi-34b", "nous-hermes-2", "toppy-m-7b", "mythomist",
-    "cinematika", "bagel", "psyfighter", "noromaid",
+    "yi-6b",
+    "yi-34b",
+    "nous-hermes-2",
+    "toppy-m-7b",
+    "mythomist",
+    "cinematika",
+    "bagel",
+    "psyfighter",
+    "noromaid",
 ];
 
 fn is_blocked_model(id: &str) -> bool {
@@ -301,7 +366,11 @@ impl WizardState {
 
     fn workspace(&self) -> Option<String> {
         let s = self.fields[1].trim();
-        if s.is_empty() { None } else { Some(s.to_string()) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
     }
 
     fn iterations(&self) -> u32 {
@@ -355,7 +424,11 @@ fn draw_wizard(frame: &mut Frame, state: &WizardState) {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" {label} "))
-            .border_style(if active { Style::default().fg(Color::Yellow) } else { Style::default() });
+            .border_style(if active {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            });
         let p = Paragraph::new(display).style(style).block(block);
         if i < 3 {
             frame.render_widget(p, layout[i + 1]);
@@ -390,7 +463,9 @@ pub async fn run_task_wizard() -> Result<(String, Option<String>, u32)> {
         if !event::poll(std::time::Duration::from_millis(50))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else { continue };
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
         if key.kind != KeyEventKind::Press {
             continue;
         }
@@ -412,10 +487,14 @@ pub async fn run_task_wizard() -> Result<(String, Option<String>, u32)> {
                 }
             }
             KeyCode::Tab | KeyCode::Down => {
-                if state.focused < 2 { state.focused += 1; }
+                if state.focused < 2 {
+                    state.focused += 1;
+                }
             }
             KeyCode::BackTab | KeyCode::Up => {
-                if state.focused > 0 { state.focused -= 1; }
+                if state.focused > 0 {
+                    state.focused -= 1;
+                }
             }
             KeyCode::Backspace => {
                 state.fields[state.focused].pop();
@@ -850,7 +929,10 @@ pub async fn run_model_selector(task_hint: &str) -> Result<Vec<String>> {
                 .await
                 .unwrap_or_default();
 
-                crate::log_warn!(tx.send((provider_name, ids)).await, "failed to send model list");
+                crate::log_warn!(
+                    tx.send((provider_name, ids)).await,
+                    "failed to send model list"
+                );
             });
         }
     }
@@ -920,16 +1002,38 @@ pub async fn run_model_selector(task_hint: &str) -> Result<Vec<String>> {
 // ── API Key Setup Wizard ─────────────────────────────────────────────────────
 
 const PROVIDER_KEYS: &[(&str, &str, &str)] = &[
-    ("Anthropic (Claude)", "ANTHROPIC_API_KEY", "https://console.anthropic.com/settings/keys"),
-    ("OpenAI (GPT)", "OPENAI_API_KEY", "https://platform.openai.com/api-keys"),
-    ("OpenRouter", "OPENROUTER_API_KEY", "https://openrouter.ai/keys"),
-    ("DeepSeek", "DEEPSEEK_API_KEY", "https://platform.deepseek.com/api_keys"),
-    ("Mistral", "MISTRAL_API_KEY", "https://console.mistral.ai/api-keys"),
+    (
+        "Anthropic (Claude)",
+        "ANTHROPIC_API_KEY",
+        "https://console.anthropic.com/settings/keys",
+    ),
+    (
+        "OpenAI (GPT)",
+        "OPENAI_API_KEY",
+        "https://platform.openai.com/api-keys",
+    ),
+    (
+        "OpenRouter",
+        "OPENROUTER_API_KEY",
+        "https://openrouter.ai/keys",
+    ),
+    (
+        "DeepSeek",
+        "DEEPSEEK_API_KEY",
+        "https://platform.deepseek.com/api_keys",
+    ),
+    (
+        "Mistral",
+        "MISTRAL_API_KEY",
+        "https://console.mistral.ai/api-keys",
+    ),
     ("Groq", "GROQ_API_KEY", "https://console.groq.com/keys"),
 ];
 
 pub fn has_any_api_key() -> bool {
-    PROVIDER_KEYS.iter().any(|(_, key, _)| env::var(key).is_ok())
+    PROVIDER_KEYS
+        .iter()
+        .any(|(_, key, _)| env::var(key).is_ok())
         || env::var("LLM_API_KEY").is_ok()
 }
 
@@ -1053,7 +1157,9 @@ pub async fn run_api_key_setup() -> Result<()> {
             if !value.is_empty() {
                 writeln!(file, "{env_key}={value}")?;
                 // SAFETY: single-threaded at this point (before tokio runtime spawns tasks)
-                unsafe { env::set_var(env_key, value); }
+                unsafe {
+                    env::set_var(env_key, value);
+                }
             }
         }
         tracing::info!(path = %env_path, "API keys saved");

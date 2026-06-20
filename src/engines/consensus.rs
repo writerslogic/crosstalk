@@ -1,5 +1,5 @@
 use crate::types::artifact::Artifact;
-use crate::types::conversation::{ConversationState, Turn, TurnOutcome, TaskCategory};
+use crate::types::conversation::{ConversationState, TaskCategory, Turn, TurnOutcome};
 use std::collections::{HashMap, VecDeque};
 
 #[derive(Debug, Clone)]
@@ -27,19 +27,25 @@ pub struct NashSolver;
 impl NashSolver {
     pub fn find_nash_equilibrium(matrix: &[Vec<Vec<f64>>]) -> Option<usize> {
         let n = matrix.len();
-        if n == 0 { return None; }
+        if n == 0 {
+            return None;
+        }
         let strategies = matrix[0].len();
         let mut psne_indices = Vec::new();
         for s in 0..strategies {
             let mut is_nash = true;
             for player in matrix.iter().take(n) {
                 let current_payoff = player[s][s];
-                if (0..strategies).any(|alt_s| alt_s != s && player[alt_s][s] > current_payoff + 1e-5) {
+                if (0..strategies)
+                    .any(|alt_s| alt_s != s && player[alt_s][s] > current_payoff + 1e-5)
+                {
                     is_nash = false;
                     break;
                 }
             }
-            if is_nash { psne_indices.push(s); }
+            if is_nash {
+                psne_indices.push(s);
+            }
         }
         psne_indices.into_iter().max_by(|&a, &b| {
             let wa: f64 = matrix.iter().map(|m| m[a][a]).sum();
@@ -48,11 +54,18 @@ impl NashSolver {
         })
     }
 
-    pub fn resolve_optimal_proposal(proposals: &[(&str, &Artifact, TurnOutcome)], current: &Artifact) -> usize {
-        if proposals.is_empty() { return 0; }
+    pub fn resolve_optimal_proposal(
+        proposals: &[(&str, &Artifact, TurnOutcome)],
+        current: &Artifact,
+    ) -> usize {
+        if proposals.is_empty() {
+            return 0;
+        }
         let matrix = PayoffCalculator::compute_payoff_matrix(proposals, current);
         let n = matrix.len();
-        if n == 0 { return 0; }
+        if n == 0 {
+            return 0;
+        }
 
         let mut n_matrix = vec![vec![vec![0.0; proposals.len()]; proposals.len()]; proposals.len()];
         for (i, row) in matrix.iter().enumerate().take(n) {
@@ -65,15 +78,21 @@ impl NashSolver {
 
         Self::find_nash_equilibrium(&n_matrix).unwrap_or_else(|| {
             tracing::warn!("no Nash equilibrium found; falling back to argmax");
-            (0..proposals.len()).max_by(|&a, &b| {
-                let wa: f64 = matrix.iter().map(|row| row[a]).sum();
-                let wb: f64 = matrix.iter().map(|row| row[b]).sum();
-                wa.total_cmp(&wb)
-            }).unwrap_or(0)
+            (0..proposals.len())
+                .max_by(|&a, &b| {
+                    let wa: f64 = matrix.iter().map(|row| row[a]).sum();
+                    let wb: f64 = matrix.iter().map(|row| row[b]).sum();
+                    wa.total_cmp(&wb)
+                })
+                .unwrap_or(0)
         })
     }
 
-    pub fn run_refinement_rounds(&self, proposals: &[(&str, &str)], max_rounds: usize) -> Vec<RefinementRound> {
+    pub fn run_refinement_rounds(
+        &self,
+        proposals: &[(&str, &str)],
+        max_rounds: usize,
+    ) -> Vec<RefinementRound> {
         if proposals.is_empty() || max_rounds == 0 {
             return vec![];
         }
@@ -111,11 +130,17 @@ impl NashSolver {
                 for &(_, _, text) in proposals {
                     *counts.entry(text).or_insert(0) += 1;
                 }
-                counts.into_iter().max_by_key(|&(_, c)| c).map(|(t, _)| t.to_string()).unwrap_or_default()
+                counts
+                    .into_iter()
+                    .max_by_key(|&(_, c)| c)
+                    .map(|(t, _)| t.to_string())
+                    .unwrap_or_default()
             }
-            ResolutionStrategy::WeightedAverage | ResolutionStrategy::ExpertDeference => {
-                proposals.iter().max_by(|a, b| a.1.total_cmp(&b.1)).map(|p| p.2.to_string()).unwrap_or_default()
-            }
+            ResolutionStrategy::WeightedAverage | ResolutionStrategy::ExpertDeference => proposals
+                .iter()
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|p| p.2.to_string())
+                .unwrap_or_default(),
             ResolutionStrategy::Mediation => {
                 let mut word_counts: HashMap<&str, usize> = HashMap::new();
                 for &(_, _, text) in proposals {
@@ -124,7 +149,8 @@ impl NashSolver {
                     }
                 }
                 let threshold = proposals.len() / 2;
-                let mut common: Vec<&str> = word_counts.into_iter()
+                let mut common: Vec<&str> = word_counts
+                    .into_iter()
                     .filter(|&(_, c)| c > threshold)
                     .map(|(w, _)| w)
                     .collect();
@@ -136,7 +162,10 @@ impl NashSolver {
 
     /// Returns ALL pure-strategy Nash equilibrium indices over proposals.
     /// Used to detect when multiple proposals tie at equilibrium so they can be synthesized.
-    pub fn find_all_equilibria(proposals: &[(&str, &Artifact, TurnOutcome)], current: &Artifact) -> Vec<usize> {
+    pub fn find_all_equilibria(
+        proposals: &[(&str, &Artifact, TurnOutcome)],
+        current: &Artifact,
+    ) -> Vec<usize> {
         let matrix = PayoffCalculator::compute_payoff_matrix(proposals, current);
         let n = proposals.len();
         if n == 0 {
@@ -181,7 +210,10 @@ impl NashSolver {
 
     /// Resolves proposals to a content string.
     /// When multiple Nash equilibria survive, synthesizes them rather than picking one winner.
-    pub fn resolve_with_synthesis(proposals: &[(&str, &Artifact, TurnOutcome)], current: &Artifact) -> String {
+    pub fn resolve_with_synthesis(
+        proposals: &[(&str, &Artifact, TurnOutcome)],
+        current: &Artifact,
+    ) -> String {
         if proposals.is_empty() {
             return String::new();
         }
@@ -191,7 +223,12 @@ impl NashSolver {
         }
         let surviving: Vec<(String, String)> = equilibria
             .iter()
-            .map(|&idx| (proposals[idx].0.to_string(), proposals[idx].1.content.clone()))
+            .map(|&idx| {
+                (
+                    proposals[idx].0.to_string(),
+                    proposals[idx].1.content.clone(),
+                )
+            })
             .collect();
         crate::engines::reasoning::SynthesisEngine::synthesize_proposals(&surviving)
     }
@@ -200,7 +237,7 @@ impl NashSolver {
         let mut equilibria = vec![];
         for r in 0..2 {
             for c in 0..2 {
-                if matrix[r][c].0 >= matrix[1-r][c].0 && matrix[r][c].1 >= matrix[r][1-c].1 {
+                if matrix[r][c].0 >= matrix[1 - r][c].0 && matrix[r][c].1 >= matrix[r][1 - c].1 {
                     equilibria.push((r, c));
                 }
             }
@@ -216,12 +253,22 @@ impl NashSolver {
         }
         let matrix = PayoffCalculator::compute_payoff_matrix(proposals, proposals[0].1);
         let n = proposals.len();
-        let col_sums: Vec<f64> = (0..n).map(|col| matrix.iter().map(|row| row[col]).sum()).collect();
+        let col_sums: Vec<f64> = (0..n)
+            .map(|col| matrix.iter().map(|row| row[col]).sum())
+            .collect();
         let total: f64 = col_sums.iter().sum();
-        proposals.iter().zip(col_sums.iter()).map(|((agent_id, _, _), &col_sum)| {
-            let score = if total > 0.0 { col_sum / total } else { 1.0 / n as f64 };
-            (agent_id.to_string(), score.clamp(0.0, 1.0))
-        }).collect()
+        proposals
+            .iter()
+            .zip(col_sums.iter())
+            .map(|((agent_id, _, _), &col_sum)| {
+                let score = if total > 0.0 {
+                    col_sum / total
+                } else {
+                    1.0 / n as f64
+                };
+                (agent_id.to_string(), score.clamp(0.0, 1.0))
+            })
+            .collect()
     }
 }
 
@@ -300,19 +347,41 @@ impl CertaintyAnalyzer {
 
         // Signal 1: Hedging language (reduces certainty)
         const HEDGES: &[&str] = &[
-            "maybe", "perhaps", "might", "could be", "not sure", "i think",
-            "possibly", "unclear", "hard to say", "it depends", "arguably",
-            "i'm not certain", "one possibility",
+            "maybe",
+            "perhaps",
+            "might",
+            "could be",
+            "not sure",
+            "i think",
+            "possibly",
+            "unclear",
+            "hard to say",
+            "it depends",
+            "arguably",
+            "i'm not certain",
+            "one possibility",
         ];
         let hedge_count = HEDGES.iter().filter(|h| lower.contains(*h)).count() as f64;
         let hedge_penalty = (hedge_count * 0.12).min(0.4);
 
         // Signal 2: Assertive language (increases certainty)
         const ASSERTIVE: &[&str] = &[
-            "verified", "confirmed", "optimal", "correct", "proven",
-            "tests pass", "all tests", "successfully", "no issues",
-            "the solution is", "this fixes", "this resolves",
-            "implemented", "works", "complete", "done",
+            "verified",
+            "confirmed",
+            "optimal",
+            "correct",
+            "proven",
+            "tests pass",
+            "all tests",
+            "successfully",
+            "no issues",
+            "the solution is",
+            "this fixes",
+            "this resolves",
+            "implemented",
+            "works",
+            "complete",
+            "done",
         ];
         let assert_count = ASSERTIVE.iter().filter(|a| lower.contains(*a)).count() as f64;
         let assert_boost = (assert_count * 0.11).min(0.35);
@@ -322,7 +391,8 @@ impl CertaintyAnalyzer {
         let code_boost = (code_blocks as f64 * 0.05).min(0.15);
 
         // Signal 4: Quantitative claims (numbers, measurements, percentages)
-        let numeric_density = content.chars().filter(|c| c.is_ascii_digit()).count() as f64 / word_count;
+        let numeric_density =
+            content.chars().filter(|c| c.is_ascii_digit()).count() as f64 / word_count;
         let quant_boost = (numeric_density * 0.3).min(0.1);
 
         // Signal 5: Response length (very short with no assertions = low effort)
@@ -335,22 +405,29 @@ impl CertaintyAnalyzer {
         };
 
         // Signal 6: Structural markers (organized thought = higher certainty)
-        let has_steps = lower.contains("step 1") || lower.contains("1.") || lower.contains("first,");
-        let has_reasoning = lower.contains("because") || lower.contains("therefore") || lower.contains("since");
-        let structure_boost = if has_steps { 0.05 } else { 0.0 }
-            + if has_reasoning { 0.05 } else { 0.0 };
+        let has_steps =
+            lower.contains("step 1") || lower.contains("1.") || lower.contains("first,");
+        let has_reasoning =
+            lower.contains("because") || lower.contains("therefore") || lower.contains("since");
+        let structure_boost =
+            if has_steps { 0.05 } else { 0.0 } + if has_reasoning { 0.05 } else { 0.0 };
 
         // Signal 7: Self-contradiction (agent contradicts itself within response)
         let contradiction_penalty = {
-            let sentences: Vec<&str> = content.split(|c| c == '.' || c == '!' || c == '\n')
+            let sentences: Vec<&str> = content
+                .split(['.', '!', '\n'])
                 .map(str::trim)
                 .filter(|s| s.len() > 10)
                 .collect();
             let mut contradictions = 0u32;
             for s in &sentences {
                 let sl = s.to_lowercase();
-                if sl.contains("however") || sl.contains("but actually") || sl.contains("on second thought")
-                    || sl.contains("wait,") || sl.contains("correction:") || sl.contains("i was wrong")
+                if sl.contains("however")
+                    || sl.contains("but actually")
+                    || sl.contains("on second thought")
+                    || sl.contains("wait,")
+                    || sl.contains("correction:")
+                    || sl.contains("i was wrong")
                 {
                     contradictions += 1;
                 }
@@ -369,8 +446,15 @@ impl CertaintyAnalyzer {
         };
 
         let base = 0.50;
-        let raw = base + assert_boost + code_boost + quant_boost + length_signal
-            + structure_boost + grounding_boost - hedge_penalty - contradiction_penalty;
+        let raw = base
+            + assert_boost
+            + code_boost
+            + quant_boost
+            + length_signal
+            + structure_boost
+            + grounding_boost
+            - hedge_penalty
+            - contradiction_penalty;
         (raw - volatility * 0.1).clamp(0.05, 0.98)
     }
 }
@@ -381,16 +465,19 @@ impl PayoffCalculator {
         let base = 0.5;
         let proof_bonus = (artifact.proof_attachments.len() as f64 * 0.1).min(0.3);
         let complexity_penalty = if artifact.metrics.line_count > 0 {
-            let ratio = artifact.metrics.cyclomatic_complexity as f64 / artifact.metrics.line_count as f64;
+            let ratio =
+                artifact.metrics.cyclomatic_complexity as f64 / artifact.metrics.line_count as f64;
             (ratio * 0.5).min(0.3)
         } else {
             0.0
         };
-        
+
         // --- Sovereign-Tier: Multi-Modal Visual Fidelity ---
         let visual_bonus = (artifact.metrics.visual_fidelity * 0.2).min(0.2);
 
-        (base + proof_bonus + artifact.metrics.health_score * 0.3 + visual_bonus - complexity_penalty).clamp(0.0, 1.0)
+        (base + proof_bonus + artifact.metrics.health_score * 0.3 + visual_bonus
+            - complexity_penalty)
+            .clamp(0.0, 1.0)
     }
     pub fn evaluate_with_outcome(artifact: &Artifact, outcome: &TurnOutcome) -> f64 {
         let correctness = match outcome {
@@ -400,19 +487,32 @@ impl PayoffCalculator {
         };
         (correctness * 0.7 + (artifact.metrics.health_score * 0.3)).clamp(0.0, 1.0)
     }
-    pub fn compute_payoff_matrix(proposals: &[(&str, &Artifact, TurnOutcome)], current: &Artifact) -> Vec<Vec<f64>> {
+    pub fn compute_payoff_matrix(
+        proposals: &[(&str, &Artifact, TurnOutcome)],
+        current: &Artifact,
+    ) -> Vec<Vec<f64>> {
         let current_score = Self::evaluate_with_outcome(current, &TurnOutcome::Unknown);
-        let scores: Vec<f64> = proposals.iter().map(|(_, a, o)| Self::evaluate_with_outcome(a, o)).collect();
-        scores.iter().map(|&my_score| {
-            scores.iter().map(|&their_score| {
-                let relative = ((my_score - their_score) * 0.5 + 0.5).clamp(0.0, 1.0);
-                let coordination = (1.0 - (my_score - current_score).abs()).clamp(0.0, 1.0);
-                relative * 0.7 + coordination * 0.3
-            }).collect()
-        }).collect()
+        let scores: Vec<f64> = proposals
+            .iter()
+            .map(|(_, a, o)| Self::evaluate_with_outcome(a, o))
+            .collect();
+        scores
+            .iter()
+            .map(|&my_score| {
+                scores
+                    .iter()
+                    .map(|&their_score| {
+                        let relative = ((my_score - their_score) * 0.5 + 0.5).clamp(0.0, 1.0);
+                        let coordination = (1.0 - (my_score - current_score).abs()).clamp(0.0, 1.0);
+                        relative * 0.7 + coordination * 0.3
+                    })
+                    .collect()
+            })
+            .collect()
     }
     pub fn best_response(mine: &[f64], theirs: &[f64]) -> usize {
-        mine.iter().zip(theirs.iter())
+        mine.iter()
+            .zip(theirs.iter())
             .enumerate()
             .max_by(|(_, (a_m, a_t)), (_, (b_m, b_t))| {
                 let sa = *a_m + *a_t;
@@ -501,7 +601,9 @@ impl StallDetector {
 
         // Non-decreasing entropy over last 5 turns.
         if self.entropy_history.len() >= 5 {
-            let non_decreasing = self.entropy_history.iter()
+            let non_decreasing = self
+                .entropy_history
+                .iter()
                 .zip(self.entropy_history.iter().skip(1))
                 .all(|(a, b)| b >= a);
             if non_decreasing {
@@ -540,8 +642,14 @@ impl InfluenceWeightManager {
         }
         sigma.agent_weights.clone()
     }
-    pub fn calculate_weights_for_category(sigma: &ConversationState, category: TaskCategory, recency: f64) -> std::collections::BTreeMap<String, f64> {
-        let category_turns: Vec<&Turn> = sigma.turns.iter()
+    pub fn calculate_weights_for_category(
+        sigma: &ConversationState,
+        category: TaskCategory,
+        recency: f64,
+    ) -> std::collections::BTreeMap<String, f64> {
+        let category_turns: Vec<&Turn> = sigma
+            .turns
+            .iter()
             .filter(|t| t.task_category.as_ref() == Some(&category))
             .collect();
 
@@ -551,9 +659,15 @@ impl InfluenceWeightManager {
             return global;
         }
 
-        Self::compute_agent_weights_from_turns(&category_turns.into_iter().cloned().collect::<Vec<_>>(), recency)
+        Self::compute_agent_weights_from_turns(
+            &category_turns.into_iter().cloned().collect::<Vec<_>>(),
+            recency,
+        )
     }
-    fn compute_agent_weights_from_turns(turns: &[Turn], recency: f64) -> std::collections::BTreeMap<String, f64> {
+    fn compute_agent_weights_from_turns(
+        turns: &[Turn],
+        recency: f64,
+    ) -> std::collections::BTreeMap<String, f64> {
         use std::collections::BTreeMap;
         let mut scores: HashMap<String, (f64, f64)> = HashMap::new();
         let n = turns.len();
@@ -579,12 +693,19 @@ impl InfluenceWeightManager {
         }
         let mut weights = BTreeMap::new();
         for (agent, (weighted_sum, weight_total)) in &scores {
-            let w = if *weight_total > 0.0 { weighted_sum / weight_total } else { 0.3 };
+            let w = if *weight_total > 0.0 {
+                weighted_sum / weight_total
+            } else {
+                0.3
+            };
             weights.insert(agent.clone(), w);
         }
         weights
     }
-    pub fn calculate_weights_with_recency(sigma: &ConversationState, recency: f64) -> std::collections::BTreeMap<String, f64> {
+    pub fn calculate_weights_with_recency(
+        sigma: &ConversationState,
+        recency: f64,
+    ) -> std::collections::BTreeMap<String, f64> {
         if sigma.agent_weights.is_empty() && !sigma.turns.is_empty() {
             return Self::compute_agent_weights_from_turns(&sigma.turns, recency);
         }

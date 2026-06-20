@@ -1,10 +1,9 @@
-use anyhow::Result;
-use crate::types::mcp::{
-    McpResource, McpTool, JsonRpcRequest, PermissionManager, PermissionTier,
-    TimeoutManager,
-};
 use crate::mcp::bridge::CliBridge;
-use serde_json::{json, Value};
+use crate::types::mcp::{
+    JsonRpcRequest, McpResource, McpTool, PermissionManager, PermissionTier, TimeoutManager,
+};
+use anyhow::Result;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 /// Critical tools that require explicit confirmation before execution.
@@ -19,6 +18,9 @@ pub struct McpGateway {
     resources: Vec<McpResource>,
     prompt_templates: Vec<Value>,
     confirmation_override: Option<bool>,
+    /// Categories of tools the current principal has consented to invoke.
+    /// Empty means all categories are permitted (open consent or no principal set).
+    principal_allowed_categories: Vec<String>,
 }
 
 impl McpGateway {
@@ -33,7 +35,12 @@ impl McpGateway {
             resources: Vec::new(),
             prompt_templates: Vec::new(),
             confirmation_override: None,
+            principal_allowed_categories: vec!["*".to_string()],
         }
+    }
+
+    pub fn set_principal_allowed_categories(&mut self, categories: Vec<String>) {
+        self.principal_allowed_categories = categories;
     }
 
     /// Create a gateway rooted at a specific workspace directory.
@@ -106,20 +113,25 @@ impl McpGateway {
         // preventing an attacker from pre-creating the socket path.
         {
             use std::os::unix::fs::MetadataExt;
-            let meta = std::fs::metadata(&socket_path).map_err(|e| {
+            let meta = tokio::fs::metadata(&socket_path).await.map_err(|e| {
                 anyhow::anyhow!(
                     "MCP sampling unavailable: socket not found at {} ({}). \
                      Start the MCP server or wire a remote worker pool.",
-                    socket_path.display(), e
+                    socket_path.display(),
+                    e
                 )
             })?;
-            unsafe extern "C" { fn getuid() -> u32; }
+            unsafe extern "C" {
+                fn getuid() -> u32;
+            }
             let current_uid = unsafe { getuid() };
             if meta.uid() != current_uid {
                 return Err(anyhow::anyhow!(
                     "MCP socket at {} is not owned by the current user (owner uid={}, current uid={}); \
                      refusing to connect",
-                    socket_path.display(), meta.uid(), current_uid
+                    socket_path.display(),
+                    meta.uid(),
+                    current_uid
                 ));
             }
         }
@@ -152,7 +164,8 @@ impl McpGateway {
                     last_err = Some(anyhow::anyhow!(
                         "MCP sampling unavailable: could not connect to {} ({}). \
                          Start the MCP server or wire a remote worker pool.",
-                        socket_path.display(), e
+                        socket_path.display(),
+                        e
                     ));
                     continue;
                 }
@@ -160,7 +173,8 @@ impl McpGateway {
 
             if let Err(e) = stream.write_all(&req_bytes).await {
                 last_err = Some(anyhow::anyhow!(
-                    "failed to write sampling request to MCP socket: {}", e
+                    "failed to write sampling request to MCP socket: {}",
+                    e
                 ));
                 continue;
             }
@@ -168,7 +182,8 @@ impl McpGateway {
             // Read exactly one newline-delimited JSON response, capped at 1 MiB.
             const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
             let (reader, _writer) = stream.into_split();
-            let mut lines = BufReader::new(tokio::io::AsyncReadExt::take(reader, MAX_RESPONSE_BYTES)).lines();
+            let mut lines =
+                BufReader::new(tokio::io::AsyncReadExt::take(reader, MAX_RESPONSE_BYTES)).lines();
             let line = match lines.next_line().await {
                 Ok(Some(l)) => l,
                 Ok(None) => {
@@ -176,7 +191,10 @@ impl McpGateway {
                     continue;
                 }
                 Err(e) => {
-                    last_err = Some(anyhow::anyhow!("failed to read MCP sampling response: {}", e));
+                    last_err = Some(anyhow::anyhow!(
+                        "failed to read MCP sampling response: {}",
+                        e
+                    ));
                     continue;
                 }
             };
@@ -198,9 +216,9 @@ impl McpGateway {
                 return Err(anyhow::anyhow!("MCP sampling error: {}", err));
             }
 
-            let result = response
-                .get("result")
-                .ok_or_else(|| anyhow::anyhow!("MCP response missing 'result' field: {:?}", response))?;
+            let result = response.get("result").ok_or_else(|| {
+                anyhow::anyhow!("MCP response missing 'result' field: {:?}", response)
+            })?;
 
             // Try structured content array first, then fall back to plain string result
             let text = result
@@ -222,12 +240,7 @@ impl McpGateway {
     }
 
     /// High-level dispatch by method name (used by tests and internal routing).
-    pub async fn dispatch(
-        &mut self,
-        agent_id: &str,
-        method: &str,
-        params: Value,
-    ) -> Result<Value> {
+    pub async fn dispatch(&mut self, agent_id: &str, method: &str, params: Value) -> Result<Value> {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             method: method.to_string(),
@@ -238,26 +251,22 @@ impl McpGateway {
     }
 
     /// Handle a full JSON-RPC request envelope.
-    pub async fn handle_request(
-        &mut self,
-        agent_id: &str,
-        req: JsonRpcRequest,
-    ) -> Result<Value> {
+    pub async fn handle_request(&mut self, agent_id: &str, req: JsonRpcRequest) -> Result<Value> {
         match req.method.as_str() {
             "initialize" => Ok(self.handle_initialize()),
             "tools/list" => Ok(self.handle_tools_list(agent_id)),
-            "resources/list" => {
-                Ok(json!({ "resources": self.resources }))
-            }
-            "prompts/list" => {
-                Ok(json!({ "prompts": self.prompt_templates }))
-            }
+            "resources/list" => Ok(json!({ "resources": self.resources })),
+            "prompts/list" => Ok(json!({ "prompts": self.prompt_templates })),
             "tools/call" => {
-                let name = req.params.get("name")
+                let name = req
+                    .params
+                    .get("name")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("Missing tool name"))?
                     .to_string();
-                let args = req.params.get("arguments")
+                let args = req
+                    .params
+                    .get("arguments")
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("Missing tool arguments"))?;
                 self.call_tool(agent_id, &name, args).await
@@ -267,42 +276,60 @@ impl McpGateway {
     }
 
     async fn call_tool(&mut self, agent_id: &str, name: &str, args: Value) -> Result<Value> {
+        // Principal consent check (Loyalty/Controllability duty).
+        {
+            let category = self
+                .tools
+                .get(name)
+                .and_then(|t| t.description.split(':').next())
+                .unwrap_or("uncategorized");
+            if !self
+                .principal_allowed_categories
+                .iter()
+                .any(|c| c == "*" || c == category)
+            {
+                return Err(anyhow::anyhow!(
+                    "Tool {:?} (category {:?}) blocked: not in principal's allowed categories",
+                    name,
+                    category
+                ));
+            }
+        }
+
         // Permission check
         self.permissions
             .check_with_reason(agent_id, name, &args)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         // Critical-tool confirmation gate
-        let needs_confirmation = CRITICAL_TOOLS.contains(&name) || matches!(
-            self.permissions.tiers.get(agent_id),
-            Some(PermissionTier::CriticalConfirmation(_))
-        );
+        let needs_confirmation = CRITICAL_TOOLS.contains(&name)
+            || matches!(
+                self.permissions.tiers.get(agent_id),
+                Some(PermissionTier::CriticalConfirmation(_))
+            );
         if needs_confirmation {
             match self.confirmation_override {
                 Some(true) => { /* confirmed */ }
                 Some(false) => {
-                    return Err(anyhow::anyhow!(
-                        "Tool {} not confirmed by operator",
-                        name
-                    ));
+                    return Err(anyhow::anyhow!("Tool {:?} not confirmed by operator", name));
                 }
                 None => {
-                    return Err(anyhow::anyhow!(
-                        "Tool {} not confirmed by operator",
-                        name
-                    ));
+                    return Err(anyhow::anyhow!("Tool {:?} not confirmed by operator", name));
                 }
             }
         }
 
         // Timeout-disabled check
         if self.timeout_manager.is_disabled(name) {
-            return Err(anyhow::anyhow!("Tool {} is disabled due to repeated timeouts", name));
+            return Err(anyhow::anyhow!(
+                "Tool {:?} is disabled due to repeated timeouts",
+                name
+            ));
         }
 
         // Tool lookup
         if !self.tools.contains_key(name) {
-            return Err(anyhow::anyhow!("Tool not found: {}", name));
+            return Err(anyhow::anyhow!("Tool not found: {:?}", name));
         }
 
         // Build CLI args

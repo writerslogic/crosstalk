@@ -28,6 +28,7 @@ fn test_hash_chain_10_consecutive() {
             surprise_signal: None,
             consistency_score: None,
             diff_quality_score: None,
+            persona_disclosure: None,
         });
 
         let prev_hash = hashes[i];
@@ -57,6 +58,7 @@ fn test_invariant_checker_monotonic_indices() {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     });
     state.turns.push(Turn {
         index: 0,
@@ -72,6 +74,7 @@ fn test_invariant_checker_monotonic_indices() {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     });
 
     assert!(InvariantChecker::check_all(&state).is_err());

@@ -103,16 +103,24 @@ impl CrosstalkUI {
                 while let Ok(event) = self.event_rx.try_recv() {
                     match event {
                         StreamEvent::TokenReceived { agent_id: _, token } => {
-                            Arc::make_mut(&mut self.ghost_stream_buffer).push_str(&token);
+                            let safe: String = token
+                                .chars()
+                                .filter(|&c| c >= ' ' || c == '\n' || c == '\t')
+                                .collect();
+                            Arc::make_mut(&mut self.ghost_stream_buffer).push_str(&safe);
                         }
                         StreamEvent::TurnComplete(turn) => {
-                            sigma.turns.push(turn);
+                            sigma.push_turn(turn);
                             sigma.iteration_index += 1;
                             Arc::make_mut(&mut self.ghost_stream_buffer).clear();
                         }
                         StreamEvent::Error(err) => {
+                            let safe_err: String = err
+                                .chars()
+                                .filter(|&c| c >= ' ' || c == '\n' || c == '\t')
+                                .collect();
                             Arc::make_mut(&mut self.ghost_stream_buffer)
-                                .push_str(&format!("\n[ERROR] {}\n", err));
+                                .push_str(&format!("\n[ERROR] {}\n", safe_err));
                         }
                         _ => {}
                     }
@@ -130,12 +138,18 @@ impl CrosstalkUI {
                 match self.mode {
                     UIMode::Normal => match key.code {
                         KeyCode::Char('q') => {
-                            crate::log_warn!(self.control_tx.send(ControlSignal::Shutdown).await, "failed to send shutdown signal");
+                            crate::log_warn!(
+                                self.control_tx.send(ControlSignal::Shutdown).await,
+                                "failed to send shutdown signal"
+                            );
                             break;
                         }
                         KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             self.mode = UIMode::Insert;
-                            crate::log_warn!(self.control_tx.send(ControlSignal::Pause).await, "failed to send pause signal");
+                            crate::log_warn!(
+                                self.control_tx.send(ControlSignal::Pause).await,
+                                "failed to send pause signal"
+                            );
                         }
                         KeyCode::Char('p') => {
                             self.mode = UIMode::Playback;
@@ -143,7 +157,10 @@ impl CrosstalkUI {
                         }
                         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             self.mode = UIMode::Intercept;
-                            crate::log_warn!(self.control_tx.send(ControlSignal::Pause).await, "failed to send pause signal");
+                            crate::log_warn!(
+                                self.control_tx.send(ControlSignal::Pause).await,
+                                "failed to send pause signal"
+                            );
                         }
                         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             crate::log_warn!(self.capture_to_svg(&sigma), "failed to capture SVG");
@@ -187,9 +204,21 @@ impl CrosstalkUI {
                     },
                     UIMode::Insert => match key.code {
                         KeyCode::Enter => {
-                            let content = std::mem::take(&mut self.input_buffer);
-                            crate::log_warn!(self.control_tx.send(ControlSignal::Inject(content)).await, "failed to send inject signal");
-                            crate::log_warn!(self.control_tx.send(ControlSignal::Resume).await, "failed to send resume signal");
+                            let raw = std::mem::take(&mut self.input_buffer);
+                            // Strip ASCII control characters before the text enters
+                            // the AI pipeline; keeps printable chars, newline, and tab.
+                            let content: String = raw
+                                .chars()
+                                .filter(|&c| c >= ' ' || c == '\n' || c == '\t')
+                                .collect();
+                            crate::log_warn!(
+                                self.control_tx.send(ControlSignal::Inject(content)).await,
+                                "failed to send inject signal"
+                            );
+                            crate::log_warn!(
+                                self.control_tx.send(ControlSignal::Resume).await,
+                                "failed to send resume signal"
+                            );
                             self.mode = UIMode::Normal;
                         }
                         KeyCode::Char(c) => {
@@ -200,48 +229,61 @@ impl CrosstalkUI {
                         }
                         KeyCode::Esc => {
                             self.mode = UIMode::Normal;
-                            crate::log_warn!(self.control_tx.send(ControlSignal::Resume).await, "failed to send resume signal");
-                            self.mode = UIMode::Normal;
+                            crate::log_warn!(
+                                self.control_tx.send(ControlSignal::Resume).await,
+                                "failed to send resume signal"
+                            );
                         }
                         _ => {}
                     },
-                    UIMode::Rewind => {
-                        if key.code == KeyCode::Esc {
-                            self.mode = UIMode::Normal;
-                            crate::log_warn!(self.control_tx.send(ControlSignal::Resume).await, "failed to send resume signal");
-                        }
-                    }
                     UIMode::Intercept => match key.code {
                         KeyCode::Up | KeyCode::Char('k') => {
-                             self.selection_index = self.selection_index.saturating_sub(1);
+                            self.selection_index = self.selection_index.saturating_sub(1);
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
-                             self.selection_index += 1;
+                            self.selection_index = self.selection_index.saturating_add(1);
                         }
                         KeyCode::Char('l') => {
-                             let names: Vec<_> = sigma.artifacts.keys().cloned().collect();
-                             if !names.is_empty() {
+                            let names: Vec<_> = sigma.artifacts.keys().cloned().collect();
+                            if !names.is_empty() {
                                 let target = &names[self.selection_index % names.len()];
-                                crate::log_warn!(self.control_tx.send(ControlSignal::LockCode(target.clone())).await, "failed to send lock signal");
-                             }
+                                crate::log_warn!(
+                                    self.control_tx
+                                        .send(ControlSignal::LockCode(target.clone()))
+                                        .await,
+                                    "failed to send lock signal"
+                                );
+                            }
                         }
                         KeyCode::Char('m') => {
                             if !sigma.agent_weights.is_empty() {
                                 let idx = self.selection_index % sigma.agent_weights.len();
                                 if let Some((target, _)) = sigma.agent_weights.iter().nth(idx) {
-                                    crate::log_warn!(self.control_tx.send(ControlSignal::MuteAgent(target.clone())).await, "failed to send mute signal");
+                                    crate::log_warn!(
+                                        self.control_tx
+                                            .send(ControlSignal::MuteAgent(target.clone()))
+                                            .await,
+                                        "failed to send mute signal"
+                                    );
                                 }
                             }
                         }
                         KeyCode::Char('d') => {
-                            crate::log_warn!(self.control_tx.send(ControlSignal::DampenSwarm(0.5)).await, "failed to send dampen signal");
+                            crate::log_warn!(
+                                self.control_tx.send(ControlSignal::DampenSwarm(0.5)).await,
+                                "failed to send dampen signal"
+                            );
                         }
                         KeyCode::Esc => {
                             self.mode = UIMode::Normal;
-                            crate::log_warn!(self.control_tx.send(ControlSignal::Resume).await, "failed to send resume signal");
+                            crate::log_warn!(
+                                self.control_tx.send(ControlSignal::Resume).await,
+                                "failed to send resume signal"
+                            );
                         }
                         _ => {}
-                    }
+                    },
+                    UIMode::Rewind => {}
                 }
             }
         }

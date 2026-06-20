@@ -1,7 +1,7 @@
-use anyhow::Result;
-use crate::types::artifact::{Artifact, ArtifactDiff};
 use crate::engines::diff::DiffEngine;
-use crate::engines::sandbox::{SandboxManager, SandboxConfig};
+use crate::engines::sandbox::{SandboxConfig, SandboxManager};
+use crate::types::artifact::{Artifact, ArtifactDiff};
+use anyhow::Result;
 use std::sync::Arc;
 use tokio::task;
 
@@ -43,7 +43,12 @@ impl MonteCarloRunner {
         Ok(Self { sandbox })
     }
 
-    pub async fn predict(&self, artifact: &Artifact, diff: &ArtifactDiff, trials: usize) -> Result<(f64, f64)> {
+    pub async fn predict(
+        &self,
+        artifact: &Artifact,
+        diff: &ArtifactDiff,
+        trials: usize,
+    ) -> Result<(f64, f64)> {
         let mut tasks = Vec::new();
         let artifact_base: Arc<str> = artifact.content.as_str().into();
         let diff_arc = Arc::new(diff.clone());
@@ -53,13 +58,13 @@ impl MonteCarloRunner {
             let content = Arc::clone(&artifact_base);
             let diff_clone = Arc::clone(&diff_arc);
 
-                        tasks.push(task::spawn(async move {
+            tasks.push(task::spawn(async move {
                 // 1. Apply Patch
                 let patched = DiffEngine::apply_patch(&content, &diff_clone);
 
                 // 2. Real Sandboxed Execution Trial
                 // We mock the WASM compilation for the trial, but use the sandbox to execute
-                match sandbox.execute(patched.as_bytes()) {
+                match sandbox.execute_with_timeout(patched.as_bytes()).await {
                     Ok(res) => Some(res.exit_code == 0),
                     Err(_) => None, // sandbox failure is inconclusive; exclude from trial count
                 }
@@ -67,7 +72,16 @@ impl MonteCarloRunner {
         }
 
         let results = futures::future::join_all(tasks).await;
-        let outcomes: Vec<bool> = results.into_iter().filter_map(|r| r.ok().flatten()).collect();
+        let outcomes: Vec<bool> = results
+            .into_iter()
+            .filter_map(|r| match r {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "simulation task panicked");
+                    None
+                }
+            })
+            .collect();
 
         if outcomes.is_empty() {
             // All trials inconclusive (e.g. sandbox can't run source code as WASM).
@@ -116,7 +130,11 @@ impl MonteCarloRunner {
         }
 
         let mean_p_fail = p_fails.iter().sum::<f64>() / n as f64;
-        let variance = p_fails.iter().map(|p| (p - mean_p_fail).powi(2)).sum::<f64>() / n as f64;
+        let variance = p_fails
+            .iter()
+            .map(|p| (p - mean_p_fail).powi(2))
+            .sum::<f64>()
+            / n as f64;
         let std_dev = variance.sqrt();
 
         // 95% CI using normal approximation: mean +/- 1.96 * (std_dev / sqrt(n))

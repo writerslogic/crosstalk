@@ -235,6 +235,7 @@ fn make_turn(model: &str, outcome: TurnOutcome, certainty: f64) -> Turn {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     }
 }
 
@@ -379,7 +380,11 @@ fn compute_payoff_matrix_has_correct_dimensions() {
     let a = empty_artifact("a");
     let b = empty_artifact("b");
     let c = empty_artifact("c");
-    let proposals = vec![("ag1", &a, TurnOutcome::Compiled), ("ag2", &b, TurnOutcome::Compiled), ("ag3", &c, TurnOutcome::Compiled)];
+    let proposals = vec![
+        ("ag1", &a, TurnOutcome::Compiled),
+        ("ag2", &b, TurnOutcome::Compiled),
+        ("ag3", &c, TurnOutcome::Compiled),
+    ];
     let current = empty_artifact("cur");
     let matrix = PayoffCalculator::compute_payoff_matrix(&proposals, &current);
     assert_eq!(matrix.len(), 3);
@@ -392,7 +397,10 @@ fn compute_payoff_matrix_has_correct_dimensions() {
 fn compute_payoff_matrix_values_in_unit_interval() {
     let a = empty_artifact("a");
     let b = empty_artifact("b");
-    let proposals = vec![("x", &a, TurnOutcome::Compiled), ("y", &b, TurnOutcome::Compiled)];
+    let proposals = vec![
+        ("x", &a, TurnOutcome::Compiled),
+        ("y", &b, TurnOutcome::Compiled),
+    ];
     let current = empty_artifact("cur");
     let matrix = PayoffCalculator::compute_payoff_matrix(&proposals, &current);
     for row in &matrix {
@@ -525,6 +533,10 @@ fn resolve_all_strategies_handle_empty() {
         ResolutionStrategy::Mediation,
     ] {
         let result = NashSolver::resolve(&[], strategy);
-        assert_eq!(result, "", "empty proposals should return empty for {:?}", strategy);
+        assert_eq!(
+            result, "",
+            "empty proposals should return empty for {:?}",
+            strategy
+        );
     }
 }

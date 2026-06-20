@@ -15,9 +15,16 @@ const MAX_EVIDENCE_SPAN: usize = 200;
 /// `MAX_EVIDENCE_SPAN` at a char boundary.
 pub fn sanitize_directive_content(raw: &str) -> String {
     const STRIP_PATTERNS: &[&str] = &[
-        "[INST]", "[/INST]", "<<SYS>>", "<</SYS>>",
-        "###", "<|im_start|>", "<|im_end|>",
-        "<|system|>", "<|user|>", "<|assistant|>",
+        "[INST]",
+        "[/INST]",
+        "<<SYS>>",
+        "<</SYS>>",
+        "###",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|system|>",
+        "<|user|>",
+        "<|assistant|>",
     ];
     let cleaned: String = raw
         .chars()
@@ -80,24 +87,42 @@ impl ReasoningEngine {
             }
 
             let lower = trimmed.to_lowercase();
-            if lower.contains("[decision]") || lower.starts_with("decision:") || lower.starts_with("conclusion:") {
+            if lower.contains("[decision]")
+                || lower.starts_with("decision:")
+                || lower.starts_with("conclusion:")
+            {
                 decisions.push(trimmed.to_string());
-            } else if lower.contains("bug") || lower.contains("error") || lower.contains("issue:")
-                || lower.contains("problem:") || lower.contains("flaw") || lower.contains("regression")
-                || lower.starts_with("- fix") || lower.starts_with("- bug")
+            } else if lower.contains("bug")
+                || lower.contains("error")
+                || lower.contains("issue:")
+                || lower.contains("problem:")
+                || lower.contains("flaw")
+                || lower.contains("regression")
+                || lower.starts_with("- fix")
+                || lower.starts_with("- bug")
             {
                 problems.push(trimmed.to_string());
-            } else if trimmed.ends_with('?') || lower.starts_with("question:") || lower.starts_with("q:") {
+            } else if trimmed.ends_with('?')
+                || lower.starts_with("question:")
+                || lower.starts_with("q:")
+            {
                 questions.push(trimmed.to_string());
             }
         }
 
-        ExtractedSignals { decisions, problems, questions, code_blocks }
+        ExtractedSignals {
+            decisions,
+            problems,
+            questions,
+            code_blocks,
+        }
     }
 
     pub fn select_structure(category: TaskCategory, agent_id: &str) -> TurnStructure {
         // apply agent-specific structure bias if detected
-        if agent_id.to_lowercase().contains("architect") { return TurnStructure::ProsCons; }
+        if agent_id.to_lowercase().contains("architect") {
+            return TurnStructure::ProsCons;
+        }
         category.preferred_structure()
     }
 
@@ -105,7 +130,7 @@ impl ReasoningEngine {
     pub fn anchor_evidence(content: &str, sigma: &ConversationState) -> Vec<AnchoredClaim> {
         let mut anchored = Vec::new();
         let signals = Self::extract_signals(content);
-        
+
         for claim in signals.decisions {
             let mut anchors = Vec::new();
             let mut confidence: f64 = 0.2; // Base unanchored weight
@@ -121,7 +146,7 @@ impl ReasoningEngine {
                 if claim.contains(basename) && !basename.is_empty() {
                     anchors.push(EvidenceAnchor::CodeRef {
                         file: basename.to_string(),
-                        line: 0
+                        line: 0,
                     });
                     confidence = (confidence + 0.4).min(1.0);
                 }
@@ -132,16 +157,16 @@ impl ReasoningEngine {
                 if claim.contains(&format!("i_{}", turn.index)) {
                     anchors.push(EvidenceAnchor::Citation {
                         source: turn.model_id.clone(),
-                        quote: String::new()
+                        quote: String::new(),
                     });
                     confidence = (confidence + 0.2).min(1.0);
                 }
             }
 
-            anchored.push(AnchoredClaim { 
-                claim, 
-                anchors, 
-                confidence: confidence.min(1.0) 
+            anchored.push(AnchoredClaim {
+                claim,
+                anchors,
+                confidence: confidence.min(1.0),
             });
         }
         anchored
@@ -149,19 +174,19 @@ impl ReasoningEngine {
 
     /// Suggestion 7: RAG-Powered Evidence Anchoring
     pub async fn anchor_evidence_rag(
-        content: &str, 
-        sigma: &ConversationState, 
-        store: &crate::engines::memory::MemoryStore
+        content: &str,
+        sigma: &ConversationState,
+        store: &crate::engines::memory::MemoryStore,
     ) -> Vec<AnchoredClaim> {
         let mut anchored = Self::anchor_evidence(content, sigma);
-        
+
         for ac in &mut anchored {
             if let Ok(matches) = store.query_hybrid("memory", &ac.claim, 3).await {
                 for (rec, score) in matches {
                     if score > 0.7 {
-                        ac.anchors.push(EvidenceAnchor::SemanticMem { 
-                            session_id: rec.session_id, 
-                            relevance: score 
+                        ac.anchors.push(EvidenceAnchor::SemanticMem {
+                            session_id: rec.session_id,
+                            relevance: score,
                         });
                         ac.confidence = (ac.confidence + 0.3).min(1.0);
                     }
@@ -171,7 +196,6 @@ impl ReasoningEngine {
         anchored
     }
 }
-
 
 pub struct SignalExtractor;
 impl SignalExtractor {
@@ -298,14 +322,16 @@ impl FallacyDetector {
 
     pub fn detect_straw_man_robust(content: &str, prior_turns: &[Turn]) -> Option<FallacyReport> {
         let lower = content.to_lowercase();
-        
+
         // Find segments that look like attributions/summaries of others
         let markers = ["they said", "the other agent claims", "it was argued that"];
         let mut target_span = None;
         for m in markers {
             if let Some(idx) = lower.find(m) {
-                let end = content[idx..].find(['.', '\n']).unwrap_or(content.len() - idx);
-                target_span = Some(&content[idx..idx+end]);
+                let end = content[idx..]
+                    .find(['.', '\n'])
+                    .unwrap_or(content.len() - idx);
+                target_span = Some(&content[idx..idx + end]);
                 break;
             }
         }
@@ -315,11 +341,15 @@ impl FallacyDetector {
             let mut max_sim = 0.0;
             for t in prior_turns {
                 let sim = crate::engines::diff::DiffEngine::calculate_similarity(span, &t.content);
-                if sim > max_sim { max_sim = sim; }
+                if sim > max_sim {
+                    max_sim = sim;
+                }
             }
 
             // If we are quoting someone but similarity to their actual words is low, it might be a straw man
-            if max_sim < 0.2 && (lower.contains("absurd") || lower.contains("wrong") || lower.contains("false")) {
+            if max_sim < 0.2
+                && (lower.contains("absurd") || lower.contains("wrong") || lower.contains("false"))
+            {
                 return Some(FallacyReport {
                     fallacy_type: "StrawMan".to_string(),
                     evidence_span: sanitize_directive_content(span),
@@ -479,7 +509,7 @@ impl StructureSelector {
     pub fn recommend_with_exploration(&self, task: TaskCategory, agent_id: &str) -> TurnStructure {
         use rand::Rng;
         let mut rng = rand::rng();
-        
+
         if rng.random_bool(0.1) {
             // Exploration: pick a random structure
             let all = [
@@ -855,7 +885,8 @@ impl SynthesisEngine {
         let mut seen_normalized: HashMap<String, usize> = HashMap::new(); // normalized -> index in sentence_freq
 
         for (_, content) in proposals {
-            let mut proposal_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut proposal_seen: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for sentence in Self::split_sentences(content) {
                 let normalized = Self::normalize_sentence(&sentence);
                 if normalized.is_empty() {
@@ -1011,7 +1042,9 @@ pub struct SynthesisEngine {
 
 impl SynthesisEngine {
     pub fn new() -> Self {
-        Self { strategy: Box::new(DefaultSynthesis) }
+        Self {
+            strategy: Box::new(DefaultSynthesis),
+        }
     }
 
     pub fn with_strategy(s: Box<dyn SynthesisStrategy>) -> Self {
@@ -1095,7 +1128,7 @@ impl SynthesisEngine {
         // 1. Process existing blocks (Keep, Replace, or Delete)
         let mut replacements: Vec<(std::ops::Range<usize>, String)> = Vec::new();
         let mut handled_signatures = std::collections::HashSet::new();
-        let threshold = (versions.len() + 1) / 2;
+        let threshold = versions.len().div_ceil(2);
 
         for base_block in &base_blocks {
             handled_signatures.insert(base_block.signature.clone());
@@ -1260,7 +1293,10 @@ impl AdversarialCritic {
             let lower = line.to_lowercase();
             if lower.contains("strength:") || lower.contains("+ ") {
                 strengths.push(line.trim().to_string());
-            } else if lower.contains("weakness:") || lower.contains("error:") || lower.contains("bug:") {
+            } else if lower.contains("weakness:")
+                || lower.contains("error:")
+                || lower.contains("bug:")
+            {
                 weaknesses.push((line.trim().to_string(), 0.8, String::new()));
                 verdict = CriticVerdict::RequestChanges;
             } else if lower.contains("fix:") || lower.contains("suggest:") {
@@ -1270,6 +1306,11 @@ impl AdversarialCritic {
             }
         }
 
-        CritiqueReport { strengths, weaknesses, suggested_fixes: fixes, verdict }
+        CritiqueReport {
+            strengths,
+            weaknesses,
+            suggested_fixes: fixes,
+            verdict,
+        }
     }
 }

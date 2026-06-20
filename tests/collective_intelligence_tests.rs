@@ -24,6 +24,7 @@ fn make_turn(model_id: &str, outcome: TurnOutcome, category: Option<TaskCategory
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     }
 }
 

@@ -77,8 +77,10 @@ impl ReleaseManager {
             result
                 .issues
                 .push(format!("{risky_turns} turn(s) with certainty < 0.3"));
+            result.failed += 1;
+        } else {
+            result.passed += 1;
         }
-        result.passed += 1;
 
         if result.failed > 0 {
             Err(anyhow!(
@@ -105,19 +107,29 @@ impl ReleaseManager {
     pub fn run_sovereign_audit(sigma: &ConversationState) -> Result<String> {
         let stability = Self::run_stability_audit(sigma)?;
         let history_valid = CpopVerifier::verify_history(std::slice::from_ref(sigma));
-        
+
         if !history_valid {
-            return Err(anyhow!("Sovereign Audit Failed: CPOP history verification failed."));
+            return Err(anyhow!(
+                "Sovereign Audit Failed: CPOP history verification failed."
+            ));
         }
 
         let mut report = "Sovereign Audit: CLEAN\n".to_string();
-        report.push_str(&format!("  - Stability Checks: {} passed, 0 failed
-", stability.passed));
-        report.push_str("  - Cryptographic History: VERIFIED
-");
-        report.push_str(&format!("  - Artifact Integrity: {} artifacts validated
-", sigma.artifacts.len()));
-        
+        report.push_str(&format!(
+            "  - Stability Checks: {} passed, 0 failed
+",
+            stability.passed
+        ));
+        report.push_str(
+            "  - Cryptographic History: VERIFIED
+",
+        );
+        report.push_str(&format!(
+            "  - Artifact Integrity: {} artifacts validated
+",
+            sigma.artifacts.len()
+        ));
+
         Ok(report)
     }
 
@@ -232,9 +244,14 @@ impl PluginManager {
 
     pub fn run_on_turn(&self, sigma: &mut ConversationState) -> Result<()> {
         let mut errors = Vec::new();
-        for entry in self.plugins.iter() {
-            if let Err(e) = entry.value().on_turn(sigma) {
-                errors.push(format!("{}: {}", entry.key(), e));
+        let snapshot: Vec<(String, Arc<dyn CrosstalkPlugin>)> = self
+            .plugins
+            .iter()
+            .map(|e| (e.key().clone(), Arc::clone(e.value())))
+            .collect();
+        for (name, plugin) in &snapshot {
+            if let Err(e) = plugin.on_turn(sigma) {
+                errors.push(format!("{}: {}", name, e));
             }
         }
         if !errors.is_empty() {

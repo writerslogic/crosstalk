@@ -24,6 +24,7 @@ async fn test_continuous_auditor_spawns_and_receives() {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     });
     let prev_hash = [0u8; 32];
     state1.state_hash = HashChain::compute(&state1, &prev_hash).expect("Hash computation failed");
@@ -51,6 +52,7 @@ async fn test_continuous_auditor_spawns_and_receives() {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     });
     state2.state_hash =
         HashChain::compute(&state2, &state1.state_hash).expect("Hash computation failed");

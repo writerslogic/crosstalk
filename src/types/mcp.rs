@@ -120,6 +120,13 @@ impl PermissionManager {
             PermissionTier::ScopedWrite(allowed) => {
                 // Check that all path arguments are within allowed paths
                 if let Some(arr) = args.get("args").and_then(|v| v.as_array()) {
+                    if arr.len() > 100 {
+                        return Err(PermissionError::PermissionDenied(format!(
+                            "Too many arguments ({}) for agent {}",
+                            arr.len(),
+                            agent_id
+                        )));
+                    }
                     for v in arr {
                         if let Some(s) = v.as_str() {
                             let p = Path::new(s);
@@ -144,9 +151,13 @@ impl PermissionManager {
                         }
                     }
                 }
+                self.failure_counts.remove(agent_id);
                 Ok(())
             }
-            PermissionTier::Full => Ok(()),
+            PermissionTier::Full => {
+                self.failure_counts.remove(agent_id);
+                Ok(())
+            }
             PermissionTier::CriticalConfirmation(allowed_tools) => {
                 if !allowed_tools.contains(&tool_name.to_string()) {
                     self.record_failure(agent_id);
@@ -156,16 +167,14 @@ impl PermissionManager {
                     )));
                 }
                 // Confirmation check is handled at the gateway level
+                self.failure_counts.remove(agent_id);
                 Ok(())
             }
         }
     }
 
     /// Validate that a path does not contain traversal and is within allowed directories.
-    pub fn validate_path_strict(
-        path: &Path,
-        allowed: &[PathBuf],
-    ) -> Result<(), PermissionError> {
+    pub fn validate_path_strict(path: &Path, allowed: &[PathBuf]) -> Result<(), PermissionError> {
         let path_str = path.to_string_lossy();
 
         // Check for path traversal

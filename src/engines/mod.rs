@@ -4,11 +4,13 @@ pub mod analytics;
 pub mod collective_intelligence;
 pub mod compute;
 pub mod consensus;
+pub mod data_minimizer;
 pub mod diff;
 pub mod intelligence;
 pub mod linter;
 pub mod memory;
 pub mod metacognition;
+pub mod novelty;
 pub mod planning;
 pub mod prompt_evolution;
 pub mod proof;
@@ -27,9 +29,7 @@ pub mod verification;
 
 // Re-export commonly-used types for ergonomic imports
 pub use analytics::{AnalyticsEngine, FailureTaxonomy, QualityTrendDetector};
-pub use consensus::{
-    CertaintyAnalyzer, KalmanConvergence, NashSolver, PayoffCalculator,
-};
+pub use consensus::{CertaintyAnalyzer, KalmanConvergence, NashSolver, PayoffCalculator};
 pub use intelligence::{IntelligenceEngine, QualityScorer};
 pub use reasoning::{FallacyDetector, ReasoningEngine, ReasoningScorer, SynthesisEngine};
 pub use validation::AstValidator;

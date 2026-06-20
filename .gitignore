@@ -3,3 +3,5 @@
 .crosstalk_db
 **/*.rs.bk
 .todo-runner/
+*.proof
+__pycache__/

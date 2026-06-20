@@ -35,7 +35,7 @@ impl AnalyticsEngine {
                 .iter()
                 .rev()
                 .take(5)
-                .map(|_| sigma.completion_probability)
+                .map(|t| t.certainty.unwrap_or(sigma.completion_probability))
                 .collect();
             velocity = Self::linear_regression_slope(&x, &y);
             quality_trend = velocity * 0.8;
@@ -53,7 +53,10 @@ impl AnalyticsEngine {
             blockers.push("StuckGoal: low convergence velocity after 10+ turns".to_string());
         }
         if semantic_delta > 0.4 && n > 5 {
-             blockers.push(format!("SemanticDivergence: delta={:.2} exceeds threshold", semantic_delta));
+            blockers.push(format!(
+                "SemanticDivergence: delta={:.2} exceeds threshold",
+                semantic_delta
+            ));
         }
         // Capability mismatch: one agent dominates failures
         let failure_agents = Self::dominant_failure_agent(sigma);
@@ -294,12 +297,18 @@ impl MetaLearningEngine {
                 }
             }
         }
-        let best_model = model_wins.into_iter().max_by_key(|(_, v)| *v).map(|(k, _)| k);
+        let best_model = model_wins
+            .into_iter()
+            .max_by_key(|(_, v)| *v)
+            .map(|(k, _)| k);
 
         if session_count < 2 {
             return MetaLearningInsight {
                 session_count,
-                avg_turns_to_convergence: sessions.first().map(|s| s.turns.len() as f64).unwrap_or(0.0),
+                avg_turns_to_convergence: sessions
+                    .first()
+                    .map(|s| s.turns.len() as f64)
+                    .unwrap_or(0.0),
                 quality_growth_rate: 0.0,
                 best_model,
             };

@@ -37,6 +37,7 @@ fn make_state(session_id: &str, turns: u32, prob: f64) -> ConversationState {
             surprise_signal: None,
             consistency_score: None,
             diff_quality_score: None,
+            persona_disclosure: None,
         });
     }
     s
@@ -190,6 +191,7 @@ fn agent_success_rate_matches_known_outcomes() {
             surprise_signal: None,
             consistency_score: None,
             diff_quality_score: None,
+            persona_disclosure: None,
         });
     }
     let report = AnalyticsEngine::generate_report(&sigma);
@@ -234,6 +236,7 @@ fn convergence_diagnostics_detects_conflicting_proposals() {
             surprise_signal: None,
             consistency_score: None,
             diff_quality_score: None,
+            persona_disclosure: None,
         });
     }
     let report = AnalyticsEngine::generate_report(&sigma);
@@ -265,6 +268,7 @@ fn convergence_diagnostics_detects_capability_mismatch() {
             surprise_signal: None,
             consistency_score: None,
             diff_quality_score: None,
+            persona_disclosure: None,
         });
     }
     // One control turn from a different agent
@@ -282,6 +286,7 @@ fn convergence_diagnostics_detects_capability_mismatch() {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     });
     let report = AnalyticsEngine::generate_report(&sigma);
     assert!(
@@ -402,6 +407,7 @@ fn is_mandate_active_false_for_old_session() {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     });
     assert!(
         !ReleaseManager::is_mandate_active(&sigma),

@@ -10,17 +10,25 @@ use tokio::sync::mpsc;
 static LOG_FILE: OnceLock<Option<Mutex<BufWriter<std::fs::File>>>> = OnceLock::new();
 
 fn log_file() -> Option<std::sync::MutexGuard<'static, BufWriter<std::fs::File>>> {
-    LOG_FILE.get_or_init(|| {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/crosstalk.log")
-            .ok()
-            .map(|f| Mutex::new(BufWriter::new(f)))
-    })
-    .as_ref()?
-    .lock()
-    .ok()
+    LOG_FILE
+        .get_or_init(|| {
+            let log_dir = std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| {
+                std::env::var("HOME")
+                    .map(|h| format!("{h}/.local/state"))
+                    .unwrap_or_else(|_| "/tmp".to_string())
+            });
+            let log_path = format!("{log_dir}/crosstalk/events.log");
+            let _ = std::fs::create_dir_all(format!("{log_dir}/crosstalk"));
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path)
+                .ok()
+                .map(|f| Mutex::new(BufWriter::new(f)))
+        })
+        .as_ref()?
+        .lock()
+        .ok()
 }
 
 pub enum Action {
@@ -40,7 +48,14 @@ fn log_event(ev: &StreamEvent) {
         }
         let lines: Vec<String> = BUF.with(|b| {
             let mut map = b.borrow_mut();
+            if map.len() > 64 && !map.contains_key(agent_id) {
+                map.clear();
+            }
             let entry = map.entry(agent_id.clone()).or_default();
+            const BUF_LIMIT: usize = 64 * 1024;
+            if entry.len() + token.len() > BUF_LIMIT {
+                entry.clear();
+            }
             entry.push_str(token);
             let mut out = Vec::new();
             while let Some(pos) = entry.find('\n') {
@@ -52,7 +67,9 @@ fn log_event(ev: &StreamEvent) {
             }
             out
         });
-        if !lines.is_empty() && let Some(mut f) = log_file() {
+        if !lines.is_empty()
+            && let Some(mut f) = log_file()
+        {
             for line in lines {
                 crate::log_warn!(writeln!(f, "{line}"), "failed to write log event");
             }
@@ -63,41 +80,101 @@ fn log_event(ev: &StreamEvent) {
     if let Some(mut f) = log_file() {
         match ev {
             StreamEvent::TurnComplete(turn) => {
-                crate::log_warn!(writeln!(
-                    f, "{ts} [TURN] i_{} by {} outcome={:?} cert={:.2} diffs={}",
-                    turn.index, turn.model_id, turn.outcome,
-                    turn.certainty.unwrap_or(0.0), turn.diffs.len()
-                ), "failed to write log event");
+                crate::log_warn!(
+                    writeln!(
+                        f,
+                        "{ts} [TURN] i_{} by {} outcome={:?} cert={:.2} diffs={}",
+                        turn.index,
+                        turn.model_id,
+                        turn.outcome,
+                        turn.certainty.unwrap_or(0.0),
+                        turn.diffs.len()
+                    ),
+                    "failed to write log event"
+                );
             }
-            StreamEvent::ConvergenceUpdated { p, certainty, agent_weights } => {
-                let weights_str: String = agent_weights.iter()
+            StreamEvent::ConvergenceUpdated {
+                p,
+                certainty,
+                agent_weights,
+            } => {
+                let weights_str: String = agent_weights
+                    .iter()
                     .map(|(a, w)| format!("{a}={w:.2}"))
                     .collect::<Vec<_>>()
                     .join(" ");
-                crate::log_warn!(writeln!(f, "{ts} [CONV] p={p:.3} cert={certainty:.3} weights=[{weights_str}]"), "failed to write log event");
+                crate::log_warn!(
+                    writeln!(
+                        f,
+                        "{ts} [CONV] p={p:.3} cert={certainty:.3} weights=[{weights_str}]"
+                    ),
+                    "failed to write log event"
+                );
             }
             StreamEvent::ArtifactsUpdated(list) => {
-                crate::log_warn!(writeln!(f, "{ts} [ARTIFACTS] {} artifact(s) updated", list.len()), "failed to write log event");
+                crate::log_warn!(
+                    writeln!(f, "{ts} [ARTIFACTS] {} artifact(s) updated", list.len()),
+                    "failed to write log event"
+                );
             }
             StreamEvent::EntropyUpdated(entries) => {
-                crate::log_warn!(writeln!(f, "{ts} [ENTROPY] {} entries", entries.len()), "failed to write log event");
+                crate::log_warn!(
+                    writeln!(f, "{ts} [ENTROPY] {} entries", entries.len()),
+                    "failed to write log event"
+                );
             }
-            StreamEvent::GodViewUpdated { frame, avg_certainty, avg_surprise, agent_count } => {
-                crate::log_warn!(writeln!(
-                    f, "{ts} [GODVIEW] frame={frame} cert={avg_certainty:.2} surprise={avg_surprise:.2} agents={agent_count}"
-                ), "failed to write log event");
+            StreamEvent::GodViewUpdated {
+                frame,
+                avg_certainty,
+                avg_surprise,
+                agent_count,
+            } => {
+                crate::log_warn!(
+                    writeln!(
+                        f,
+                        "{ts} [GODVIEW] frame={frame} cert={avg_certainty:.2} surprise={avg_surprise:.2} agents={agent_count}"
+                    ),
+                    "failed to write log event"
+                );
             }
             StreamEvent::CheckpointWritten(idx) => {
-                crate::log_warn!(writeln!(f, "{ts} [CKPT] i_{idx}"), "failed to write log event");
+                crate::log_warn!(
+                    writeln!(f, "{ts} [CKPT] i_{idx}"),
+                    "failed to write log event"
+                );
             }
             StreamEvent::Error(msg) => {
-                crate::log_warn!(writeln!(f, "{ts} [ERROR] {msg}"), "failed to write log event");
+                crate::log_warn!(
+                    writeln!(f, "{ts} [ERROR] {msg}"),
+                    "failed to write log event"
+                );
             }
-            StreamEvent::FiduciarySignal { principal_id, event, .. } => {
-                crate::log_warn!(writeln!(f, "{ts} [FIDUCIARY] principal={principal_id} event={event:?}"), "failed to write log event");
+            StreamEvent::FiduciarySignal {
+                principal_id,
+                event,
+                ..
+            } => {
+                crate::log_warn!(
+                    writeln!(
+                        f,
+                        "{ts} [FIDUCIARY] principal={principal_id} event={event:?}"
+                    ),
+                    "failed to write log event"
+                );
             }
-            StreamEvent::ModeTransition { from_name, to_name, reason, synthesized } => {
-                crate::log_warn!(writeln!(f, "{ts} [MODE] {from_name} → {to_name} synthesized={synthesized} reason={reason}"), "failed to write log event");
+            StreamEvent::ModeTransition {
+                from_name,
+                to_name,
+                reason,
+                synthesized,
+            } => {
+                crate::log_warn!(
+                    writeln!(
+                        f,
+                        "{ts} [MODE] {from_name} → {to_name} synthesized={synthesized} reason={reason}"
+                    ),
+                    "failed to write log event"
+                );
             }
             StreamEvent::TokenReceived { .. } => unreachable!("handled above"),
         }
@@ -129,11 +206,14 @@ pub fn drain_stream_events(app: &mut App, stream_rx: &mut mpsc::Receiver<StreamE
                 };
                 app.push_event(format!(
                     "Convergence {:.0}%, certainty {:.0}% — {}",
-                    p * 100.0, certainty * 100.0, trend
+                    p * 100.0,
+                    certainty * 100.0,
+                    trend
                 ));
             }
             StreamEvent::ArtifactsUpdated(list) => {
-                let changed: Vec<&str> = list.iter()
+                let changed: Vec<&str> = list
+                    .iter()
                     .filter(|a| a.diff_count > 0)
                     .map(|a| a.name.as_str())
                     .collect();
@@ -147,12 +227,20 @@ pub fn drain_stream_events(app: &mut App, stream_rx: &mut mpsc::Receiver<StreamE
                 app.artifacts = list;
             }
             StreamEvent::EntropyUpdated(entries) => {
-                app.entropy_scores = entries.into_iter().map(|e| crate::ui::app::EntropyRow {
-                    artifact: e.artifact_name,
-                    agents: e.scores,
-                }).collect();
+                app.entropy_scores = entries
+                    .into_iter()
+                    .map(|e| crate::ui::app::EntropyRow {
+                        artifact: e.artifact_name,
+                        agents: e.scores,
+                    })
+                    .collect();
             }
-            StreamEvent::GodViewUpdated { frame, avg_certainty, avg_surprise, .. } => {
+            StreamEvent::GodViewUpdated {
+                frame,
+                avg_certainty,
+                avg_surprise,
+                ..
+            } => {
                 app.godview_frame = frame;
                 app.godview_certainty = avg_certainty;
                 app.godview_surprise = avg_surprise;
@@ -161,13 +249,25 @@ pub fn drain_stream_events(app: &mut App, stream_rx: &mut mpsc::Receiver<StreamE
                 app.push_event(format!("Checkpoint i_{idx}"));
             }
             StreamEvent::Error(msg) => app.push_event(format!("Error: {msg}")),
-            StreamEvent::FiduciarySignal { principal_id, event, .. } => {
+            StreamEvent::FiduciarySignal {
+                principal_id,
+                event,
+                ..
+            } => {
                 app.push_event(format!("[fiduciary] principal={principal_id} {event:?}"));
             }
-            StreamEvent::ModeTransition { from_name, to_name, reason, synthesized } => {
+            StreamEvent::ModeTransition {
+                from_name,
+                to_name,
+                reason,
+                synthesized,
+            } => {
                 app.current_mode_name = to_name.clone();
                 let tag = if synthesized { " [NEW]" } else { "" };
-                app.push_event(format!("[MODE] {} → {}{} | {}", from_name, to_name, tag, reason));
+                app.push_event(format!(
+                    "[MODE] {} → {}{} | {}",
+                    from_name, to_name, tag, reason
+                ));
             }
         }
     }
@@ -259,9 +359,7 @@ pub fn handle_key(app: &mut App, key: event::KeyEvent) -> Action {
                 app.scroll_bottom();
                 Action::None
             }
-            KeyCode::Char('m') => {
-                Action::Send(ControlSignal::CycleMode)
-            }
+            KeyCode::Char('m') => Action::Send(ControlSignal::CycleMode),
             KeyCode::Char('?') => {
                 app.showing_help = !app.showing_help;
                 Action::None

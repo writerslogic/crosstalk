@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
+use std::sync::Arc;
+use std::time::Instant;
 use wasmtime::*;
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::pipe::MemoryOutputPipe;
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
-use std::sync::Arc;
-use std::time::Instant;
 
 /// Default execution timeout in seconds for sandbox operations.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -45,10 +45,23 @@ pub struct SandboxResult {
 pub struct SandboxManager {
     engine: Engine,
     config: SandboxConfig,
+    _epoch_task: tokio::task::JoinHandle<()>,
 }
 
 impl SandboxManager {
     pub fn new(config: SandboxConfig) -> Result<Self> {
+        anyhow::ensure!(
+            config.memory_limit_bytes > 0,
+            "SandboxConfig.memory_limit_bytes must be > 0"
+        );
+        anyhow::ensure!(
+            config.cpu_fuel_limit > 0,
+            "SandboxConfig.cpu_fuel_limit must be > 0"
+        );
+        anyhow::ensure!(
+            config.timeout_secs > 0,
+            "SandboxConfig.timeout_secs must be > 0"
+        );
         let mut wasm_cfg = Config::new();
         wasm_cfg.consume_fuel(true);
         wasm_cfg.epoch_interruption(true);
@@ -56,7 +69,7 @@ impl SandboxManager {
 
         // Start background epoch incrementer
         let engine_clone = engine.clone();
-        tokio::spawn(async move {
+        let epoch_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
             loop {
                 interval.tick().await;
@@ -64,7 +77,11 @@ impl SandboxManager {
             }
         });
 
-        Ok(Self { engine, config })
+        Ok(Self {
+            engine,
+            config,
+            _epoch_task: epoch_task,
+        })
     }
 
     /// Execute WASM bytes synchronously (blocking). Prefer `execute_with_timeout`
@@ -93,7 +110,8 @@ impl SandboxManager {
 
         let module = Module::from_binary(&self.engine, wasm_bytes)
             .context("failed to compile WASM module from provided bytes")?;
-        linker.module(&mut store, "", &module)
+        linker
+            .module(&mut store, "", &module)
             .context("failed to link WASM module")?;
 
         let func = linker
@@ -103,12 +121,18 @@ impl SandboxManager {
             .context("default export has unexpected signature (expected () -> ())")?;
 
         let res = func.call(&mut store, ());
-        let _fuel_consumed = store.get_fuel().ok().map(|f| self.config.cpu_fuel_limit - f);
+        let _fuel_consumed = store
+            .get_fuel()
+            .ok()
+            .map(|f| self.config.cpu_fuel_limit - f);
         let _elapsed_ms = start.elapsed().as_millis() as u64;
 
         let exit_code = match res {
             Ok(_) => 0,
-            Err(_) => 1,
+            Err(e) => {
+                tracing::warn!("WASM execution failed: {e}");
+                1
+            }
         };
 
         let stdout = String::from_utf8_lossy(&stdout_pipe.contents()).into_owned();
@@ -124,14 +148,18 @@ impl SandboxManager {
     /// Execute WASM bytes with a wall-clock timeout guard. The blocking WASM
     /// execution runs on the tokio blocking thread pool so it cannot stall the
     /// async reactor, and `tokio::time::timeout` enforces the deadline.
-    pub async fn execute_with_timeout(self: &Arc<Self>, wasm_bytes: &[u8]) -> Result<SandboxResult> {
+    pub async fn execute_with_timeout(
+        self: &Arc<Self>,
+        wasm_bytes: &[u8],
+    ) -> Result<SandboxResult> {
         let timeout = tokio::time::Duration::from_secs(self.config.timeout_secs);
         let bytes = wasm_bytes.to_vec();
         let this = Arc::clone(self);
 
-        let result = tokio::time::timeout(timeout, tokio::task::spawn_blocking(move || {
-            this.execute(&bytes)
-        }))
+        let result = tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || this.execute(&bytes)),
+        )
         .await;
 
         match result {
@@ -144,5 +172,11 @@ impl SandboxManager {
                 self.config.timeout_secs
             )),
         }
+    }
+}
+
+impl Drop for SandboxManager {
+    fn drop(&mut self) {
+        self._epoch_task.abort();
     }
 }

@@ -28,6 +28,13 @@ fn test_budget_ledger_mode_transitions() {
 }
 
 #[test]
+fn test_budget_ledger_zero_budget_is_normal() {
+    // session_budget == 0 means "no limit configured" — must not trigger Emergency.
+    let ledger = BudgetLedger::default();
+    assert_eq!(ledger.mode(), BudgetMode::Normal);
+}
+
+#[test]
 fn test_turn_serialization_roundtrip() {
     let turn = Turn {
         index: 42,
@@ -43,6 +50,7 @@ fn test_turn_serialization_roundtrip() {
         surprise_signal: None,
         consistency_score: None,
         diff_quality_score: None,
+        persona_disclosure: None,
     };
 
     let serialized = serde_json::to_string(&turn).unwrap();
