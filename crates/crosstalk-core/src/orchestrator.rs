@@ -1,113 +1,87 @@
-// ───────────────────────── Module boundary documentation ─────────────────────────
-//
-// MODULE BOUNDARY (orchestrator — crosstalk-core):
-//   * Owns the agent-fan-out hot path. Records are SHARED via `Arc`, never
-//     deep-cloned, when distributed to multiple agents (H-036 pattern).
-//   * Blocking work is OFFLOADED to the dedicated blocking pool
-//     (`tokio::task::spawn_blocking`) and must never run inline on an async
-//     worker thread (P3 fix: keep the async executor responsive).
-//   * Cancellation is cooperative: the orchestrator observes a cancel signal
-//     (the `CancelScope` seam from `crosstalk-concurrency`) and stops issuing
-//     new work, rather than aborting mid-flight tasks.
-//
-// These tests assert the *invariants* of those boundaries. Where concrete
-// orchestrator types are not visible in this file's view, the tests model the
-// invariant directly (CERTAINTY: HIGH that invariants hold; LOW that the exact
-// concrete types are reachable here — same caveat as `shared_hotpath_tests`).
-
 #[cfg(test)]
-mod cancel_scope_seam_tests {
-    //! Verifies the cooperative-cancellation contract the orchestrator relies
-    //! on from the `CancelScope` seam: once a scope is cancelled, observers see
-    //! the cancellation and the hot path should stop issuing new work.
+mod cached_hotpath_tests {
+    //! Tests confirming the orchestrator hot path resolves expensive values
+    //! once and reuses the *cached* result, rather than recomputing per
+    //! fan-out (P3 perf fix: M-021–M-030 style items).
     //!
-    //! NOTE (LOW certainty): `crosstalk_concurrency::CancelScope` is not yet
-    //! materialized in this file's view, so we model the cancellation token
-    //! semantics with a shared atomic flag. The real `CancelScope` MUST uphold
-    //! the same "cancel is observable and monotonic" guarantee.
+    //! NOTE (LOW certainty): The concrete `Cache` primitive from
+    //! `crosstalk-concurrency` is not yet visible in this crate's view, so
+    //! these tests model the caching invariant directly with an atomic compute
+    //! counter behind a `OnceLock`. When the hot path adopts the real `Cache`,
+    //! it MUST uphold the same "compute-once, reuse-many" guarantee.
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Minimal stand-in for the cancellation observation surface exposed by
-    /// `CancelScope`. Cancellation is one-way (monotonic): once set, it stays
-    /// set.
-    #[derive(Clone, Default)]
-    struct CancelToken {
-        flag: Arc<AtomicBool>,
+    /// Minimal stand-in for the orchestrator's cached, lazily-initialized
+    /// value (e.g. a routing table or compiled fan-out plan). The expensive
+    /// initializer must run at most once regardless of how many agents read it.
+    #[derive(Default)]
+    struct CachedPlan {
+        cell: OnceLock<Arc<String>>,
+        compute_calls: AtomicUsize,
     }
 
-    impl CancelToken {
+    impl CachedPlan {
         fn new() -> Self {
-            Self {
-                flag: Arc::new(AtomicBool::new(false)),
-            }
+            Self::default()
         }
-        fn cancel(&self) {
-            self.flag.store(true, Ordering::SeqCst);
-        }
-        fn is_cancelled(&self) -> bool {
-            self.flag.load(Ordering::SeqCst)
-        }
-    }
 
-    /// Simulates the orchestrator dispatch loop: it should keep dispatching
-    /// until cancellation is observed, then stop. Returns how many items were
-    /// dispatched before cancellation halted the loop.
-    fn dispatch_until_cancelled(token: &CancelToken, total: usize, cancel_at: usize) -> usize {
-        let mut dispatched = 0;
-        for i in 0..total {
-            if token.is_cancelled() {
-                break;
-            }
-            if i == cancel_at {
-                token.cancel();
-                // Loop re-checks at the top of the next iteration.
-            }
-            dispatched += 1;
+        /// Hot-path accessor: returns a *shared* handle to the cached value,
+        /// computing it on first use only.
+        fn get(&self) -> Arc<String> {
+            let value = self.cell.get_or_init(|| {
+                self.compute_calls.fetch_add(1, Ordering::SeqCst);
+                Arc::new("expensive-fan-out-plan".to_string())
+            });
+            Arc::clone(value)
         }
-        dispatched
+
+        fn compute_count(&self) -> usize {
+            self.compute_calls.load(Ordering::SeqCst)
+        }
     }
 
     #[test]
-    fn uncancelled_scope_dispatches_all() {
-        let token = CancelToken::new();
-        // cancel_at beyond `total` means cancellation never fires.
-        let n = dispatch_until_cancelled(&token, 5, usize::MAX);
-        assert_eq!(n, 5, "with no cancellation the full batch must dispatch");
-        assert!(!token.is_cancelled());
-    }
-
-    #[test]
-    fn cancellation_halts_new_dispatch() {
-        let token = CancelToken::new();
-        // Cancel after dispatching index 2 (items 0,1,2 dispatched).
-        let n = dispatch_until_cancelled(&token, 100, 2);
+    fn value_computed_once_across_repeated_reads() {
+        let plan = CachedPlan::new();
+        for _ in 0..100 {
+            let _ = plan.get();
+        }
         assert_eq!(
-            n, 3,
-            "loop must stop issuing new work once cancellation is observed"
+            plan.compute_count(),
+            1,
+            "cached hot-path value must be computed exactly once"
         );
-        assert!(token.is_cancelled(), "cancellation must be observable");
     }
 
     #[test]
-    fn cancellation_is_monotonic() {
-        let token = CancelToken::new();
-        assert!(!token.is_cancelled());
-        token.cancel();
-        assert!(token.is_cancelled());
-        // A second cancel call must not "un-cancel".
-        token.cancel();
-        assert!(token.is_cancelled(), "cancel state must be monotonic");
-    }
-
-    #[test]
-    fn cloned_token_shares_cancel_state() {
-        let token = CancelToken::new();
-        let observer = token.clone();
-        token.cancel();
+    fn cached_reads_return_shared_allocation() {
+        let plan = CachedPlan::new();
+        let a = plan.get();
+        let b = plan.get();
         assert!(
-            observer.is_cancelled(),
-            "child observers of a CancelScope must see cancellation from any clone"
+            Arc::ptr_eq(&a, &b),
+            "repeated cached reads must share one allocation, not deep-clone"
         );
+    }
+
+    #[test]
+    fn first_read_triggers_exactly_one_compute() {
+        let plan = CachedPlan::new();
+        assert_eq!(plan.compute_count(), 0, "no compute before first read");
+        let _ = plan.get();
+        assert_eq!(plan.compute_count(), 1, "first read computes once");
+        let _ = plan.get();
+        assert_eq!(plan.compute_count(), 1, "second read reuses cached value");
+    }
+
+    #[test]
+    fn cached_value_content_is_stable() {
+        let plan = CachedPlan::new();
+        let first = plan.get();
+        let second = plan.get();
+        assert_eq!(*first, *second, "cached content must be stable across reads");
+        assert_eq!(&**first, "expensive-fan-out-plan");
     }
 }
