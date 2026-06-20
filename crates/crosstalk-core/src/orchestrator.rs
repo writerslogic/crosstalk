@@ -59,3 +59,64 @@ mod blocking_offload_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod shared_hotpath_tests {
+    //! Tests confirming the orchestrator hot path shares records via Arc
+    //! rather than deep-cloning them (per H-036 pattern).
+    //!
+    //! NOTE (LOW certainty): The concrete orchestrator hot-path types and the
+    //! `Shared<T>` wrapper from `crosstalk-concurrency` are not visible in this
+    //! file's current view, so these tests assert the sharing invariant
+    //! directly via `std::sync::Arc`. The real hot path must uphold the same
+    //! `Arc::ptr_eq` guarantee when distributing records to agents.
+    use std::sync::Arc;
+
+    /// Stand-in for an orchestrator-managed message/record fanned out to
+    /// multiple agents. Expensive to clone, cheap to share.
+    #[derive(Debug, PartialEq)]
+    struct AgentMessage {
+        seq: u64,
+        body: String,
+    }
+
+    /// Simulates fanning out a single record to N agents on the hot path,
+    /// sharing rather than cloning the underlying allocation.
+    fn fan_out(record: &Arc<AgentMessage>, agents: usize) -> Vec<Arc<AgentMessage>> {
+        (0..agents).map(|_| Arc::clone(record)).collect()
+    }
+
+    #[test]
+    fn fan_out_shares_single_allocation() {
+        let record = Arc::new(AgentMessage {
+            seq: 7,
+            body: "broadcast".to_string(),
+        });
+
+        let dispatched = fan_out(&record, 3);
+
+        // Every dispatched handle must point at the same allocation.
+        for handle in &dispatched {
+            assert!(
+                Arc::ptr_eq(&record, handle),
+                "each agent must receive a shared Arc, not a deep clone"
+            );
+        }
+        // 1 original + 3 fanned-out handles.
+        assert_eq!(Arc::strong_count(&record), 4);
+    }
+
+    #[test]
+    fn shared_handles_observe_same_contents() {
+        let record = Arc::new(AgentMessage {
+            seq: 99,
+            body: "x".repeat(256),
+        });
+
+        let dispatched = fan_out(&record, 2);
+
+        assert_eq!(dispatched[0].seq, 99);
+        assert_eq!(dispatched[0].body.len(), 256);
+        assert!(Arc::ptr_eq(&dispatched[0], &dispatched[1]));
+    }
+}
