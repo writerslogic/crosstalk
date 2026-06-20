@@ -620,3 +620,44 @@ fn no_python_artifacts_produces_no_py_compile() {
 
     assert!(tool_sets.is_empty());
 }
+
+// --- H-019: concurrent MCP tool calls must not serialize on the gateway lock ---
+
+// Mirrors `Orchestrator::tool_call`: authorize under the gateway lock, release
+// the lock, then run the tool. Two 300ms tool calls issued concurrently must
+// finish in ~300ms (overlapped), not ~600ms (serialized). `sleep` is Unix-only.
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_tool_calls_do_not_serialize_on_gateway_lock() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::Mutex;
+
+    let gateway = {
+        let mut g = McpGateway::new();
+        g.register_tool(make_tool("sleep"));
+        g.permissions
+            .tiers
+            .insert("agent".to_string(), PermissionTier::Full);
+        Arc::new(Mutex::new(g))
+    };
+
+    async fn one_call(gateway: Arc<Mutex<McpGateway>>) -> anyhow::Result<serde_json::Value> {
+        // Authorize under the lock (fast, in-memory), then drop it before exec.
+        let authorized = {
+            let mut g = gateway.lock().await;
+            g.authorize_tool_call("agent", "sleep", &serde_json::json!({ "args": ["0.3"] }))?
+        };
+        McpGateway::execute_authorized(authorized).await
+    }
+
+    let start = Instant::now();
+    let (a, b) = tokio::join!(one_call(gateway.clone()), one_call(gateway.clone()));
+    let elapsed = start.elapsed();
+
+    assert!(a.is_ok() && b.is_ok(), "both tool calls should succeed");
+    assert!(
+        elapsed < Duration::from_millis(550),
+        "concurrent tool calls serialized on the gateway lock (took {elapsed:?}, expected ~300ms)"
+    );
+}
