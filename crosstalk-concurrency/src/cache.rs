@@ -1,3 +1,114 @@
+//! A single moka-backed async cache primitive.
+//!
+//! This addresses H-033 and H-050: both `embed_text()` and metacognition
+//! embeddings route through one shared cache instance with `get_or_insert_async`.
+
+use std::future::Future;
+use std::hash::Hash;
+use std::time::Duration;
+
+use moka::future::Cache as MokaCache;
+
+/// Configuration for constructing a [`Cache`].
+// CERTAIN: A small config struct keeps capacity/TTL configurable without
+// proliferating constructor overloads.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheConfig {
+    /// Maximum number of entries the cache may hold.
+    pub capacity: u64,
+    /// Optional time-to-live for entries. `None` disables TTL expiry.
+    pub ttl: Option<Duration>,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        // CERTAIN: Reasonable defaults; callers may override.
+        Self {
+            capacity: 10_000,
+            ttl: Some(Duration::from_secs(3600)),
+        }
+    }
+}
+
+/// An async, concurrent cache with `get_or_insert_async` semantics.
+///
+/// `K` and `V` are constrained to satisfy moka's `future::Cache` bounds.
+// CERTAIN: moka requires Send + Sync + 'static for both key and value, plus
+// Hash + Eq for the key and Clone for the value.
+#[derive(Clone)]
+pub struct Cache<K, V>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    inner: MokaCache<K, V>,
+}
+
+impl<K, V> Cache<K, V>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// Construct a cache with the given configuration.
+    pub fn new(config: CacheConfig) -> Self {
+        let mut builder = MokaCache::builder().max_capacity(config.capacity);
+        if let Some(ttl) = config.ttl {
+            builder = builder.time_to_live(ttl);
+        }
+        Self {
+            inner: builder.build(),
+        }
+    }
+
+    /// Construct a cache with explicit capacity and TTL.
+    pub fn with_capacity_and_ttl(capacity: u64, ttl: Option<Duration>) -> Self {
+        Self::new(CacheConfig { capacity, ttl })
+    }
+
+    /// Get the value for `key`, computing and inserting it via `init` if absent.
+    ///
+    /// The `init` future is only awaited on a cache miss. moka ensures only
+    /// one concurrent initialization per key.
+    pub async fn get_or_insert_async<F, Fut>(&self, key: K, init: F) -> V
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = V>,
+    {
+        self.inner.get_with(key, init()).await
+    }
+
+    /// Fetch a value if present without inserting.
+    pub async fn get(&self, key: &K) -> Option<V> {
+        self.inner.get(key).await
+    }
+
+    /// Insert a value directly.
+    pub async fn insert(&self, key: K, value: V) {
+        self.inner.insert(key, value).await;
+    }
+
+    /// Invalidate a single entry.
+    pub async fn invalidate(&self, key: &K) {
+        self.inner.invalidate(key).await;
+    }
+
+    /// Approximate number of entries currently in the cache.
+    pub fn entry_count(&self) -> u64 {
+        self.inner.entry_count()
+    }
+}
+
+impl<K, V> Default for Cache<K, V>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    fn default() -> Self {
+        Self::new(CacheConfig::default())
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -18,6 +18,7 @@ chrono = "0.4.39"
 clap = { version = "4.6.0", features = ["derive"] }
 clap_complete = "4.5.44"
 crossbeam = "0.8.4"
+crosstalk-concurrency = { path = "crosstalk-concurrency" }
 crossterm = "0.29.0"
 dotenv = "0.15.0"
 ed25519-dalek = "2.1.1"

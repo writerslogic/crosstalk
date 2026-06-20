@@ -1,3 +1,105 @@
+//! Cancellation token primitives.
+//!
+//! Provides [`CancelScope`], a structured-concurrency helper that wraps a
+//! [`CancellationToken`] together with a [`TaskTracker`]. All background work
+//! is expected to be spawned through [`CancelScope::spawn`], which guarantees
+//! that the scope can be shut down gracefully — cancelling the token and then
+//! waiting for every tracked task to complete.
+//!
+//! Addresses H-040 (structured shutdown of background work) and partially
+//! H-038 (cancellation propagation).
+
+use std::future::Future;
+
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+
+/// A structured cancellation scope.
+///
+/// `CancelScope` couples a [`CancellationToken`] with a [`TaskTracker`] so that
+/// all background tasks spawned via [`CancelScope::spawn`] can be cancelled and
+/// awaited together. This guarantees structured shutdown: once
+/// [`CancelScope::shutdown_graceful`] returns, no tracked task is still running.
+///
+/// Cloning a `CancelScope` yields a handle to the *same* underlying token and
+/// tracker, so cancellation and tracking are shared across clones.
+#[derive(Clone, Debug)]
+pub struct CancelScope {
+    token: CancellationToken,
+    tracker: TaskTracker,
+}
+
+impl CancelScope {
+    /// Create a new, empty cancellation scope with a fresh token and tracker.
+    pub fn new() -> Self {
+        Self {
+            token: CancellationToken::new(),
+            tracker: TaskTracker::new(),
+        }
+    }
+
+    /// Create a child scope whose token is derived from this scope's token.
+    ///
+    /// Cancelling the parent cancels the child, but cancelling the child does
+    /// not affect the parent. The child uses its own [`TaskTracker`].
+    pub fn child(&self) -> Self {
+        Self {
+            token: self.token.child_token(),
+            tracker: TaskTracker::new(),
+        }
+    }
+
+    /// Return a clone of the underlying [`CancellationToken`].
+    ///
+    /// Tasks can use this to observe cancellation, e.g. via
+    /// [`CancellationToken::cancelled`].
+    pub fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+
+    /// Returns `true` if this scope's token has been cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    /// Cancel the scope's token without waiting for tasks to finish.
+    pub fn cancel(&self) {
+        self.token.cancel();
+    }
+
+    /// Spawn a future onto the Tokio runtime, tracked by this scope.
+    ///
+    /// The returned [`JoinHandle`] can be used to await the individual task,
+    /// but tasks are also collectively awaited by
+    /// [`CancelScope::shutdown_graceful`].
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.tracker.spawn(future)
+    }
+
+    /// Gracefully shut down the scope.
+    ///
+    /// This cancels the token (signalling all cooperating tasks to stop),
+    /// closes the tracker so no further tasks can be spawned, and then waits
+    /// for every tracked task to complete.
+    pub async fn shutdown_graceful(&self) {
+        self.token.cancel();
+        self.tracker.close();
+        self.tracker.wait().await;
+    }
+}
+
+impl Default for CancelScope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -30,12 +30,10 @@ mod tests {
     #[test]
     fn modules_are_declared() {
         // Reference the module paths to ensure they exist at compile time.
-        // These are no-op uses; the assertion documents intent.
-        let _ = stringify!(cache);
-        let _ = stringify!(cancel);
-        let _ = stringify!(executor);
-        let _ = stringify!(sharded);
-        assert!(true);
+        assert_eq!(stringify!(cache), "cache");
+        assert_eq!(stringify!(cancel), "cancel");
+        assert_eq!(stringify!(executor), "executor");
+        assert_eq!(stringify!(sharded), "sharded");
     }
 
     // CERTAIN: The re-export resolves, confirming CancelScope is part of the

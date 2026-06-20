@@ -1889,6 +1889,7 @@ dependencies = [
  "clap_complete",
  "criterion",
  "crossbeam",
+ "crosstalk-concurrency",
  "crossterm",
  "dashmap",
  "dotenv",
@@ -1943,6 +1944,7 @@ dependencies = [
  "moka",
  "rustc-hash 2.1.2",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -8766,6 +8768,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
