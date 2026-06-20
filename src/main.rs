@@ -11,6 +11,7 @@ use crosstalk::ui::app::App;
 use crosstalk::ui::events::{self as ui_events, Action};
 use crosstalk::ui::model_select;
 use crosstalk::ui::render;
+use crosstalk_concurrency::CancelScope;
 use crossterm::ExecutableCommand;
 use crossterm::cursor::MoveTo;
 use crossterm::terminal::{
@@ -183,15 +184,14 @@ fn is_likely_text(path: &std::path::Path) -> bool {
     })
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Load ~/.env then .env (project-local), silently ignoring missing files.
-    if let Ok(home) = std::env::var("HOME") {
-        let _ = dotenv::from_path(std::path::Path::new(&home).join(".env"));
-    }
-    let _ = dotenv::dotenv();
-
-    // 0. Initialize structured logging -- rotate, keeping last 5 logs
+/// Initialize structured logging: create the log directory, rotate to the 5
+/// most recent logs, and install a non-blocking file subscriber.
+///
+/// Returns the worker guard (which must be kept alive for the process lifetime
+/// so buffered logs are flushed on shutdown), the path of the active log file,
+/// and the run timestamp (reused as the default session id).
+fn init_logging()
+-> anyhow::Result<(tracing_appender::non_blocking::WorkerGuard, std::path::PathBuf, String)> {
     let log_dir = std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| {
         std::env::var("HOME")
             .map(|h| format!("{h}/.local/state"))
@@ -217,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
     let run_ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let run_log = std::path::PathBuf::from(&log_path).join(format!("crosstalk-{run_ts}.log"));
     let log_file = std::fs::File::create(&run_log)?;
-    let (non_blocking, _guard) = tracing_appender::non_blocking(log_file);
+    let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -226,6 +226,96 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(non_blocking)
         .with_ansi(false)
         .init();
+    Ok((guard, run_log, run_ts))
+}
+
+/// Drive the background orchestrator loop: run turns until convergence, the
+/// iteration cap, an unrecoverable error, or cancellation. Spawned (and later
+/// drained) by the caller's [`CancelScope`]; checks `cancel` before each turn
+/// so a shutdown takes effect at the next turn boundary.
+async fn run_orchestrator_loop(
+    app: Arc<Mutex<App>>,
+    sigma: Arc<Mutex<ConversationState>>,
+    omicron: Arc<Orchestrator>,
+    iterations: u32,
+    turn_timeout: Duration,
+    cancel: CancelScope,
+) {
+    let mut i = 0u32;
+    loop {
+        if cancel.is_cancelled() || app.lock().await.shutdown {
+            break;
+        }
+        let sigma_in = Arc::clone(&sigma);
+        let omicron_in = Arc::clone(&omicron);
+        let join = tokio::task::spawn(async move { omicron_in.run_turn(sigma_in).await });
+        let res = match tokio::time::timeout(turn_timeout, join).await {
+            Err(_elapsed) => {
+                let mut a = app.lock().await;
+                a.push_event(format!(
+                    "Turn {} timed out after {}s",
+                    i + 1,
+                    turn_timeout.as_secs()
+                ));
+                drop(a);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if iterations > 0 && i >= iterations {
+                    break;
+                }
+                continue;
+            }
+            Ok(r) => r,
+        };
+
+        match res {
+            Ok(Ok(optimal)) => {
+                i += 1;
+                if optimal {
+                    let mut a = app.lock().await;
+                    a.push_event(format!("Converged after {} turn(s)", i));
+                    break;
+                }
+                if iterations > 0 && i >= iterations {
+                    let mut a = app.lock().await;
+                    a.push_event(format!("Completed {} iteration(s)", i));
+                    break;
+                }
+                let session_id = sigma.lock().await.session_id.clone();
+                Orchestrator::git_commit_session(&omicron.file_writer.root, &session_id, i).await;
+            }
+            Ok(Err(e)) => {
+                let mut app_err = app.lock().await;
+                app_err.push_event(format!("Turn {} error: {}", i + 1, e));
+                drop(app_err);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if iterations > 0 && i >= iterations {
+                    break;
+                }
+            }
+            Err(e) => {
+                let mut app_err = app.lock().await;
+                app_err.push_event(format!("Turn {} panic: {}", i + 1, e));
+                drop(app_err);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                break;
+            }
+        }
+    }
+    let mut a = app.lock().await;
+    a.push_event("Session ending...".to_string());
+    a.shutdown = true;
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Load ~/.env then .env (project-local), silently ignoring missing files.
+    if let Ok(home) = std::env::var("HOME") {
+        let _ = dotenv::from_path(std::path::Path::new(&home).join(".env"));
+    }
+    let _ = dotenv::dotenv();
+
+    // 0. Initialize structured logging -- rotate, keeping last 5 logs
+    let (_guard, run_log, run_ts) = init_logging()?;
 
     tracing::info!("crosstalk session starting");
 
@@ -574,76 +664,17 @@ async fn main() -> anyhow::Result<()> {
     let turn_timeout = Duration::from_secs(timeout_secs);
     let omicron_orch = Arc::new(omicron);
     let omicron_spawn = Arc::clone(&omicron_orch);
-    tokio::spawn(async move {
-        let mut i = 0u32;
-        loop {
-            if app_orch.lock().await.shutdown {
-                break;
-            }
-            let sigma_in = Arc::clone(&sigma_orch);
-            let omicron_in = Arc::clone(&omicron_spawn);
-            let join = tokio::task::spawn(async move { omicron_in.run_turn(sigma_in).await });
-            let res = match tokio::time::timeout(turn_timeout, join).await {
-                Err(_elapsed) => {
-                    let mut a = app_orch.lock().await;
-                    a.push_event(format!(
-                        "Turn {} timed out after {}s",
-                        i + 1,
-                        turn_timeout.as_secs()
-                    ));
-                    drop(a);
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    if iterations > 0 && i >= iterations {
-                        break;
-                    }
-                    continue;
-                }
-                Ok(r) => r,
-            };
-
-            match res {
-                Ok(Ok(optimal)) => {
-                    i += 1;
-                    if optimal {
-                        let mut a = app_orch.lock().await;
-                        a.push_event(format!("Converged after {} turn(s)", i));
-                        break;
-                    }
-                    if iterations > 0 && i >= iterations {
-                        let mut a = app_orch.lock().await;
-                        a.push_event(format!("Completed {} iteration(s)", i));
-                        break;
-                    }
-                    let session_id = sigma_orch.lock().await.session_id.clone();
-                    Orchestrator::git_commit_session(
-                        &omicron_spawn.file_writer.root,
-                        &session_id,
-                        i,
-                    )
-                    .await;
-                }
-                Ok(Err(e)) => {
-                    let mut app_err = app_orch.lock().await;
-                    app_err.push_event(format!("Turn {} error: {}", i + 1, e));
-                    drop(app_err);
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    if iterations > 0 && i >= iterations {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    let mut app_err = app_orch.lock().await;
-                    app_err.push_event(format!("Turn {} panic: {}", i + 1, e));
-                    drop(app_err);
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    break;
-                }
-            }
-        }
-        let mut a = app_orch.lock().await;
-        a.push_event("Session ending...".to_string());
-        a.shutdown = true;
-    });
+    // Structured cancellation for the background orchestrator loop so it can be
+    // drained gracefully on shutdown instead of being dropped mid-turn (H-040).
+    let cancel_scope = CancelScope::new();
+    cancel_scope.spawn(run_orchestrator_loop(
+        app_orch,
+        sigma_orch,
+        omicron_spawn,
+        iterations,
+        turn_timeout,
+        cancel_scope.clone(),
+    ));
 
     let mut event_rx = event_rx;
     let ctrl_tx = control_tx;
@@ -728,6 +759,17 @@ async fn main() -> anyhow::Result<()> {
 
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
+
+    // Drain the background orchestrator loop before finalizing so no turn is
+    // mid-write. Bounded so shutdown can never hang on an in-flight turn.
+    app.lock().await.shutdown = true;
+    cancel_scope.cancel();
+    if tokio::time::timeout(Duration::from_secs(5), cancel_scope.shutdown_graceful())
+        .await
+        .is_err()
+    {
+        tracing::warn!("background orchestrator did not drain within 5s; proceeding with shutdown");
+    }
 
     // Graceful shutdown: finalize session, persist memory, shut down orchestrator.
     log_warn!(
