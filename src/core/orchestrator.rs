@@ -4210,7 +4210,13 @@ impl Orchestrator {
                     Ok(()) => {
                         if let Ok(canonical_target) = target.canonicalize() {
                             if !canonical_target.starts_with(&canonical_root) {
-                                let _ = tokio::fs::remove_file(&target).await;
+                                if let Err(e) = tokio::fs::remove_file(&target).await {
+                                    tracing::error!(
+                                        path = %target.display(),
+                                        err = %e,
+                                        "failed to remove workspace-escaping file; it may persist on disk"
+                                    );
+                                }
                                 return "[write_file] Path escapes workspace after resolution"
                                     .to_string();
                             }
