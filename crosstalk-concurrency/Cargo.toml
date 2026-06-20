@@ -1,0 +1,13 @@
+[package]
+name = "crosstalk-concurrency"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+
+[dependencies]
+anyhow = "1.0.102"
+arc-swap = "1.7"
+lru = "0.12"
+moka = { version = "0.12", features = ["future"] }
+rustc-hash = "2.0.0"
+tokio = { version = "1.51.0", features = ["full"] }

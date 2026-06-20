@@ -1,0 +1,1 @@
+//! Cancellation token primitives (placeholder).

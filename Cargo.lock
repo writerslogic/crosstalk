@@ -1934,6 +1934,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "crosstalk-concurrency"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "lru 0.12.5",
+ "moka",
+ "rustc-hash 2.1.2",
+ "tokio",
+]
+
+[[package]]
 name = "crosstalk-eval"
 version = "0.1.0"
 dependencies = [
