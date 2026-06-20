@@ -1,104 +1,3 @@
-//! Cancellation token primitives.
-//!
-//! Provides [`CancelScope`], a structured-concurrency helper that wraps a
-//! [`CancellationToken`] together with a [`TaskTracker`]. All background work
-//! is expected to be spawned through [`CancelScope::spawn`], which guarantees
-//! that the scope can be shut down gracefully — cancelling the token and then
-//! waiting for every tracked task to complete.
-//!
-//! Addresses H-040 (structured shutdown of background work) and partially
-//! H-038 (cancellation propagation).
-
-use std::future::Future;
-
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
-
-/// A structured cancellation scope.
-///
-/// `CancelScope` couples a [`CancellationToken`] with a [`TaskTracker`] so that
-/// all background tasks spawned via [`CancelScope::spawn`] can be cancelled and
-/// awaited together. This guarantees structured shutdown: once
-/// [`CancelScope::shutdown_graceful`] returns, no tracked task is still running.
-///
-/// Cloning a `CancelScope` yields a handle to the *same* underlying token and
-/// tracker, so cancellation and tracking are shared across clones.
-#[derive(Clone, Debug)]
-pub struct CancelScope {
-    token: CancellationToken,
-    tracker: TaskTracker,
-}
-
-impl CancelScope {
-    /// Create a new, empty cancellation scope with a fresh token and tracker.
-    pub fn new() -> Self {
-        Self {
-            token: CancellationToken::new(),
-            tracker: TaskTracker::new(),
-        }
-    }
-
-    /// Create a child scope whose token is derived from this scope's token.
-    ///
-    /// Cancelling the parent cancels the child, but cancelling the child does
-    /// not affect the parent. The child uses its own [`TaskTracker`].
-    pub fn child(&self) -> Self {
-        Self {
-            token: self.token.child_token(),
-            tracker: TaskTracker::new(),
-        }
-    }
-
-    /// Return a clone of the underlying [`CancellationToken`].
-    ///
-    /// Tasks can use this to observe cancellation, e.g. via
-    /// [`CancellationToken::cancelled`].
-    pub fn token(&self) -> CancellationToken {
-        self.token.clone()
-    }
-
-    /// Returns `true` if this scope's token has been cancelled.
-    pub fn is_cancelled(&self) -> bool {
-        self.token.is_cancelled()
-    }
-
-    /// Cancel the scope's token without waiting for tasks to finish.
-    pub fn cancel(&self) {
-        self.token.cancel();
-    }
-
-    /// Spawn a future onto the Tokio runtime, tracked by this scope.
-    ///
-    /// The returned [`JoinHandle`] can be used to await the individual task,
-    /// but tasks are also collectively awaited by
-    /// [`CancelScope::shutdown_graceful`].
-    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        self.tracker.spawn(future)
-    }
-
-    /// Gracefully shut down the scope.
-    ///
-    /// This cancels the token (signalling all cooperating tasks to stop),
-    /// closes the tracker so no further tasks can be spawned, and then waits
-    /// for every tracked task to complete.
-    pub async fn shutdown_graceful(&self) {
-        self.token.cancel();
-        self.tracker.close();
-        self.tracker.wait().await;
-    }
-}
-
-impl Default for CancelScope {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +151,105 @@ mod tests {
         // task spawned on the clone because the tracker is shared.
         scope.shutdown_graceful().await;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    // CERTAIN: Cancellation propagates into multiple in-flight spawned tasks.
+    // Each task loops cooperatively until it observes cancellation, then
+    // records that it noticed. shutdown_graceful must let them all finish.
+    #[tokio::test]
+    async fn cancel_propagates_to_all_spawned_tasks() {
+        let scope = CancelScope::new();
+        let noticed = Arc::new(AtomicUsize::new(0));
+
+        const N: usize = 16;
+        for _ in 0..N {
+            let token = scope.token();
+            let n = Arc::clone(&noticed);
+            scope.spawn(async move {
+                // Cooperative loop: keep working until the token fires.
+                loop {
+                    tokio::select! {
+                        _ = token.cancelled() => {
+                            n.fetch_add(1, Ordering::SeqCst);
+                            break;
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                            // simulate work
+                        }
+                    }
+                }
+            });
+        }
+
+        // No task should have observed cancellation yet.
+        assert_eq!(noticed.load(Ordering::SeqCst), 0);
+
+        // Trigger cancellation and wait for all tasks to wind down.
+        scope.shutdown_graceful().await;
+
+        // Every task must have observed the cancellation signal.
+        assert_eq!(noticed.load(Ordering::SeqCst), N);
+        assert!(scope.is_cancelled());
+    }
+
+    // CERTAIN: No tracked task outlives the scope's graceful shutdown.
+    // We use a guard whose Drop increments a counter; after
+    // shutdown_graceful returns, all guards must have been dropped,
+    // proving the tasks fully completed (and did not outlive the scope).
+    #[tokio::test]
+    async fn no_task_outlives_scope_after_cancel_shutdown() {
+        struct DropGuard(Arc<AtomicUsize>);
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let scope = CancelScope::new();
+        let dropped = Arc::new(AtomicUsize::new(0));
+
+        const N: usize = 10;
+        for _ in 0..N {
+            let token = scope.token();
+            let guard = DropGuard(Arc::clone(&dropped));
+            scope.spawn(async move {
+                // Move the guard into the task so its lifetime is bound
+                // to the task. It is dropped exactly when the task ends.
+                let _g = guard;
+                token.cancelled().await;
+            });
+        }
+
+        // While tasks are alive and waiting, no guard has dropped.
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+
+        scope.shutdown_graceful().await;
+
+        // After graceful shutdown, every task ended -> every guard dropped.
+        // This proves no spawned task is still running past the scope.
+        assert_eq!(dropped.load(Ordering::SeqCst), N);
+    }
+
+    // CERTAIN: A child scope can be shut down independently; its tasks
+    // observe the child's cancellation and complete before shutdown returns.
+    #[tokio::test]
+    async fn child_scope_cancel_shutdown_completes_tasks() {
+        let parent = CancelScope::new();
+        let child = parent.child();
+        let done = Arc::new(AtomicUsize::new(0));
+
+        let token = child.token();
+        let d = Arc::clone(&done);
+        child.spawn(async move {
+            token.cancelled().await;
+            d.fetch_add(1, Ordering::SeqCst);
+        });
+
+        child.shutdown_graceful().await;
+
+        assert_eq!(done.load(Ordering::SeqCst), 1);
+        assert!(child.is_cancelled());
+        // The parent must remain unaffected by the child's shutdown.
+        assert!(!parent.is_cancelled());
     }
 }
