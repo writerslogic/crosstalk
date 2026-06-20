@@ -9,6 +9,9 @@ pub mod cancel;
 pub mod executor;
 pub mod sharded;
 
+// CERTAIN: Re-export the primary cancellation type for ergonomic access.
+pub use cancel::CancelScope;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -24,5 +27,13 @@ mod tests {
         let _ = stringify!(executor);
         let _ = stringify!(sharded);
         assert!(true);
+    }
+
+    // CERTAIN: The re-export resolves, confirming CancelScope is part of the
+    // crate's public API.
+    #[test]
+    fn cancel_scope_is_reexported() {
+        let _scope = CancelScope::new();
+        assert!(!_scope.is_cancelled());
     }
 }
