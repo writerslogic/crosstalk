@@ -208,33 +208,9 @@ impl Orchestrator {
                 }
             }
             "shell_exec" => {
-                const ALLOWED_PREFIXES: &[&str] = &[
-                    "git log",
-                    "git status",
-                    "git diff",
-                    "git show",
-                    "cargo check",
-                    "cargo test",
-                    "cargo clippy",
-                    "ls ",
-                    "cat ",
-                    "head ",
-                    "tail ",
-                    "wc ",
-                    "grep ",
-                    "find ",
-                    "diff ",
-                    "file ",
-                ];
                 let trimmed = args.trim();
-                if !ALLOWED_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
-                    return format!("[shell_exec] Command not in whitelist: {trimmed}");
-                }
-                const INJECTION_CHARS: &[char] = &[';', '|', '&', '$', '`', '>', '<', '(', ')'];
-                if trimmed.contains(INJECTION_CHARS) {
-                    return format!(
-                        "[shell_exec] Command contains disallowed characters: {trimmed}"
-                    );
+                if let Err(msg) = validate_shell_exec(trimmed) {
+                    return format!("[shell_exec] {msg}");
                 }
                 let cwd = self.file_writer.root.as_path();
                 match tokio::time::timeout(
@@ -510,4 +486,101 @@ impl Orchestrator {
         artifacts
     }
 
+}
+
+/// Validate a `shell_exec` directive: it must be an allowlisted read-only
+/// command, free of shell metacharacters and control characters, with every
+/// path argument confined to the workspace (no absolute paths, `~` home
+/// expansion, or `..` traversal). `find` is intentionally excluded because its
+/// `-delete`/`-exec` flags make it destructive even when path-confined.
+///
+/// Returns `Err(reason)` describing the first violation, or `Ok(())` if safe.
+fn validate_shell_exec(trimmed: &str) -> Result<(), String> {
+    const ALLOWED_PREFIXES: &[&str] = &[
+        "git log",
+        "git status",
+        "git diff",
+        "git show",
+        "cargo check",
+        "cargo test",
+        "cargo clippy",
+        "ls ",
+        "cat ",
+        "head ",
+        "tail ",
+        "wc ",
+        "grep ",
+        "diff ",
+        "file ",
+    ];
+    if !ALLOWED_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+        return Err(format!("Command not in whitelist: {trimmed}"));
+    }
+    const INJECTION_CHARS: &[char] = &[';', '|', '&', '$', '`', '>', '<', '(', ')'];
+    if trimmed.contains(INJECTION_CHARS) {
+        return Err(format!("Command contains disallowed characters: {trimmed}"));
+    }
+    // Newlines/tabs/etc. would let `sh -c` run additional commands; reject them
+    // regardless of how the caller assembled the args.
+    if trimmed.contains(|c: char| c.is_control()) {
+        return Err(format!("Command contains control characters: {trimmed}"));
+    }
+    // Confine every path argument to the workspace: no absolute paths, no home
+    // expansion, no parent-dir traversal. Flags (`-r`, `--name`) and relative
+    // paths/globs are allowed.
+    for tok in trimmed.split_whitespace() {
+        if tok.starts_with('/') || tok.starts_with('~') || tok.split('/').any(|c| c == "..") {
+            return Err(format!("Path argument escapes the workspace: {tok}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod shell_exec_validation_tests {
+    use super::validate_shell_exec;
+
+    #[test]
+    fn allows_workspace_relative_read_commands() {
+        assert!(validate_shell_exec("cat src/main.rs").is_ok());
+        assert!(validate_shell_exec("grep -r needle src/").is_ok());
+        assert!(validate_shell_exec("git log").is_ok());
+        assert!(validate_shell_exec("cargo test --lib").is_ok());
+        assert!(validate_shell_exec("ls ./crates").is_ok());
+    }
+
+    #[test]
+    fn rejects_non_whitelisted_commands() {
+        assert!(validate_shell_exec("rm -rf src").is_err());
+        assert!(validate_shell_exec("curl http://x").is_err());
+    }
+
+    #[test]
+    fn rejects_shell_metacharacter_chaining() {
+        assert!(validate_shell_exec("git log; rm -rf /").is_err());
+        assert!(validate_shell_exec("cat x && cat y").is_err());
+        assert!(validate_shell_exec("grep x file | sh").is_err());
+        assert!(validate_shell_exec("cat $(secret)").is_err());
+    }
+
+    #[test]
+    fn rejects_control_character_injection() {
+        assert!(validate_shell_exec("git log\nrm -rf /").is_err());
+        assert!(validate_shell_exec("cat x\ty").is_err());
+    }
+
+    #[test]
+    fn rejects_paths_outside_workspace() {
+        assert!(validate_shell_exec("cat /etc/passwd").is_err());
+        assert!(validate_shell_exec("cat ~/.ssh/id_rsa").is_err());
+        assert!(validate_shell_exec("cat ../../etc/passwd").is_err());
+        assert!(validate_shell_exec("grep secret /var/log/auth.log").is_err());
+        assert!(validate_shell_exec("cat src/../../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn rejects_destructive_find() {
+        // `find` is no longer whitelisted (was destructive via -delete/-exec).
+        assert!(validate_shell_exec("find . -delete").is_err());
+    }
 }
