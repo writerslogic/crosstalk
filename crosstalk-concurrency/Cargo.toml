@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.91"
 description = "Cancellation primitives for Crosstalk's concurrent orchestration"
 authors = ["David Condrey <david@writerslogic.com>"]
-license = "AGPL-3.0-only"
+license = "Apache-2.0"
 
 [dependencies]
 tokio = { version = "1.51.0", features = ["full"] }

@@ -11,7 +11,7 @@
   <a href="https://github.com/writerslogic/crosstalk/actions/workflows/ci.yml"><img src="https://github.com/writerslogic/crosstalk/actions/workflows/ci.yml/badge.svg" alt="Build Status"></a>
   <img src="https://img.shields.io/badge/rust-1.91%2B-orange" alt="Rust">
   <img src="https://img.shields.io/badge/edition-2024-orange" alt="Edition 2024">
-  <a href="https://github.com/writerslogic/crosstalk/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--only-blue" alt="License"></a>
+  <a href="https://github.com/writerslogic/crosstalk/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
 </p>
 
 ---
@@ -183,4 +183,4 @@ open a public issue for security reports.
 
 ## License
 
-AGPL-3.0-only &copy; [WritersLogic, Inc.](https://github.com/writerslogic)
+Apache-2.0 &copy; [WritersLogic, Inc.](https://github.com/writerslogic)

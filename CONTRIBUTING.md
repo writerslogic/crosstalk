@@ -66,7 +66,7 @@ sandbox (`src/engines/sandbox.rs`) warrant extra care:
 
 ## License and Contributor Agreement
 
-Crosstalk is licensed under [AGPL-3.0-only](LICENSE). By contributing, you agree
+Crosstalk is licensed under [Apache-2.0](LICENSE). By contributing, you agree
 that your contributions are licensed under the same terms.
 
 For questions about the contributor agreement, contact: admin@writerslogic.com

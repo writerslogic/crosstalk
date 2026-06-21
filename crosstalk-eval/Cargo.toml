@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.91"
 description = "Benchmarking harness for Crosstalk UCB1 topology selection (arXiv companion)"
 authors = ["David Condrey <david@writerslogic.com>"]
-license = "AGPL-3.0-only"
+license = "Apache-2.0"
 
 # NOTE: This crate intentionally does NOT depend on the `crosstalk` crate to
 # keep compilation fast. Key domain types (BudgetMode, DebateTopology, etc.)
