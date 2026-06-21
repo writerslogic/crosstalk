@@ -9,6 +9,21 @@ __pycache__/
 # Internal orchestration scaffolding (not part of the published product)
 .orchestrator/
 conductor/
+/devplan/
+project.yaml
+inventory.json
+implement_tracks.py
+SPEC.md
+PACKAGING.md
+todo.md
+
+# Runtime state, caches, datasets, and model artifacts (regenerated/downloaded)
+.crosstalk/
+.fastembed_cache/
+/data/
+/models/
+/results/
+/repo/
 
 # Stray local artifacts
 .DS_Store
