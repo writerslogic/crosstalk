@@ -283,8 +283,17 @@ async fn run_orchestrator_loop(
                     a.push_event(format!("Completed {} iteration(s)", i));
                     break;
                 }
-                let session_id = sigma.lock().await.session_id.clone();
-                Orchestrator::git_commit_session(&omicron.file_writer.root, &session_id, i).await;
+                let (session_id, chain_head) = {
+                    let s = sigma.lock().await;
+                    (s.session_id.clone(), s.chain_head_hex())
+                };
+                Orchestrator::git_commit_session(
+                    &omicron.file_writer.root,
+                    &session_id,
+                    i,
+                    &chain_head,
+                )
+                .await;
             }
             Ok(Err(e)) => {
                 let mut app_err = app.lock().await;
@@ -517,6 +526,22 @@ async fn main() -> anyhow::Result<()> {
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(error = %e, "could not load pinned signing identity to verify restored turns");
+            }
+        }
+
+        // Independent of signatures: verify the transcript hash chain. This
+        // catches reordering/insertion/deletion of turns and needs no key.
+        let s = sigma.lock().await;
+        match s.verify_chain() {
+            Some(idx) => tracing::warn!(
+                session = %session_id,
+                turn = idx,
+                "restored transcript hash chain is broken; turns may have been reordered or altered"
+            ),
+            None => {
+                if !s.turn_hashes.is_empty() {
+                    tracing::info!(session = %session_id, "restored transcript hash chain intact");
+                }
             }
         }
     }

@@ -3,6 +3,7 @@ use crate::types::compute::BudgetLedger;
 use crate::types::fiduciary::PersonaDisclosure;
 use crate::types::planning::GoalTree;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -112,6 +113,13 @@ fn default_outcome() -> TurnOutcome {
     TurnOutcome::Unknown
 }
 
+/// SHA-256 over a turn's canonical serialization (content, metadata, and
+/// signature). Field order is fixed by the struct, so the digest is stable.
+fn turn_content_hash(turn: &Turn) -> [u8; 32] {
+    let bytes = serde_json::to_vec(turn).unwrap_or_default();
+    sha2::Sha256::digest(bytes).into()
+}
+
 /// Full mutable state of a running session, persisted to Sled on every checkpoint.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ConversationState {
@@ -145,6 +153,12 @@ pub struct ConversationState {
     pub rejection_loop_active: bool,
     #[serde(default)]
     pub mode_active_turns: u32,
+    /// Running hash chain over `turns`: `turn_hashes[i]` commits to
+    /// `turn_hashes[i-1]` and the content of `turns[i]`, so any edit,
+    /// reorder, insertion, or deletion within the retained window is
+    /// detectable without a secret key. Maintained in lockstep by `push_turn`.
+    #[serde(default)]
+    pub turn_hashes: Vec<Vec<u8>>,
 }
 
 impl ConversationState {
@@ -167,6 +181,7 @@ impl ConversationState {
             last_tool_outputs: Vec::new(),
             rejection_loop_active: false,
             mode_active_turns: 0,
+            turn_hashes: Vec::new(),
         }
     }
 
@@ -204,10 +219,55 @@ impl ConversationState {
 
     pub fn push_turn(&mut self, turn: Turn) {
         const MAX_TURNS: usize = 200;
+        // Extend the tamper-evident hash chain before appending the turn.
+        let mut hasher = sha2::Sha256::new();
+        if let Some(prev) = self.turn_hashes.last() {
+            hasher.update(prev);
+        }
+        hasher.update(turn_content_hash(&turn));
+        self.turn_hashes.push(hasher.finalize().to_vec());
         self.turns.push(turn);
         if self.turns.len() > MAX_TURNS {
-            self.turns.drain(..self.turns.len() - MAX_TURNS);
+            let excess = self.turns.len() - MAX_TURNS;
+            self.turns.drain(..excess);
+            // Keep the chain aligned with the retained turns.
+            if self.turn_hashes.len() >= excess {
+                self.turn_hashes.drain(..excess);
+            }
         }
+    }
+
+    /// The current head of the turn hash chain (hex), suitable for anchoring in
+    /// an external append-only log (e.g. a git commit message). Empty when no
+    /// turns have been recorded.
+    #[must_use]
+    pub fn chain_head_hex(&self) -> String {
+        match self.turn_hashes.last() {
+            Some(h) => h.iter().map(|b| format!("{b:02x}")).collect(),
+            None => String::new(),
+        }
+    }
+
+    /// Verify the internal consistency of the turn hash chain over the retained
+    /// window. Returns the index of the first turn that fails to chain, or
+    /// `None` if the chain is intact (or absent, for legacy states predating it).
+    #[must_use]
+    pub fn verify_chain(&self) -> Option<usize> {
+        if self.turn_hashes.is_empty() {
+            return None; // legacy state with no recorded chain
+        }
+        if self.turn_hashes.len() != self.turns.len() {
+            return Some(0); // chain/turn count diverged → tampering
+        }
+        for i in 1..self.turns.len() {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(&self.turn_hashes[i - 1]);
+            hasher.update(turn_content_hash(&self.turns[i]));
+            if self.turn_hashes[i].as_slice() != hasher.finalize().as_slice() {
+                return Some(i);
+            }
+        }
+        None
     }
 
     pub fn now() -> u64 {

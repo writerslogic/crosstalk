@@ -59,3 +59,86 @@ fn test_turn_serialization_roundtrip() {
     assert_eq!(deserialized.index, 42);
     assert_eq!(deserialized.model_id, "gpt-4");
 }
+
+fn mk_turn(index: u32, content: &str) -> Turn {
+    Turn {
+        index,
+        model_id: "agent".to_string(),
+        content: content.to_string(),
+        timestamp: index as u64,
+        diffs: vec![],
+        certainty: None,
+        outcome: TurnOutcome::Unknown,
+        task_category: None,
+        structure: None,
+        signature: vec![],
+        surprise_signal: None,
+        consistency_score: None,
+        diff_quality_score: None,
+        persona_disclosure: None,
+    }
+}
+
+#[test]
+fn hash_chain_is_intact_after_pushes() {
+    let mut s = ConversationState::new("chain");
+    for i in 0..3 {
+        s.push_turn(mk_turn(i, &format!("turn {i}")));
+    }
+    assert_eq!(s.turn_hashes.len(), 3);
+    assert_eq!(s.verify_chain(), None);
+    assert!(!s.chain_head_hex().is_empty());
+}
+
+#[test]
+fn tampering_a_turn_breaks_the_chain() {
+    let mut s = ConversationState::new("chain");
+    for i in 0..3 {
+        s.push_turn(mk_turn(i, &format!("turn {i}")));
+    }
+    // Edit a committed turn's content without updating its chain hash.
+    s.turns[1].content = "tampered".to_string();
+    assert_eq!(s.verify_chain(), Some(1));
+}
+
+#[test]
+fn reordering_turns_breaks_the_chain() {
+    let mut s = ConversationState::new("chain");
+    for i in 0..3 {
+        s.push_turn(mk_turn(i, &format!("turn {i}")));
+    }
+    s.turns.swap(1, 2);
+    assert_eq!(s.verify_chain(), Some(1));
+}
+
+#[test]
+fn deleting_a_turn_is_detected_as_count_divergence() {
+    let mut s = ConversationState::new("chain");
+    for i in 0..3 {
+        s.push_turn(mk_turn(i, &format!("turn {i}")));
+    }
+    s.turns.remove(1);
+    assert_eq!(s.verify_chain(), Some(0));
+}
+
+#[test]
+fn legacy_state_without_chain_verifies_as_intact() {
+    let mut s = ConversationState::new("chain");
+    for i in 0..3 {
+        s.push_turn(mk_turn(i, &format!("turn {i}")));
+    }
+    // Simulate a state persisted before the chain existed.
+    s.turn_hashes.clear();
+    assert_eq!(s.verify_chain(), None);
+}
+
+#[test]
+fn chain_stays_aligned_and_consistent_after_drain() {
+    let mut s = ConversationState::new("chain");
+    for i in 0..205 {
+        s.push_turn(mk_turn(i, &format!("turn {i}")));
+    }
+    assert_eq!(s.turns.len(), 200);
+    assert_eq!(s.turn_hashes.len(), 200);
+    assert_eq!(s.verify_chain(), None);
+}

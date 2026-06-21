@@ -356,8 +356,20 @@ impl Orchestrator {
         }
     }
 
-    pub async fn git_commit_session(repo_root: &std::path::Path, session_id: &str, turn: u32) {
-        let msg = format!("crosstalk: session {} turn {}", session_id, turn);
+    pub async fn git_commit_session(
+        repo_root: &std::path::Path,
+        session_id: &str,
+        turn: u32,
+        chain_head: &str,
+    ) {
+        // Anchor the transcript hash-chain head in the commit message: an
+        // external, append-only witness that a later edit to a past turn cannot
+        // rewrite without also rewriting git history.
+        let msg = if chain_head.is_empty() {
+            format!("crosstalk: session {} turn {}", session_id, turn)
+        } else {
+            format!("crosstalk: session {} turn {} head={}", session_id, turn, chain_head)
+        };
         let status = tokio::process::Command::new("git")
             .args(["diff", "--cached", "--quiet"])
             .current_dir(repo_root)
