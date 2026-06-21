@@ -1,64 +1,22 @@
 //! Crosstalk concurrency primitives.
 //!
-//! This crate provides building blocks for concurrent and parallel
-//! orchestration within Crosstalk: cancellation tokens, sharded data
-//! structures, caching layers, and task execution helpers.
+//! This crate provides the cancellation primitives used for cooperative
+//! shutdown of concurrent orchestration work within Crosstalk.
 
-pub mod cache;
 pub mod cancel;
-pub mod executor;
-pub mod sharded;
 
-// CERTAIN: Re-export the primary cancellation type for ergonomic access.
+// Re-export the primary cancellation type for ergonomic access.
 pub use cancel::CancelScope;
-
-// CERTAIN: Re-export the cache primitive so callers (embed_text, metacognition)
-// can route through a single shared type.
-pub use cache::{Cache, CacheConfig};
-
-// CERTAIN: Re-export the execution primitives. AsyncExecutor centralizes
-// runtime construction (SYS-004) and MainThreadHandle enforces thread
-// confinement for GodView work (H-038).
-pub use executor::{AsyncExecutor, MainThreadHandle};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // CERTAIN: This compiles only if all four modules resolve to existing
-    // (empty) module declarations. Acts as a smoke test for the crate layout.
-    #[test]
-    fn modules_are_declared() {
-        // Reference the module paths to ensure they exist at compile time.
-        assert_eq!(stringify!(cache), "cache");
-        assert_eq!(stringify!(cancel), "cancel");
-        assert_eq!(stringify!(executor), "executor");
-        assert_eq!(stringify!(sharded), "sharded");
-    }
-
-    // CERTAIN: The re-export resolves, confirming CancelScope is part of the
+    // The re-export resolves, confirming CancelScope is part of the
     // crate's public API.
     #[test]
     fn cancel_scope_is_reexported() {
         let _scope = CancelScope::new();
         assert!(!_scope.is_cancelled());
-    }
-
-    // CERTAIN: Confirms the Cache re-export is part of the public API.
-    #[test]
-    fn cache_is_reexported() {
-        let _cfg = CacheConfig::default();
-        let _cache: Cache<u32, u32> = Cache::default();
-        assert!(_cfg.capacity > 0);
-    }
-
-    // CERTAIN: Confirms the executor re-exports are part of the public API and
-    // that AsyncExecutor::build() works through the crate root path.
-    #[test]
-    fn async_executor_is_reexported() {
-        let exec = AsyncExecutor::build().expect("build");
-        let _handle: MainThreadHandle<'_> = exec.main_thread_handle();
-        let value = exec.block_on(async { 1 + 1 });
-        assert_eq!(value, 2);
     }
 }
