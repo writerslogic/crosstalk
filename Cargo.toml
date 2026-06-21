@@ -6,6 +6,11 @@ name = "crosstalk"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
+description = "Multi-model AI orchestrator: routes a task across several models, scores and synthesizes their proposals, and verifies the result, with a ratatui TUI."
+authors = ["David Condrey <david@writerslogic.com>"]
+license = "AGPL-3.0-only"
+repository = "https://github.com/writerslogic/crosstalk"
+readme = "README.md"
 
 [[bin]]
 name = "crosstalk"

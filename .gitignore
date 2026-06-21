@@ -5,3 +5,13 @@
 .todo-runner/
 *.proof
 __pycache__/
+
+# Internal orchestration scaffolding (not part of the published product)
+.orchestrator/
+conductor/
+
+# Stray local artifacts
+.DS_Store
+**/.DS_Store
+test.rs
+test.rs.proof
