@@ -11,6 +11,29 @@ impl Orchestrator {
         self.rewind(index)
     }
 
+    /// Append a cross-session snapshot record (Elo ratings, evolver population,
+    /// topology scores, etc.) under a well-known pseudo-session key.
+    fn persist_snapshot(&self, key: &str, content_hash: &str, metadata_json: String) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.memory_store
+            .sessions
+            .entry(key.to_string())
+            .or_default()
+            .push(Arc::new(MemoryRecord {
+                turn_id: 0,
+                session_id: key.to_string(),
+                embedding: vec![0.0; 64],
+                content_hash: content_hash.to_string(),
+                timestamp,
+                metadata_json,
+                outcome: None,
+                is_negative: false,
+            }));
+    }
+
     pub async fn finalize_session(&self, sigma_lock: Arc<Mutex<ConversationState>>) -> Result<()> {
         let sigma = sigma_lock.lock().await;
         let eval = SelfImprovementEngine::evaluate_session(&sigma);
@@ -81,120 +104,24 @@ impl Orchestrator {
         drop(sigma);
 
         // Persist Elo ratings for cross-session continuity.
-        {
-            let obs = self.observer.lock().await;
-            let elo_json = obs.export_elo_ratings();
-            let record = MemoryRecord {
-                turn_id: 0,
-                session_id: "elo_ratings".to_string(),
-                embedding: vec![0.0; 64],
-                content_hash: "elo_snapshot".to_string(),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                metadata_json: elo_json,
-                outcome: None,
-                is_negative: false,
-            };
-            self.memory_store
-                .sessions
-                .entry("elo_ratings".to_string())
-                .or_default()
-                .push(Arc::new(record));
-        }
+        let elo_json = self.observer.lock().await.export_elo_ratings();
+        self.persist_snapshot("elo_ratings", "elo_snapshot", elo_json);
 
         // Persist prompt evolver population for cross-session evolution.
-        {
-            let evolver = self.prompt_evolver.lock().await;
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            self.memory_store
-                .sessions
-                .entry("prompt_population".to_string())
-                .or_default()
-                .push(Arc::new(MemoryRecord {
-                    turn_id: 0,
-                    session_id: "prompt_population".to_string(),
-                    embedding: vec![0.0; 64],
-                    content_hash: "prompt_snapshot".to_string(),
-                    timestamp: ts,
-                    metadata_json: evolver.export_state_json(),
-                    outcome: None,
-                    is_negative: false,
-                }));
-        }
+        let prompt_json = self.prompt_evolver.lock().await.export_state_json();
+        self.persist_snapshot("prompt_population", "prompt_snapshot", prompt_json);
 
         // Persist topology scores for cross-session learning.
-        {
-            let topo = self.topology.lock().await;
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            self.memory_store
-                .sessions
-                .entry("topology_scores".to_string())
-                .or_default()
-                .push(Arc::new(MemoryRecord {
-                    turn_id: 0,
-                    session_id: "topology_scores".to_string(),
-                    embedding: vec![0.0; 64],
-                    content_hash: "topology_snapshot".to_string(),
-                    timestamp: ts,
-                    metadata_json: topo.export_scores_json(),
-                    outcome: None,
-                    is_negative: false,
-                }));
-        }
+        let topology_json = self.topology.lock().await.export_scores_json();
+        self.persist_snapshot("topology_scores", "topology_snapshot", topology_json);
 
         // Persist collective agent profiles and meta-strategy outcomes.
-        {
-            let coll = self.collective.lock().await;
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            self.memory_store
-                .sessions
-                .entry("collective_profiles".to_string())
-                .or_default()
-                .push(Arc::new(MemoryRecord {
-                    turn_id: 0,
-                    session_id: "collective_profiles".to_string(),
-                    embedding: vec![0.0; 64],
-                    content_hash: "collective_snapshot".to_string(),
-                    timestamp: ts,
-                    metadata_json: coll.export_state_json(),
-                    outcome: None,
-                    is_negative: false,
-                }));
-        }
+        let collective_json = self.collective.lock().await.export_state_json();
+        self.persist_snapshot("collective_profiles", "collective_snapshot", collective_json);
 
         // Persist memory ranker weights for cross-session recall tuning.
-        {
-            let bridge = self.memory_bridge.lock().await;
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            self.memory_store
-                .sessions
-                .entry("ranker_weights".to_string())
-                .or_default()
-                .push(Arc::new(MemoryRecord {
-                    turn_id: 0,
-                    session_id: "ranker_weights".to_string(),
-                    embedding: vec![0.0; 64],
-                    content_hash: "ranker_snapshot".to_string(),
-                    timestamp: ts,
-                    metadata_json: bridge.export_ranker_weights_json(),
-                    outcome: None,
-                    is_negative: false,
-                }));
-        }
+        let ranker_json = self.memory_bridge.lock().await.export_ranker_weights_json();
+        self.persist_snapshot("ranker_weights", "ranker_snapshot", ranker_json);
 
         // Distill and persist a SessionLesson for future sessions.
         {
@@ -237,20 +164,7 @@ impl Orchestrator {
                 timestamp: ts,
             };
             if let Ok(lesson_json) = serde_json::to_string(&lesson) {
-                self.memory_store
-                    .sessions
-                    .entry("session_lessons".to_string())
-                    .or_default()
-                    .push(Arc::new(MemoryRecord {
-                        turn_id: 0,
-                        session_id: "session_lessons".to_string(),
-                        embedding: vec![0.0; 64],
-                        content_hash: "lesson_snapshot".to_string(),
-                        timestamp: ts,
-                        metadata_json: lesson_json,
-                        outcome: None,
-                        is_negative: false,
-                    }));
+                self.persist_snapshot("session_lessons", "lesson_snapshot", lesson_json);
             }
         }
 
