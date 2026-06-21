@@ -116,6 +116,69 @@ fn audit_logger_writes_signed_entry() {
     );
 }
 
+fn stored_seed_blob(db: &sled::Db) -> Vec<u8> {
+    db.open_tree("signing")
+        .unwrap()
+        .get("turn_signer_seed")
+        .unwrap()
+        .expect("seed present")
+        .to_vec()
+}
+
+#[test]
+fn encrypted_seed_roundtrips_with_passphrase() {
+    let (_dir, db) = temp_db();
+
+    let mut turn = sample_turn();
+    let serialized = serde_json::to_vec(&turn).unwrap();
+    {
+        let signer = TurnSigner::with_persisted_key_passphrase(&db, Some("correct horse")).unwrap();
+        turn.signature = signer.sign(&serialized);
+    }
+
+    // Stored blob must be the AEAD format (tag 0x01), never the raw seed.
+    let blob = stored_seed_blob(&db);
+    assert_eq!(blob[0], 0x01, "seed must be stored encrypted");
+    assert_eq!(blob.len(), 1 + 16 + 12 + 48);
+
+    let reloaded = TurnSigner::with_persisted_key_passphrase(&db, Some("correct horse")).unwrap();
+    assert!(reloaded.verify_turn(&turn).unwrap());
+}
+
+#[test]
+fn wrong_passphrase_fails_to_load() {
+    let (_dir, db) = temp_db();
+    TurnSigner::with_persisted_key_passphrase(&db, Some("right")).unwrap();
+    assert!(TurnSigner::with_persisted_key_passphrase(&db, Some("wrong")).is_err());
+}
+
+#[test]
+fn encrypted_seed_requires_passphrase() {
+    let (_dir, db) = temp_db();
+    TurnSigner::with_persisted_key_passphrase(&db, Some("secret")).unwrap();
+    // Loading an encrypted seed with no passphrase must error, not regenerate.
+    assert!(TurnSigner::with_persisted_key_passphrase(&db, None).is_err());
+}
+
+#[test]
+fn plaintext_seed_migrates_to_encrypted_when_passphrase_added() {
+    let (_dir, db) = temp_db();
+
+    let mut turn = sample_turn();
+    let serialized = serde_json::to_vec(&turn).unwrap();
+    {
+        let signer = TurnSigner::with_persisted_key_passphrase(&db, None).unwrap();
+        turn.signature = signer.sign(&serialized);
+    }
+    assert_eq!(stored_seed_blob(&db)[0], 0x00, "starts as plaintext");
+
+    // Adding a passphrase migrates the at-rest seed to the encrypted form while
+    // preserving the key, so prior signatures still verify.
+    let migrated = TurnSigner::with_persisted_key_passphrase(&db, Some("pw")).unwrap();
+    assert!(migrated.verify_turn(&turn).unwrap());
+    assert_eq!(stored_seed_blob(&db)[0], 0x01, "migrated to encrypted");
+}
+
 #[test]
 fn zero_trust_classifies_command_risk() {
     let policy = ZeroTrustPolicy::new();

@@ -1,5 +1,8 @@
 use crate::types::conversation::Turn;
 use crate::types::fiduciary::PersonaDisclosure;
+use argon2::Argon2;
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::Rng;
 use regex::Regex;
@@ -125,20 +128,46 @@ impl TurnSigner {
     /// Load the signing key seed from `db`, generating and persisting a fresh
     /// one on first use. A stable key is required for signatures to remain
     /// verifiable across process restarts (cross-session tamper evidence).
+    ///
+    /// If `CROSSTALK_SIGNING_PASSPHRASE` is set the seed is encrypted at rest
+    /// (ChaCha20-Poly1305 under an Argon2id-derived key); otherwise it is stored
+    /// in the clear with a warning.
     pub fn with_persisted_key(db: &sled::Db) -> Result<Self, anyhow::Error> {
+        let passphrase = std::env::var("CROSSTALK_SIGNING_PASSPHRASE").ok();
+        Self::with_persisted_key_passphrase(db, passphrase.as_deref())
+    }
+
+    /// As [`Self::with_persisted_key`] but with the passphrase supplied
+    /// explicitly (the env var is read only by the wrapper). Exposed so callers
+    /// and tests can drive the encrypted path deterministically without relying
+    /// on process-global environment state.
+    pub fn with_persisted_key_passphrase(
+        db: &sled::Db,
+        passphrase: Option<&str>,
+    ) -> Result<Self, anyhow::Error> {
         const SEED_KEY: &str = "turn_signer_seed";
         let tree = db.open_tree("signing")?;
-        let seed: Zeroizing<[u8; 32]> = match tree.get(SEED_KEY)? {
-            Some(stored) => Zeroizing::new(stored.as_ref().try_into().map_err(|_| {
-                anyhow::anyhow!("stored signing seed has invalid length: {}", stored.len())
-            })?),
-            None => {
-                let mut rng = rand::rng();
-                let bytes = Zeroizing::new(rng.random::<[u8; 32]>());
-                tree.insert(SEED_KEY, bytes.as_slice())?;
-                tree.flush()?;
-                bytes
+        let seed: Zeroizing<[u8; 32]> = match (tree.get(SEED_KEY)?, passphrase) {
+            (None, pass) => {
+                let seed = Zeroizing::new(rand::rng().random::<[u8; 32]>());
+                store_seed(&tree, SEED_KEY, &seed, pass)?;
+                seed
             }
+            (Some(blob), Some(pass)) if is_encrypted(&blob) => decrypt_seed(&blob, pass)?,
+            (Some(blob), Some(pass)) => {
+                // Stored in the clear but a passphrase is now set: migrate by
+                // re-storing it encrypted so it is no longer readable at rest.
+                let seed = read_plaintext_seed(&blob)?;
+                store_seed(&tree, SEED_KEY, &seed, Some(pass))?;
+                seed
+            }
+            (Some(blob), None) if is_encrypted(&blob) => {
+                return Err(anyhow::anyhow!(
+                    "signing seed is encrypted but CROSSTALK_SIGNING_PASSPHRASE is not set; \
+                     set it to the original passphrase to keep prior signatures verifiable"
+                ));
+            }
+            (Some(blob), None) => read_plaintext_seed(&blob)?,
         };
         Ok(Self {
             signing_key: SigningKey::from_bytes(&seed),
@@ -179,6 +208,98 @@ impl Default for TurnSigner {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ── Signing-seed storage (plaintext or passphrase-encrypted at rest) ─────────
+//
+// Stored blob layout under the `signing` tree:
+//   plaintext : [0x00] ++ seed(32)        (a bare 32-byte value is also accepted
+//                                           for backward compatibility)
+//   encrypted : [0x01] ++ salt(16) ++ nonce(12) ++ ciphertext(48)
+
+const SEED_PLAINTEXT_TAG: u8 = 0x00;
+const SEED_ENCRYPTED_TAG: u8 = 0x01;
+const SEED_SALT_LEN: usize = 16;
+const SEED_NONCE_LEN: usize = 12;
+
+fn is_encrypted(blob: &[u8]) -> bool {
+    blob.first() == Some(&SEED_ENCRYPTED_TAG)
+}
+
+fn read_plaintext_seed(blob: &[u8]) -> Result<Zeroizing<[u8; 32]>, anyhow::Error> {
+    let raw: &[u8] = match blob {
+        [SEED_PLAINTEXT_TAG, rest @ ..] => rest,
+        _ => blob, // legacy: bare 32-byte seed
+    };
+    let arr: [u8; 32] = raw
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("stored signing seed has invalid length: {}", raw.len()))?;
+    Ok(Zeroizing::new(arr))
+}
+
+fn derive_seed_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, anyhow::Error> {
+    let mut key = Zeroizing::new([0u8; 32]);
+    Argon2::default()
+        .hash_password_into(passphrase.as_bytes(), salt, key.as_mut_slice())
+        .map_err(|e| anyhow::anyhow!("argon2 key derivation failed: {e}"))?;
+    Ok(key)
+}
+
+fn store_seed(
+    tree: &sled::Tree,
+    key: &str,
+    seed: &[u8; 32],
+    passphrase: Option<&str>,
+) -> Result<(), anyhow::Error> {
+    let blob = match passphrase {
+        Some(pass) => {
+            let mut rng = rand::rng();
+            let salt = rng.random::<[u8; SEED_SALT_LEN]>();
+            let nonce = rng.random::<[u8; SEED_NONCE_LEN]>();
+            let derived = derive_seed_key(pass, &salt)?;
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(derived.as_slice()));
+            let ciphertext = cipher
+                .encrypt(Nonce::from_slice(&nonce), seed.as_slice())
+                .map_err(|e| anyhow::anyhow!("signing seed encryption failed: {e}"))?;
+            let mut blob =
+                Vec::with_capacity(1 + SEED_SALT_LEN + SEED_NONCE_LEN + ciphertext.len());
+            blob.push(SEED_ENCRYPTED_TAG);
+            blob.extend_from_slice(&salt);
+            blob.extend_from_slice(&nonce);
+            blob.extend_from_slice(&ciphertext);
+            blob
+        }
+        None => {
+            tracing::warn!(
+                "signing seed stored unencrypted; set CROSSTALK_SIGNING_PASSPHRASE to encrypt it at rest"
+            );
+            let mut blob = Vec::with_capacity(1 + 32);
+            blob.push(SEED_PLAINTEXT_TAG);
+            blob.extend_from_slice(seed);
+            blob
+        }
+    };
+    tree.insert(key, blob)?;
+    tree.flush()?;
+    Ok(())
+}
+
+fn decrypt_seed(blob: &[u8], passphrase: &str) -> Result<Zeroizing<[u8; 32]>, anyhow::Error> {
+    const HEADER: usize = 1 + SEED_SALT_LEN + SEED_NONCE_LEN;
+    if blob.len() <= HEADER {
+        return Err(anyhow::anyhow!("encrypted signing seed is truncated"));
+    }
+    let salt = &blob[1..1 + SEED_SALT_LEN];
+    let nonce = &blob[1 + SEED_SALT_LEN..HEADER];
+    let ciphertext = &blob[HEADER..];
+    let derived = derive_seed_key(passphrase, salt)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(derived.as_slice()));
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .map_err(|_| {
+            anyhow::anyhow!("signing seed decryption failed (wrong CROSSTALK_SIGNING_PASSPHRASE?)")
+        })?;
+    read_plaintext_seed(&plaintext)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
