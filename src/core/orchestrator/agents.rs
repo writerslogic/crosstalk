@@ -774,12 +774,12 @@ impl Orchestrator {
                             s.mode_library.cycle_next();
                             let new_name = s.mode_library.current_name().to_string();
                             drop(s);
-                            let _ = self.emit(StreamEvent::ModeTransition {
+                            self.emit(StreamEvent::ModeTransition {
                                 from_name: old,
                                 to_name: new_name,
                                 reason: "User cycle".to_string(),
                                 synthesized: false,
-                            }).await;
+                            }).await?;
                         }
                         Some(ControlSignal::SetModeByName(name)) => {
                             let mut s = sigma_lock.lock().await;
@@ -787,12 +787,12 @@ impl Orchestrator {
                             if s.mode_library.switch_to_name(&name) {
                                 let new_name = name.clone();
                                 drop(s);
-                                let _ = self.emit(StreamEvent::ModeTransition {
+                                self.emit(StreamEvent::ModeTransition {
                                     from_name: old,
                                     to_name: new_name,
                                     reason: "User override".to_string(),
                                     synthesized: false,
-                                }).await;
+                                }).await?;
                             }
                         }
                         None => { ctrl_open = false; }
