@@ -40,6 +40,13 @@ pub struct SandboxResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+    /// CPU fuel consumed by the execution, when fuel metering reported a value.
+    pub fuel_consumed: Option<u64>,
+    /// Wall-clock duration of the execution in milliseconds.
+    pub elapsed_ms: u64,
+    /// True when execution was killed by a resource limit (fuel exhaustion or
+    /// the epoch deadline) rather than trapping for an ordinary reason.
+    pub resource_limit_hit: bool,
 }
 
 pub struct SandboxManager {
@@ -121,17 +128,28 @@ impl SandboxManager {
             .context("default export has unexpected signature (expected () -> ())")?;
 
         let res = func.call(&mut store, ());
-        let _fuel_consumed = store
+        let fuel_consumed = store
             .get_fuel()
             .ok()
             .map(|f| self.config.cpu_fuel_limit - f);
-        let _elapsed_ms = start.elapsed().as_millis() as u64;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
 
-        let exit_code = match res {
-            Ok(_) => 0,
+        let (exit_code, resource_limit_hit) = match res {
+            Ok(_) => (0, false),
             Err(e) => {
-                tracing::warn!("WASM execution failed: {e}");
-                1
+                // A fuel-exhaustion or epoch-deadline trap is a resource-limit
+                // kill, not an ordinary program failure; surface the distinction
+                // so callers can tell a runaway module from a normal non-zero exit.
+                let limited = matches!(
+                    e.downcast_ref::<Trap>(),
+                    Some(Trap::OutOfFuel | Trap::Interrupt)
+                );
+                if limited {
+                    tracing::warn!("WASM execution hit a resource limit: {e}");
+                } else {
+                    tracing::warn!("WASM execution failed: {e}");
+                }
+                (1, limited)
             }
         };
 
@@ -142,6 +160,9 @@ impl SandboxManager {
             exit_code,
             stdout,
             stderr,
+            fuel_consumed,
+            elapsed_ms,
+            resource_limit_hit,
         })
     }
 

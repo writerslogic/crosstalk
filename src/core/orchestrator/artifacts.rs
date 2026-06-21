@@ -198,6 +198,9 @@ impl Orchestrator {
                     exit_code: 0,
                     stdout: new_content.clone(),
                     stderr: String::new(),
+                    fuel_consumed: None,
+                    elapsed_ms: 0,
+                    resource_limit_hit: false,
                 };
                 let tmp = std::env::temp_dir();
                 match LinterGuard::check(

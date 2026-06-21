@@ -9,6 +9,19 @@ fn invalid_wasm_bytes() -> Vec<u8> {
     vec![0xFF, 0xFF, 0xFF, 0xFF]
 }
 
+// A valid module whose default ("") export is `() -> ()` and loops forever,
+// so execution exhausts CPU fuel rather than returning normally.
+fn infinite_loop_wasm_bytes() -> Vec<u8> {
+    vec![
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, // header
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: () -> ()
+        0x03, 0x02, 0x01, 0x00, // function: type 0
+        0x07, 0x04, 0x01, 0x00, 0x00, 0x00, // export "" func 0
+        0x0A, 0x09, 0x01, 0x07, 0x00, // code section, body len 7, 0 locals
+        0x03, 0x40, 0x0C, 0x00, 0x0B, 0x0B, // loop (br 0) end; end
+    ]
+}
+
 #[tokio::test]
 async fn test_sandbox_fuel_limit() {
     let config = SandboxConfig {
@@ -26,6 +39,31 @@ async fn test_sandbox_fuel_limit() {
     assert!(
         result.is_err(),
         "Invalid WASM should fail to instantiate or execute"
+    );
+}
+
+#[tokio::test]
+async fn fuel_exhaustion_sets_resource_limit_hit() {
+    let config = SandboxConfig {
+        memory_limit_bytes: 1024 * 1024,
+        cpu_fuel_limit: 100_000,
+        ..Default::default()
+    };
+    let manager = SandboxManager::new(config).expect("Failed to create SandboxManager");
+
+    let result = manager
+        .execute(&infinite_loop_wasm_bytes())
+        .expect("module instantiates; the trap is reported via the result");
+
+    assert!(
+        result.resource_limit_hit,
+        "fuel exhaustion must be distinguished from an ordinary failure"
+    );
+    assert_eq!(result.exit_code, 1);
+    assert_eq!(
+        result.fuel_consumed,
+        Some(100_000),
+        "the run should consume the full fuel budget before trapping"
     );
 }
 

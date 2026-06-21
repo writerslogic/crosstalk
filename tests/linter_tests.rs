@@ -22,6 +22,9 @@ fn ok_sandbox() -> SandboxResult {
         exit_code: 0,
         stdout: String::new(),
         stderr: String::new(),
+        fuel_consumed: None,
+        elapsed_ms: 0,
+        resource_limit_hit: false,
     }
 }
 
@@ -30,6 +33,9 @@ fn failed_sandbox() -> SandboxResult {
         exit_code: 1,
         stdout: String::new(),
         stderr: "build failed".to_string(),
+        fuel_consumed: None,
+        elapsed_ms: 0,
+        resource_limit_hit: false,
     }
 }
 
