@@ -342,10 +342,7 @@ impl Orchestrator {
         // A persisted signing key keeps turn/disclosure signatures verifiable
         // across sessions; the audit log shares it so its entries are signed too.
         let signer = Arc::new(TurnSigner::with_persisted_key(state_manager.db())?);
-        let audit_log = AuditLogger::new(
-            Arc::new(state_manager.db().clone()),
-            Arc::clone(&signer),
-        );
+        let audit_log = AuditLogger::new(Arc::new(state_manager.db().clone()), Arc::clone(&signer));
 
         Ok(Self {
             agents,
@@ -503,12 +500,11 @@ impl Orchestrator {
     pub fn subscribe_all(&self) -> tokio::sync::broadcast::Receiver<Turn> {
         self.turn_tx.subscribe()
     }
-
 }
 
 mod agents;
-mod synthesis;
 mod artifacts;
-mod verification;
-mod parsing;
 mod lifecycle;
+mod parsing;
+mod synthesis;
+mod verification;

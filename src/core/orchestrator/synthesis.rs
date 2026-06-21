@@ -220,7 +220,11 @@ impl Orchestrator {
 
     /// Phase 6: Run security, tautology, and fallacy filters on the synthesised response.
     /// Returns `Ok(false)` when the response must be dropped, `Ok(true)` when it passes.
-    pub(super) async fn filter_response(&self, response: &str, history_contents: &[String]) -> Result<bool> {
+    pub(super) async fn filter_response(
+        &self,
+        response: &str,
+        history_contents: &[String],
+    ) -> Result<bool> {
         let secrets = SecretScanner::scan(response);
         if !secrets.is_empty() {
             self.emit(StreamEvent::TokenReceived {
@@ -903,5 +907,4 @@ impl Orchestrator {
 
         result
     }
-
 }

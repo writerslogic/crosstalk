@@ -117,7 +117,11 @@ impl Orchestrator {
 
         // Persist collective agent profiles and meta-strategy outcomes.
         let collective_json = self.collective.lock().await.export_state_json();
-        self.persist_snapshot("collective_profiles", "collective_snapshot", collective_json);
+        self.persist_snapshot(
+            "collective_profiles",
+            "collective_snapshot",
+            collective_json,
+        );
 
         // Persist memory ranker weights for cross-session recall tuning.
         let ranker_json = self.memory_bridge.lock().await.export_ranker_weights_json();

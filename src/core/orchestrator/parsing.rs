@@ -336,7 +336,10 @@ impl Orchestrator {
         }
     }
 
-    pub(super) async fn git_stage_file(repo_root: &std::path::Path, file: &std::path::Path) -> String {
+    pub(super) async fn git_stage_file(
+        repo_root: &std::path::Path,
+        file: &std::path::Path,
+    ) -> String {
         let rel = file.strip_prefix(repo_root).unwrap_or(file);
         match tokio::process::Command::new("git")
             .args(["add", "--", &rel.display().to_string()])
@@ -368,7 +371,10 @@ impl Orchestrator {
         let msg = if chain_head.is_empty() {
             format!("crosstalk: session {} turn {}", session_id, turn)
         } else {
-            format!("crosstalk: session {} turn {} head={}", session_id, turn, chain_head)
+            format!(
+                "crosstalk: session {} turn {} head={}",
+                session_id, turn, chain_head
+            )
         };
         let status = tokio::process::Command::new("git")
             .args(["diff", "--cached", "--quiet"])
@@ -518,7 +524,6 @@ impl Orchestrator {
         }
         artifacts
     }
-
 }
 
 /// Validate a `shell_exec` directive: it must be an allowlisted read-only

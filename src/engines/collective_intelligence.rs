@@ -585,11 +585,7 @@ impl Default for MetaStrategyOptimizer {
 fn sample_beta(rng: &mut impl rand::Rng, alpha: f64, beta: f64) -> f64 {
     let x = sample_gamma(rng, alpha);
     let y = sample_gamma(rng, beta);
-    if x + y == 0.0 {
-        0.5
-    } else {
-        x / (x + y)
-    }
+    if x + y == 0.0 { 0.5 } else { x / (x + y) }
 }
 
 fn sample_gamma(rng: &mut impl rand::Rng, shape: f64) -> f64 {

@@ -139,7 +139,9 @@ impl TurnSigner {
         // a seed that no longer matches it is a substitution and must abort.
         if let Ok(expected) = std::env::var("CROSSTALK_EXPECTED_PUBKEY")
             && !expected.trim().is_empty()
-            && !expected.trim().eq_ignore_ascii_case(&signer.verifying_key_hex())
+            && !expected
+                .trim()
+                .eq_ignore_ascii_case(&signer.verifying_key_hex())
         {
             return Err(anyhow::anyhow!(
                 "signing identity {} does not match pinned CROSSTALK_EXPECTED_PUBKEY {}",
