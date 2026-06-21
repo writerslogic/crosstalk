@@ -4482,7 +4482,7 @@ impl Orchestrator {
                 .sessions
                 .entry("elo_ratings".to_string())
                 .or_default()
-                .push(record);
+                .push(Arc::new(record));
         }
 
         // Persist prompt evolver population for cross-session evolution.
@@ -4496,7 +4496,7 @@ impl Orchestrator {
                 .sessions
                 .entry("prompt_population".to_string())
                 .or_default()
-                .push(MemoryRecord {
+                .push(Arc::new(MemoryRecord {
                     turn_id: 0,
                     session_id: "prompt_population".to_string(),
                     embedding: vec![0.0; 64],
@@ -4505,7 +4505,7 @@ impl Orchestrator {
                     metadata_json: evolver.export_state_json(),
                     outcome: None,
                     is_negative: false,
-                });
+                }));
         }
 
         // Persist topology scores for cross-session learning.
@@ -4519,7 +4519,7 @@ impl Orchestrator {
                 .sessions
                 .entry("topology_scores".to_string())
                 .or_default()
-                .push(MemoryRecord {
+                .push(Arc::new(MemoryRecord {
                     turn_id: 0,
                     session_id: "topology_scores".to_string(),
                     embedding: vec![0.0; 64],
@@ -4528,7 +4528,7 @@ impl Orchestrator {
                     metadata_json: topo.export_scores_json(),
                     outcome: None,
                     is_negative: false,
-                });
+                }));
         }
 
         // Persist collective agent profiles and meta-strategy outcomes.
@@ -4542,7 +4542,7 @@ impl Orchestrator {
                 .sessions
                 .entry("collective_profiles".to_string())
                 .or_default()
-                .push(MemoryRecord {
+                .push(Arc::new(MemoryRecord {
                     turn_id: 0,
                     session_id: "collective_profiles".to_string(),
                     embedding: vec![0.0; 64],
@@ -4551,7 +4551,7 @@ impl Orchestrator {
                     metadata_json: coll.export_state_json(),
                     outcome: None,
                     is_negative: false,
-                });
+                }));
         }
 
         // Persist memory ranker weights for cross-session recall tuning.
@@ -4565,7 +4565,7 @@ impl Orchestrator {
                 .sessions
                 .entry("ranker_weights".to_string())
                 .or_default()
-                .push(MemoryRecord {
+                .push(Arc::new(MemoryRecord {
                     turn_id: 0,
                     session_id: "ranker_weights".to_string(),
                     embedding: vec![0.0; 64],
@@ -4574,7 +4574,7 @@ impl Orchestrator {
                     metadata_json: bridge.export_ranker_weights_json(),
                     outcome: None,
                     is_negative: false,
-                });
+                }));
         }
 
         // Distill and persist a SessionLesson for future sessions.
@@ -4635,7 +4635,7 @@ impl Orchestrator {
                     .sessions
                     .entry("session_lessons".to_string())
                     .or_default()
-                    .push(MemoryRecord {
+                    .push(Arc::new(MemoryRecord {
                         turn_id: 0,
                         session_id: "session_lessons".to_string(),
                         embedding: vec![0.0; 64],
@@ -4644,7 +4644,7 @@ impl Orchestrator {
                         metadata_json: lesson_json,
                         outcome: None,
                         is_negative: false,
-                    });
+                    }));
             }
         }
 

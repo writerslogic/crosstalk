@@ -1479,3 +1479,48 @@ fn local_cosine_similarity_opposite_vectors() {
         sim
     );
 }
+
+// ── H-036 / H-047: Arc-shared session records ────────────────────────────────
+
+// H-036: recall hands out shared Arc handles, not deep clones. Two recalls of
+// the same record return Arcs pointing at the SAME allocation.
+#[tokio::test]
+async fn recall_shares_arc_instead_of_cloning_record() {
+    use std::sync::Arc;
+    let mut bridge = MemoryBridge::new();
+    bridge.push_record("s", make_record(1, "s"));
+
+    let a = bridge.recall_relevant("s", "hash-1", 5, 0).await.unwrap();
+    let b = bridge.recall_relevant("s", "hash-1", 5, 1).await.unwrap();
+
+    assert_eq!(a.len(), 1);
+    assert_eq!(b.len(), 1);
+    // Same underlying allocation across independent recalls => no deep clone.
+    assert!(
+        Arc::ptr_eq(&a[0], &b[0]),
+        "recall must return shared Arc handles, not freshly cloned records"
+    );
+}
+
+// H-047: with a backing store, push_record writes ONE shared allocation to both
+// the bridge recall index and the store snapshot index — they cannot diverge.
+#[tokio::test]
+async fn push_record_shares_one_allocation_across_both_indexes() {
+    use std::sync::Arc;
+    let store = Arc::new(MemoryStore::new("/tmp/ct-h047-test"));
+    let mut bridge = MemoryBridge::with_store(Arc::clone(&store));
+    bridge.push_record("s", make_record(7, "s"));
+
+    // Handle from the bridge recall path.
+    let recalled = bridge.recall_relevant("s", "hash-7", 5, 0).await.unwrap();
+    assert_eq!(recalled.len(), 1);
+
+    // Handle from the store's snapshot/stats index (public DashMap).
+    let store_entry = store.sessions.get("s").expect("session present in store");
+    assert_eq!(store_entry.len(), 1);
+
+    assert!(
+        Arc::ptr_eq(&recalled[0], &store_entry[0]),
+        "the bridge and store indexes must reference a single shared record allocation"
+    );
+}

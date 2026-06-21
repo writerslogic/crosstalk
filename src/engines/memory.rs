@@ -108,7 +108,12 @@ pub fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
 pub struct MemoryBridge {
     pub store: Option<Arc<MemoryStore>>,
     /// In-memory session records for lightweight (non-LanceDB) usage.
-    sessions: HashMap<String, Vec<MemoryRecord>>,
+    ///
+    /// Records are stored behind `Arc` so recall hands out cheap shared handles
+    /// instead of deep-cloning each `MemoryRecord` (H-036), and so a record
+    /// pushed into both this map and the backing store's index is a single
+    /// shared allocation that cannot diverge (H-047).
+    sessions: HashMap<String, Vec<Arc<MemoryRecord>>>,
     /// Track which (session, turn_idx) pairs have already been recalled.
     recalled_turns: HashSet<(String, u32)>,
     /// Feedback: maps turn_idx to (recalled_content_hashes, had_memory_injection).
@@ -161,7 +166,7 @@ impl MemoryBridge {
         query: &str,
         k: usize,
         idx: u32,
-    ) -> Result<Vec<MemoryRecord>> {
+    ) -> Result<Vec<Arc<MemoryRecord>>> {
         // Rate-limit: at most one recall per (session, turn_idx)
         let key = (sid.to_string(), idx);
         if !self.recalled_turns.insert(key) {
@@ -175,7 +180,7 @@ impl MemoryBridge {
                 .unwrap_or_default()
                 .as_secs();
             let query_emb = local_embed_text(query);
-            let mut scored: Vec<(f32, &MemoryRecord)> = records
+            let mut scored: Vec<(f32, &Arc<MemoryRecord>)> = records
                 .iter()
                 .filter(|r| !r.is_negative)
                 .map(|r| {
@@ -200,7 +205,7 @@ impl MemoryBridge {
             return Ok(results
                 .into_iter()
                 .filter(|(r, _)| !r.is_negative)
-                .map(|(r, _)| r)
+                .map(|(r, _)| Arc::new(r))
                 .collect());
         }
 
@@ -239,8 +244,8 @@ impl MemoryBridge {
             self.recalled_scores_last.clear();
         }
         Ok(records
-            .into_iter()
-            .map(|r| r.content_hash)
+            .iter()
+            .map(|r| r.content_hash.clone())
             .collect::<Vec<_>>()
             .join("\n"))
     }
@@ -379,7 +384,7 @@ impl MemoryBridge {
             for r in records {
                 if r.is_negative {
                     let sim = local_cosine_similarity(&query_emb, &r.embedding);
-                    all_neg.push((sim, r.clone()));
+                    all_neg.push((sim, (**r).clone()));
                 }
             }
         }
@@ -415,9 +420,12 @@ impl MemoryBridge {
     const MAX_RECORDS_PER_SESSION: usize = 1000;
 
     pub fn push_record(&mut self, sid: &str, record: MemoryRecord) {
+        // Single shared allocation referenced by both the bridge's recall index
+        // and the store's snapshot/stats index, so the two cannot diverge (H-047).
+        let record = Arc::new(record);
         if let Some(store) = &self.store {
             let mut entry = store.sessions.entry(sid.to_string()).or_default();
-            entry.push(record.clone());
+            entry.push(Arc::clone(&record));
             let len = entry.len();
             if len > Self::MAX_RECORDS_PER_SESSION {
                 entry.drain(..len - Self::MAX_RECORDS_PER_SESSION);
@@ -511,19 +519,25 @@ impl MemoryBridge {
                 }
             },
         };
-        self.sessions.entry(sid.to_string()).or_default().push(rec);
+        self.sessions
+            .entry(sid.to_string())
+            .or_default()
+            .push(Arc::new(rec));
     }
 
     /// Return a snapshot of all in-memory records for a session.
     pub fn take_snapshot(&self, sid: &str) -> Vec<MemoryRecord> {
-        self.sessions.get(sid).cloned().unwrap_or_default()
+        self.sessions
+            .get(sid)
+            .map(|v| v.iter().map(|a| (**a).clone()).collect())
+            .unwrap_or_default()
     }
 
     pub fn index_snapshot(&mut self, sid: &str, records: Vec<MemoryRecord>) {
         self.sessions
             .entry(sid.to_string())
             .or_default()
-            .extend(records);
+            .extend(records.into_iter().map(Arc::new));
     }
 
     pub fn session_count(&self) -> usize {
@@ -551,7 +565,7 @@ pub struct MemoryStore {
     pub uri: String,
     pub embedding_dim: usize,
     pub conn: Option<Connection>,
-    pub sessions: dashmap::DashMap<String, Vec<MemoryRecord>>,
+    pub sessions: dashmap::DashMap<String, Vec<Arc<MemoryRecord>>>,
     pub deletion_log: Vec<DeletionLogEntry>,
     cluster_assignments: Vec<Vec<u32>>,
 }
@@ -658,7 +672,7 @@ impl MemoryStore {
             self.sessions
                 .entry(rec.session_id.clone())
                 .or_default()
-                .push(rec);
+                .push(Arc::new(rec));
         }
         Ok(())
     }
@@ -777,7 +791,7 @@ impl MemoryStore {
                 .iter()
                 .any(|r| r.turn_id == rec.turn_id && r.session_id == rec.session_id)
             {
-                entry.push(rec);
+                entry.push(Arc::new(rec));
             }
         }
         Ok(())
@@ -787,7 +801,7 @@ impl MemoryStore {
         let records: Vec<MemoryRecord> = self
             .sessions
             .get(session_id)
-            .map(|r| r.value().clone())
+            .map(|r| r.value().iter().map(|a| (**a).clone()).collect())
             .unwrap_or_default();
         let json = serde_json::to_vec(&records)?;
         let hash: [u8; 32] = Sha256::digest(&json).into();
@@ -1137,8 +1151,8 @@ impl Default for DecayCalibrator {
 
 pub struct TieredConfig;
 pub struct TieredMemoryManager {
-    pub hot: VecDeque<MemoryRecord>,
-    pub warm: HashMap<String, (MemoryRecord, u64)>,
+    pub hot: VecDeque<Arc<MemoryRecord>>,
+    pub warm: HashMap<String, (Arc<MemoryRecord>, u64)>,
     pub cold: Arc<MemoryStore>,
     pub config: TieredConfig,
     /// Learnable ranker weights: [cosine_sim, recency_decay, outcome_boost, surprise_signal].
@@ -1204,7 +1218,7 @@ impl TieredMemoryManager {
     ///
     /// Populates `recalled_hashes_last` with fingerprints of returned records
     /// so `update_ranker` can attribute features to the correct gradient step.
-    pub async fn recall_tiered(&mut self, query: &str, k: usize) -> Result<Vec<MemoryRecord>> {
+    pub async fn recall_tiered(&mut self, query: &str, k: usize) -> Result<Vec<Arc<MemoryRecord>>> {
         if k == 0 {
             self.recalled_hashes_last.clear();
             return Ok(vec![]);
@@ -1220,7 +1234,7 @@ impl TieredMemoryManager {
 
         // Each entry: (score, fingerprint, record).
         let mut seen: HashSet<String> = HashSet::new();
-        let mut scored: Vec<(f64, u64, MemoryRecord)> = Vec::new();
+        let mut scored: Vec<(f64, u64, Arc<MemoryRecord>)> = Vec::new();
 
         // ── Hot tier ────────────────────────────────────────────────────────
         for rec in &self.hot {
@@ -1260,14 +1274,14 @@ impl TieredMemoryManager {
                     let score = score_record(&rec, &query_emb, now, w);
                     let fp = hash_to_u64(&rec.content_hash);
                     seen.insert(rec.content_hash.clone());
-                    scored.push((score, fp, rec));
+                    scored.push((score, fp, Arc::new(rec)));
                 }
             }
         }
 
         // ── Rank and return top-k ────────────────────────────────────────────
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let top_k: Vec<(f64, u64, MemoryRecord)> = scored.into_iter().take(k).collect();
+        let top_k: Vec<(f64, u64, Arc<MemoryRecord>)> = scored.into_iter().take(k).collect();
 
         self.recalled_hashes_last = top_k.iter().map(|(_, fp, _)| *fp).collect();
         self.recalled_scores_last = top_k.iter().map(|(s, _, _)| *s).collect();
