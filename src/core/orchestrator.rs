@@ -2320,35 +2320,10 @@ impl Orchestrator {
                 return Ok(ArtifactProcessOutcome::Regressive);
             }
 
-            // --- Sovereign-Tier: Multi-Modal Visual Consensus ---
-            let visual_fidelity = {
-                let viz = self.viz.lock().await;
-                if let Ok(frame) = viz.render_headless(&new_content).await {
-                    tracing::info!(artifact = %name, "captured visual frame for fidelity evaluation");
-                    // Compute pixel variance of the RGBA frame as a structural fidelity proxy.
-                    // High variance = rich content; low variance = blank/uniform frame.
-                    if frame.is_empty() {
-                        0.0
-                    } else {
-                        let len = frame.len() as f64;
-                        let mean: f64 = frame.iter().map(|&b| b as f64).sum::<f64>() / len;
-                        let variance: f64 = frame
-                            .iter()
-                            .map(|&b| {
-                                let d = b as f64 - mean;
-                                d * d
-                            })
-                            .sum::<f64>()
-                            / len;
-                        // Max variance for u8 data is 128^2 = 16384; normalise to [0.0, 1.0].
-                        (variance / 16384.0_f64).min(1.0)
-                    }
-                } else {
-                    0.0
-                }
-            };
             let mut final_metrics = new_metrics.clone();
-            final_metrics.visual_fidelity = visual_fidelity;
+            // Visual-fidelity scoring required GPU frame capture, which was never
+            // wired up (no window/event loop), so it always evaluated to 0.0.
+            final_metrics.visual_fidelity = 0.0;
             final_metrics.health_score *= 1.0 - (mc_variance * 0.3).min(0.15);
 
             let node_updates: Vec<(String, String)> =

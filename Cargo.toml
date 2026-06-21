@@ -54,10 +54,7 @@ tree-sitter-rust = "0.23.2"
 wasmtime = "29.0.1"
 wasmtime-wasi = "29.0.1"
 which = "7.0.1"
-wgpu = "24.0.1"
-winit = "0.30.9"
-bytemuck = { version = "1.21.0", features = ["derive"] }
-fastembed = { version = "3", default-features = false, features = ["online", "ort-load-dynamic"], optional = true }
+fastembed ={ version = "3", default-features = false, features = ["online", "ort-load-dynamic"], optional = true }
 ort = { version = "=2.0.0-rc.4", features = ["coreml"], optional = true }
 flate2 = "1.0"
 glob = "0.3"
@@ -73,7 +70,6 @@ name = "Crosstalk"
 identifier = "com.sovereign.crosstalk"
 icon = ["assets/icon.png"]
 version = "1.0.0"
-resources = ["src/ui/viz.wgsl"]
 copyright = "Copyright © 2026 Sovereign Architect"
 category = "DeveloperTool"
 short_description = "AI Multi-Model Mediator and Collective Synthesis Engine"

@@ -1,8 +1,5 @@
 use crate::types::conversation::ConversationState;
-use anyhow::Result;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-use wgpu::util::DeviceExt;
 
 fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -19,13 +16,6 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    position: [f32; 3],
-    color: [f32; 3],
-}
-
 #[derive(Debug, Clone)]
 pub struct GodViewMetrics {
     pub frame: u64,
@@ -39,13 +29,6 @@ pub struct GodViewMetrics {
 
 pub struct GodView {
     pub frame_count: u64,
-    instance: Option<wgpu::Instance>,
-    surface: Option<wgpu::Surface<'static>>,
-    device: Option<wgpu::Device>,
-    queue: Option<wgpu::Queue>,
-    render_pipeline: Option<wgpu::RenderPipeline>,
-    /// Kept alive to guarantee the surface's backing window outlives the surface.
-    _window: Option<std::sync::Arc<winit::window::Window>>,
 }
 
 impl Default for GodView {
@@ -56,86 +39,7 @@ impl Default for GodView {
 
 impl GodView {
     pub fn new() -> Self {
-        Self {
-            frame_count: 0,
-            instance: None,
-            surface: None,
-            device: None,
-            queue: None,
-            render_pipeline: None,
-            _window: None,
-        }
-    }
-
-    pub async fn init_wgpu(&mut self, window: std::sync::Arc<winit::window::Window>) -> Result<()> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(), // Supports Metal, Vulkan, DX12, etc.
-            ..Default::default()
-        });
-        let surface = instance.create_surface(Arc::clone(&window))?;
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance, // Prefers Metal/GPU on Mac
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .ok_or_else(|| anyhow::anyhow!("No suitable GPU or Metal adapter found"))?;
-
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default(), None)
-            .await?;
-
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("viz_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("viz.wgsl").into()),
-        });
-
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[],
-                push_constant_ranges: &[],
-            });
-
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
-                }],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Bgra8UnormSrgb,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-
-        self.instance = Some(instance);
-        self.surface = Some(surface);
-        self.device = Some(device);
-        self.queue = Some(queue);
-        self.render_pipeline = Some(render_pipeline);
-        self._window = Some(window);
-
-        Ok(())
+        Self { frame_count: 0 }
     }
 
     pub fn compute_metrics(&mut self, sigma: &ConversationState) -> GodViewMetrics {
@@ -166,200 +70,6 @@ impl GodView {
             completion_p: sigma.completion_probability,
             agent_count,
         }
-    }
-
-    pub async fn render_frame(&mut self, sigma: &ConversationState) -> Result<()> {
-        self.frame_count += 1;
-
-        let Some(ref device) = self.device else {
-            return Ok(());
-        };
-        let Some(ref queue) = self.queue else {
-            return Ok(());
-        };
-        let Some(ref surface) = self.surface else {
-            return Ok(());
-        };
-        let Some(ref render_pipeline) = self.render_pipeline else {
-            return Ok(());
-        };
-
-        let output = surface.get_current_texture()?;
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Render Encoder"),
-        });
-
-        // 1. Project Swarm State to 3D Vertices
-        let mut vertices = vec![];
-        let total_turns = sigma.turns.len() as f32;
-
-        for (i, turn) in sigma.turns.iter().enumerate() {
-            // --- Suggestion 4: GPU-Accelerated Latent Trajectory Visualization ---
-            let pos = LatentMapper::project_to_3d(&turn.content);
-            let progress = i as f32 / total_turns.max(1.0);
-
-            let x = pos[0];
-            let y = pos[1];
-            let z = (progress * 2.0) - 1.0; // Use Z for temporal progression
-
-            // Sovereign Color Language: Green (Stable) -> Purple (Evolving)
-            let color = [
-                0.0 + (progress * 0.5),
-                1.0 - (progress * 0.5),
-                0.53 + (progress * 0.4),
-            ];
-
-            vertices.push(Vertex {
-                position: [x, y, z],
-                color,
-            });
-        }
-
-        if vertices.is_empty() {
-            vertices.push(Vertex {
-                position: [0.0, 0.0, 0.0],
-                color: [1.0, 1.0, 1.0],
-            });
-        }
-
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.01,
-                            g: 0.01,
-                            b: 0.02,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            render_pass.set_pipeline(render_pipeline);
-            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            render_pass.draw(0..vertices.len() as u32, 0..1);
-        }
-
-        queue.submit(std::iter::once(encoder.finish()));
-        output.present();
-
-        Ok(())
-    }
-
-    /// Suggestion 3: Multi-Modal Visual Consensus (Headless Capture)
-    pub async fn render_headless(&self, artifact_content: &str) -> Result<Vec<u8>> {
-        let Some(ref device) = self.device else {
-            return Err(anyhow::anyhow!("WGPU device not initialized"));
-        };
-        let Some(ref queue) = self.queue else {
-            return Err(anyhow::anyhow!("WGPU queue not initialized"));
-        };
-
-        // 1. Create a texture to render into
-        let size = wgpu::Extent3d {
-            width: 512,
-            height: 512,
-            depth_or_array_layers: 1,
-        };
-        let texture_desc = wgpu::TextureDescriptor {
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            label: Some("Headless Texture"),
-            view_formats: &[],
-        };
-        let texture = device.create_texture(&texture_desc);
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        // 2. Setup staging buffer for reading
-        let buffer_size = (512 * 512 * 4) as wgpu::BufferAddress;
-        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Headless Staging Buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // 3. Render Pass (Simplified placeholder for actual artifact rendering)
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Headless Encoder"),
-        });
-        {
-            let mut _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Headless Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-            // Here we would use the artifact_content to drive rendering
-        }
-
-        // 4. Copy texture to buffer
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &staging_buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(512 * 4),
-                    rows_per_image: Some(512),
-                },
-            },
-            size,
-        );
-
-        queue.submit(std::iter::once(encoder.finish()));
-
-        // 5. Read back the buffer
-        let buffer_slice = staging_buffer.slice(..);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        device.poll(wgpu::Maintain::Wait);
-        rx.await??;
-
-        let data = buffer_slice.get_mapped_range().to_vec();
-        staging_buffer.unmap();
-
-        tracing::info!(content_len = %artifact_content.len(), "captured functional headless visual frame");
-        Ok(data)
     }
 }
 
