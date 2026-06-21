@@ -57,6 +57,29 @@ impl Orchestrator {
             );
         }
 
+        // Snapshot the values the rest of finalization needs, then release the
+        // sigma lock: the persistence below touches only engines/memory_store,
+        // so holding the conversation-state lock across it is unnecessary.
+        let session_id = sigma.session_id.clone();
+        let lesson_task_summary = sigma
+            .turns
+            .first()
+            .map(|t| t.content.chars().take(200).collect::<String>())
+            .unwrap_or_default();
+        let lesson_completion_p = sigma.completion_probability;
+        let lesson_turn_count = sigma.iteration_index;
+        let lesson_quality_trajectory: Vec<f64> = sigma
+            .turns
+            .iter()
+            .rev()
+            .take(10)
+            .map(|t| {
+                RewardVector::from_turn(t)
+                    .weighted_score(t.task_category.unwrap_or(TaskCategory::Research))
+            })
+            .collect();
+        drop(sigma);
+
         // Persist Elo ratings for cross-session continuity.
         {
             let obs = self.observer.lock().await;
@@ -179,11 +202,7 @@ impl Orchestrator {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let task_summary = sigma
-                .turns
-                .first()
-                .map(|t| t.content.chars().take(200).collect::<String>())
-                .unwrap_or_default();
+            let task_summary = lesson_task_summary;
             let topo = self.topology.lock().await;
             let topology_sequence: Vec<String> = topo
                 .history
@@ -191,9 +210,9 @@ impl Orchestrator {
                 .map(|(_, t, _)| format!("{t:?}"))
                 .collect();
             drop(topo);
-            let final_outcome = if sigma.completion_probability > 0.7 {
+            let final_outcome = if lesson_completion_p > 0.7 {
                 "succeeded"
-            } else if sigma.completion_probability > 0.3 {
+            } else if lesson_completion_p > 0.3 {
                 "stalled"
             } else {
                 "failed"
@@ -207,23 +226,14 @@ impl Orchestrator {
                 .map(|(id, _)| id)
                 .unwrap_or_default();
             drop(obs);
-            let quality_trajectory: Vec<f64> = sigma
-                .turns
-                .iter()
-                .rev()
-                .take(10)
-                .map(|t| {
-                    RewardVector::from_turn(t)
-                        .weighted_score(t.task_category.unwrap_or(TaskCategory::Research))
-                })
-                .collect();
+            let quality_trajectory = lesson_quality_trajectory;
             let lesson = SessionLesson {
                 task_summary,
                 topology_sequence,
                 final_outcome,
                 winning_model,
                 quality_trajectory,
-                turn_count: sigma.iteration_index,
+                turn_count: lesson_turn_count,
                 timestamp: ts,
             };
             if let Ok(lesson_json) = serde_json::to_string(&lesson) {
@@ -249,14 +259,14 @@ impl Orchestrator {
             let principal = self.principal.lock().await;
             if let Ok(Some(event)) = crate::engines::data_minimizer::DataMinimizer::enforce(
                 self.state_manager.db(),
-                &sigma.session_id,
+                &session_id,
                 &principal.constraints,
             ) {
                 crate::log_warn!(
                     self.emit(StreamEvent::FiduciarySignal {
                         principal_id: principal.id.to_string(),
                         event,
-                        session_id: sigma.session_id.clone(),
+                        session_id: session_id.clone(),
                         timestamp: ConversationState::now(),
                     })
                     .await,
