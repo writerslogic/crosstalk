@@ -96,103 +96,6 @@ impl SecretScanner {
     }
 }
 
-pub struct ShellSanity;
-
-impl ShellSanity {
-    const ALLOWED_BINS: &'static [&'static str] = &[
-        "cargo",
-        "rustc",
-        "git",
-        "ls",
-        "cat",
-        "grep",
-        "rustfmt",
-        "clippy",
-        "tree-sitter",
-    ];
-
-    const DANGEROUS_PATTERNS: &'static [&'static str] = &[
-        "rm -rf /", "rm -rf ~", "curl", "wget", "nc", "netcat", "dd", "mkfs",
-    ];
-
-    pub fn validate(cmd: &str) -> Result<(), String> {
-        let tokens = Self::tokenize(cmd);
-        if tokens.is_empty() {
-            return Ok(());
-        }
-
-        let bin = &tokens[0];
-        let bin_name = Path::new(bin)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(bin);
-
-        if !Self::ALLOWED_BINS.contains(&bin_name) {
-            return Err(format!(
-                "Binary '{}' is not on the Sovereign allowlist",
-                bin_name
-            ));
-        }
-
-        let full_cmd = tokens.join(" ");
-        for pattern in Self::DANGEROUS_PATTERNS {
-            if full_cmd.contains(pattern) {
-                return Err(format!("Command matches dangerous pattern: {}", pattern));
-            }
-        }
-
-        for token in &tokens {
-            if token.contains('>')
-                || token.contains('|')
-                || token.contains('&')
-                || token.contains(';')
-            {
-                return Err("Command contains restricted operators (>, |, &, ;)".to_string());
-            }
-            if token.contains("/dev/") || token.contains("/etc/") {
-                return Err(format!("Command references restricted path: {}", token));
-            }
-        }
-
-        Ok(())
-    }
-
-    fn tokenize(cmd: &str) -> Vec<String> {
-        let mut tokens = vec![];
-        let mut current = String::new();
-        let mut in_quote: Option<char> = None;
-        let mut escaped = false;
-
-        for c in cmd.chars() {
-            if escaped {
-                current.push(c);
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if let Some(q) = in_quote {
-                if c == q {
-                    in_quote = None;
-                } else {
-                    current.push(c);
-                }
-            } else if c == '\'' || c == '\"' {
-                in_quote = Some(c);
-            } else if c.is_whitespace() {
-                if !current.is_empty() {
-                    tokens.push(current.clone());
-                    current.clear();
-                }
-            } else {
-                current.push(c);
-            }
-        }
-        if !current.is_empty() {
-            tokens.push(current);
-        }
-        tokens
-    }
-}
-
 pub struct InjectionShield;
 
 impl InjectionShield {
@@ -217,6 +120,29 @@ impl TurnSigner {
         let bytes = Zeroizing::new(rng.random::<[u8; 32]>());
         let signing_key = SigningKey::from_bytes(&bytes);
         Self { signing_key }
+    }
+
+    /// Load the signing key seed from `db`, generating and persisting a fresh
+    /// one on first use. A stable key is required for signatures to remain
+    /// verifiable across process restarts (cross-session tamper evidence).
+    pub fn with_persisted_key(db: &sled::Db) -> Result<Self, anyhow::Error> {
+        const SEED_KEY: &str = "turn_signer_seed";
+        let tree = db.open_tree("signing")?;
+        let seed: Zeroizing<[u8; 32]> = match tree.get(SEED_KEY)? {
+            Some(stored) => Zeroizing::new(stored.as_ref().try_into().map_err(|_| {
+                anyhow::anyhow!("stored signing seed has invalid length: {}", stored.len())
+            })?),
+            None => {
+                let mut rng = rand::rng();
+                let bytes = Zeroizing::new(rng.random::<[u8; 32]>());
+                tree.insert(SEED_KEY, bytes.as_slice())?;
+                tree.flush()?;
+                bytes
+            }
+        };
+        Ok(Self {
+            signing_key: SigningKey::from_bytes(&seed),
+        })
     }
 
     #[must_use]
@@ -313,6 +239,7 @@ pub struct AuditEntry {
     pub signature: Vec<u8>,
 }
 
+#[derive(Clone)]
 pub struct AuditLogger {
     pub db: Arc<sled::Db>,
     pub signer: Arc<TurnSigner>,

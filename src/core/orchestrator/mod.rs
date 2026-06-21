@@ -24,7 +24,7 @@ use crate::engines::reasoning::{ReasoningEngine, SynthesisEngine};
 use crate::engines::release::ConvergenceReport;
 use crate::engines::sandbox::SandboxResult;
 use crate::engines::security::SecretScanner;
-use crate::engines::security::TurnSigner;
+use crate::engines::security::{AuditLogger, InjectionShield, TurnSigner, ZeroTrustPolicy};
 use crate::engines::self_improvement::{
     FileWriter, PostMortemGenerator, SelfImprovementEngine, WriteOutcome,
 };
@@ -152,7 +152,11 @@ pub struct Orchestrator {
     stall_detector: Mutex<StallDetector>,
 
     // ── Concurrency & Session ─────────────────────────────────────────────────
-    pub signer: TurnSigner,
+    pub signer: Arc<TurnSigner>,
+    /// Signed, tamper-evident audit trail for tool-directive executions.
+    pub audit_log: AuditLogger,
+    /// Risk classifier for tool directives, feeding the audit trail.
+    pub risk_policy: ZeroTrustPolicy,
     pub compute: Mutex<ComputeManager>,
     pub completion_probability: Arc<AtomicU64>,
     rate_limiter: Arc<RequestRateLimiter>,
@@ -335,6 +339,14 @@ impl Orchestrator {
             })
             .unwrap_or_default();
 
+        // A persisted signing key keeps turn/disclosure signatures verifiable
+        // across sessions; the audit log shares it so its entries are signed too.
+        let signer = Arc::new(TurnSigner::with_persisted_key(state_manager.db())?);
+        let audit_log = AuditLogger::new(
+            Arc::new(state_manager.db().clone()),
+            Arc::clone(&signer),
+        );
+
         Ok(Self {
             agents,
             state_manager,
@@ -356,7 +368,9 @@ impl Orchestrator {
             self_improve: SelfImprovementEngine,
             swarm: SwarmController::new(),
             planning: PlanningEngine,
-            signer: TurnSigner::new(),
+            signer,
+            audit_log,
+            risk_policy: ZeroTrustPolicy::new(),
             analytics: AnalyticsEngine,
             collective: Mutex::new({
                 let mut coll = CollectiveIntelligenceEngine::new();

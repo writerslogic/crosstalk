@@ -488,6 +488,38 @@ async fn main() -> anyhow::Result<()> {
         ConversationState::new(&session_id)
     }));
 
+    // Cross-session tamper evidence: verify the signatures on restored turns
+    // against the persisted signing key before resuming work on them.
+    if args.resume.is_some() {
+        match crosstalk::engines::security::TurnSigner::with_persisted_key(manager.db()) {
+            Ok(signer) => {
+                let s = sigma.lock().await;
+                let signed = s.turns.iter().filter(|t| !t.signature.is_empty());
+                let mut total = 0usize;
+                let mut bad = 0usize;
+                for turn in signed {
+                    total += 1;
+                    if !matches!(signer.verify_turn(turn), Ok(true)) {
+                        bad += 1;
+                    }
+                }
+                if bad > 0 {
+                    tracing::warn!(
+                        session = %session_id,
+                        failed = bad,
+                        total,
+                        "restored turn signatures failed verification; persisted state may have been tampered with"
+                    );
+                } else if total > 0 {
+                    tracing::info!(session = %session_id, verified = total, "restored turn signatures verified");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not load signing key to verify restored turns");
+            }
+        }
+    }
+
     let effective_workspace = wizard_workspace.as_deref().or(args.workspace.as_deref());
 
     if let Some(ws) = effective_workspace {

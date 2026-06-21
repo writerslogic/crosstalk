@@ -371,10 +371,9 @@ impl Orchestrator {
             diff_quality_score: Some(dq_score),
             persona_disclosure: None,
         };
-        let serialized = serde_json::to_vec(&turn)?;
-        turn.signature = self.signer.sign(&serialized);
 
-        // Transparency duty: attach a signed PersonaDisclosure to every named-agent turn.
+        // Transparency duty: attach a signed PersonaDisclosure to every named-agent
+        // turn *before* signing the turn, so the turn signature also covers it.
         {
             let principal = self.principal.lock().await;
             if principal.constraints.require_persona_disclosure && agent_id != "System" {
@@ -403,6 +402,9 @@ impl Orchestrator {
                 );
             }
         }
+
+        let serialized = serde_json::to_vec(&turn)?;
+        turn.signature = self.signer.sign(&serialized);
 
         let quality_score = {
             let base = {

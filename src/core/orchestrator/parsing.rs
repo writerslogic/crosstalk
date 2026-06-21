@@ -188,6 +188,24 @@ impl Orchestrator {
         args: &str,
         sigma_lock: &Arc<Mutex<ConversationState>>,
     ) -> String {
+        // Record every tool-directive attempt (including rejected ones) in the
+        // signed audit trail, classified by risk. For shell_exec the risk is
+        // judged on the underlying command rather than the wrapper tool name.
+        let actor = { sigma_lock.lock().await.session_id.clone() };
+        let effective = if tool_name == "shell_exec" {
+            args.split_whitespace().next().unwrap_or(tool_name)
+        } else {
+            tool_name
+        };
+        let risk = self.risk_policy.classify(effective, args);
+        let audit = self.audit_log.clone();
+        let event = format!("tool_directive:{tool_name}");
+        match tokio::task::spawn_blocking(move || audit.log(&event, risk, &actor)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "audit log write failed"),
+            Err(e) => tracing::warn!(error = %e, "audit log task panicked"),
+        }
+
         match tool_name {
             "memory_query" => {
                 let (sid, turn_idx) = {
@@ -305,7 +323,10 @@ impl Orchestrator {
                 }
                 match tokio::fs::read_to_string(&target).await {
                     Ok(content) => {
-                        let truncated: String = content.chars().take(4000).collect();
+                        // File contents are untrusted input fed back into the
+                        // model; redact known prompt-injection patterns first.
+                        let sanitized = InjectionShield::sanitize(&content);
+                        let truncated: String = sanitized.chars().take(4000).collect();
                         format!("[read_file {}]:\n{truncated}", target.display())
                     }
                     Err(e) => format!("[read_file] Error: {e}"),
