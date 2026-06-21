@@ -6,7 +6,7 @@ name = "crosstalk"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
-description = "Multi-model AI orchestrator: routes a task across several models, scores and synthesizes their proposals, and verifies the result, with a ratatui TUI."
+description = "Metacognitive multi-agent AI orchestrator: runs models as an adaptive debate swarm with self-improvement, multi-objective scoring, sandboxed verification, and tamper-evident transcripts."
 authors = ["David Condrey <david@writerslogic.com>"]
 license = "AGPL-3.0-only"
 repository = "https://github.com/writerslogic/crosstalk"
@@ -74,10 +74,10 @@ ort-embeddings = ["dep:fastembed", "dep:ort"]
 
 [package.metadata.bundle]
 name = "Crosstalk"
-identifier = "com.sovereign.crosstalk"
+identifier = "com.writerslogic.crosstalk"
 icon = ["assets/icon.png"]
-version = "1.0.0"
-copyright = "Copyright © 2026 Sovereign Architect"
+version = "0.1.0"
+copyright = "Copyright © 2026 WritersLogic, Inc."
 category = "DeveloperTool"
 short_description = "AI Multi-Model Mediator and Collective Synthesis Engine"
 long_description = """

@@ -1,0 +1,11 @@
+# Default owner for everything
+* @writerslogic
+
+# Security-sensitive code requires security-experienced review
+/src/engines/security.rs @writerslogic
+/src/engines/sandbox.rs @writerslogic
+/src/mcp/ @writerslogic
+
+# CI/CD and security policy
+/.github/ @writerslogic
+/SECURITY.md @writerslogic
