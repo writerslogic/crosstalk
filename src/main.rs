@@ -488,18 +488,18 @@ async fn main() -> anyhow::Result<()> {
         ConversationState::new(&session_id)
     }));
 
-    // Cross-session tamper evidence: verify the signatures on restored turns
-    // against the persisted signing key before resuming work on them.
+    // Cross-session tamper evidence: verify restored turns against the *pinned*
+    // public key (no secret needed), so a swapped seed cannot mask a forgery.
     if args.resume.is_some() {
-        match crosstalk::engines::security::TurnSigner::with_persisted_key(manager.db()) {
-            Ok(signer) => {
+        match crosstalk::engines::security::TurnVerifier::pinned(manager.db()) {
+            Ok(Some(verifier)) => {
                 let s = sigma.lock().await;
                 let signed = s.turns.iter().filter(|t| !t.signature.is_empty());
                 let mut total = 0usize;
                 let mut bad = 0usize;
                 for turn in signed {
                     total += 1;
-                    if !matches!(signer.verify_turn(turn), Ok(true)) {
+                    if !matches!(verifier.verify_turn(turn), Ok(true)) {
                         bad += 1;
                     }
                 }
@@ -514,8 +514,9 @@ async fn main() -> anyhow::Result<()> {
                     tracing::info!(session = %session_id, verified = total, "restored turn signatures verified");
                 }
             }
+            Ok(None) => {}
             Err(e) => {
-                tracing::warn!(error = %e, "could not load signing key to verify restored turns");
+                tracing::warn!(error = %e, "could not load pinned signing identity to verify restored turns");
             }
         }
     }

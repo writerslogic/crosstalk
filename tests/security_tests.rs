@@ -1,5 +1,5 @@
 use crosstalk::engines::security::{
-    AuditEntry, AuditLogger, InjectionShield, RiskLevel, TurnSigner, ZeroTrustPolicy,
+    AuditEntry, AuditLogger, InjectionShield, RiskLevel, TurnSigner, TurnVerifier, ZeroTrustPolicy,
 };
 use crosstalk::types::conversation::{Turn, TurnOutcome};
 use std::sync::Arc;
@@ -177,6 +177,69 @@ fn plaintext_seed_migrates_to_encrypted_when_passphrase_added() {
     let migrated = TurnSigner::with_persisted_key_passphrase(&db, Some("pw")).unwrap();
     assert!(migrated.verify_turn(&turn).unwrap());
     assert_eq!(stored_seed_blob(&db)[0], 0x01, "migrated to encrypted");
+}
+
+/// A transcript can be verified with only the pinned public key — no secret.
+#[test]
+fn pinned_verifier_checks_turn_without_the_secret() {
+    let (_dir, db) = temp_db();
+    let signer = TurnSigner::with_persisted_key(&db).expect("signer");
+
+    let mut turn = sample_turn();
+    let serialized = serde_json::to_vec(&turn).unwrap();
+    turn.signature = signer.sign(&serialized);
+
+    let verifier = TurnVerifier::from_hex(&signer.verifying_key_hex()).expect("verifier");
+    assert!(verifier.verify_turn(&turn).unwrap());
+
+    // The pin persisted on first run resolves to the same identity.
+    let pinned = TurnVerifier::pinned(&db).unwrap().expect("pinned key");
+    assert_eq!(pinned.key_hex(), signer.verifying_key_hex());
+    assert!(pinned.verify_turn(&turn).unwrap());
+}
+
+/// A turn signed by one key must not verify against a different pinned key.
+#[test]
+fn wrong_pinned_key_rejects_turn() {
+    let (_dir, a) = temp_db();
+    let (_dir2, b) = temp_db();
+    let signer_a = TurnSigner::with_persisted_key(&a).expect("a");
+    let signer_b = TurnSigner::with_persisted_key(&b).expect("b");
+
+    let mut turn = sample_turn();
+    let serialized = serde_json::to_vec(&turn).unwrap();
+    turn.signature = signer_a.sign(&serialized);
+
+    let verifier_b = TurnVerifier::from_hex(&signer_b.verifying_key_hex()).unwrap();
+    assert!(!verifier_b.verify_turn(&turn).unwrap());
+}
+
+/// Swapping the seed while leaving the pinned public key in place (or vice
+/// versa) must be detected on load rather than silently accepted.
+#[test]
+fn seed_swap_against_pin_is_detected() {
+    let (_dir, db) = temp_db();
+    TurnSigner::with_persisted_key(&db).expect("first run pins the identity");
+
+    // Overwrite the seed with a different one, leaving the original pin.
+    db.open_tree("signing")
+        .unwrap()
+        .insert("turn_signer_seed", &[0xABu8; 32])
+        .unwrap();
+
+    let err = TurnSigner::with_persisted_key(&db)
+        .err()
+        .expect("expected a tamper error");
+    assert!(
+        err.to_string().contains("pinned public key"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn pinned_returns_none_for_fresh_database() {
+    let (_dir, db) = temp_db();
+    assert!(TurnVerifier::pinned(&db).unwrap().is_none());
 }
 
 #[test]

@@ -134,7 +134,21 @@ impl TurnSigner {
     /// in the clear with a warning.
     pub fn with_persisted_key(db: &sled::Db) -> Result<Self, anyhow::Error> {
         let passphrase = std::env::var("CROSSTALK_SIGNING_PASSPHRASE").ok();
-        Self::with_persisted_key_passphrase(db, passphrase.as_deref())
+        let signer = Self::with_persisted_key_passphrase(db, passphrase.as_deref())?;
+        // Cross-domain pin: if the operator recorded the identity out-of-band,
+        // a seed that no longer matches it is a substitution and must abort.
+        if let Ok(expected) = std::env::var("CROSSTALK_EXPECTED_PUBKEY")
+            && !expected.trim().is_empty()
+            && !expected.trim().eq_ignore_ascii_case(&signer.verifying_key_hex())
+        {
+            return Err(anyhow::anyhow!(
+                "signing identity {} does not match pinned CROSSTALK_EXPECTED_PUBKEY {}",
+                signer.verifying_key_hex(),
+                expected.trim()
+            ));
+        }
+        tracing::info!(identity = %signer.verifying_key_hex(), "turn signing identity");
+        Ok(signer)
     }
 
     /// As [`Self::with_persisted_key`] but with the passphrase supplied
@@ -169,9 +183,27 @@ impl TurnSigner {
             }
             (Some(blob), None) => read_plaintext_seed(&blob)?,
         };
-        Ok(Self {
+        let signer = Self {
             signing_key: SigningKey::from_bytes(&seed),
-        })
+        };
+        // Pin the public identity on first run and check it on every load: a seed
+        // swapped without a matching pin update (or vice versa) is tamper evidence.
+        const PUBKEY_KEY: &str = "turn_signer_pubkey";
+        let pubkey_hex = signer.verifying_key_hex();
+        match tree.get(PUBKEY_KEY)? {
+            Some(stored) if stored.as_ref() != pubkey_hex.as_bytes() => {
+                return Err(anyhow::anyhow!(
+                    "signing seed does not match the pinned public key in this database; \
+                     the seed or the pin was tampered with"
+                ));
+            }
+            Some(_) => {}
+            None => {
+                tree.insert(PUBKEY_KEY, pubkey_hex.as_bytes())?;
+                tree.flush()?;
+            }
+        }
+        Ok(signer)
     }
 
     #[must_use]
@@ -187,21 +219,96 @@ impl TurnSigner {
         }
     }
 
-    pub fn verify_turn(&self, turn: &Turn) -> Result<bool, anyhow::Error> {
-        let mut clean = turn.clone();
-        clean.signature = vec![];
-        let data = serde_json::to_vec(&clean)
-            .map_err(|e| anyhow::anyhow!("failed to serialize turn for verification: {e}"))?;
-        let sig_bytes: &[u8; 64] = turn.signature.as_slice().try_into().map_err(|_| {
-            anyhow::anyhow!(
-                "invalid signature length: expected 64 bytes, got {}",
-                turn.signature.len()
-            )
-        })?;
-        let sig = Signature::from_bytes(sig_bytes);
-        let verifying_key: VerifyingKey = (&self.signing_key).into();
-        Ok(verifying_key.verify(&data, &sig).is_ok())
+    /// The public (verifying) half of the signing key. Safe to publish; this is
+    /// the identity that should be pinned out-of-band so a swapped seed cannot
+    /// silently re-sign a forged transcript.
+    #[must_use]
+    pub fn verifying_key(&self) -> VerifyingKey {
+        (&self.signing_key).into()
     }
+
+    /// Hex-encoded public key — the value to record out-of-band and to pass via
+    /// `CROSSTALK_EXPECTED_PUBKEY` for cross-domain pinning.
+    #[must_use]
+    pub fn verifying_key_hex(&self) -> String {
+        to_hex(&self.verifying_key().to_bytes())
+    }
+
+    /// Self-verification against this signer's own key. Prefer a [`TurnVerifier`]
+    /// built from the *pinned* public key for trust decisions: verifying with the
+    /// same secret you are protecting is circular.
+    pub fn verify_turn(&self, turn: &Turn) -> Result<bool, anyhow::Error> {
+        verify_turn_signature(turn, &self.verifying_key())
+    }
+}
+
+/// Verifies turn signatures using only a public key — no secret required, so a
+/// transcript can be checked by a party that never holds the signing seed.
+pub struct TurnVerifier {
+    verifying_key: VerifyingKey,
+}
+
+impl TurnVerifier {
+    #[must_use]
+    pub fn new(verifying_key: VerifyingKey) -> Self {
+        Self { verifying_key }
+    }
+
+    pub fn from_hex(hex: &str) -> Result<Self, anyhow::Error> {
+        let bytes = from_hex(hex.trim())?;
+        let arr: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("public key must be 32 bytes, got {}", bytes.len()))?;
+        let verifying_key = VerifyingKey::from_bytes(&arr)
+            .map_err(|e| anyhow::anyhow!("invalid ed25519 public key: {e}"))?;
+        Ok(Self { verifying_key })
+    }
+
+    /// Resolve the pinned verifier for `db`: `CROSSTALK_EXPECTED_PUBKEY` is
+    /// authoritative when set (cross-domain pin); otherwise the public key
+    /// recorded in the `signing` tree on first run is used. Returns `None` when
+    /// no key has been pinned yet (a brand-new database).
+    pub fn pinned(db: &sled::Db) -> Result<Option<Self>, anyhow::Error> {
+        if let Ok(hex) = std::env::var("CROSSTALK_EXPECTED_PUBKEY")
+            && !hex.trim().is_empty()
+        {
+            return Ok(Some(Self::from_hex(hex.trim())?));
+        }
+        let tree = db.open_tree("signing")?;
+        match tree.get("turn_signer_pubkey")? {
+            Some(v) => {
+                let hex = std::str::from_utf8(&v)
+                    .map_err(|e| anyhow::anyhow!("pinned public key is not valid utf-8: {e}"))?;
+                Ok(Some(Self::from_hex(hex)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    #[must_use]
+    pub fn key_hex(&self) -> String {
+        to_hex(&self.verifying_key.to_bytes())
+    }
+
+    pub fn verify_turn(&self, turn: &Turn) -> Result<bool, anyhow::Error> {
+        verify_turn_signature(turn, &self.verifying_key)
+    }
+}
+
+fn verify_turn_signature(turn: &Turn, verifying_key: &VerifyingKey) -> Result<bool, anyhow::Error> {
+    let mut clean = turn.clone();
+    clean.signature = vec![];
+    let data = serde_json::to_vec(&clean)
+        .map_err(|e| anyhow::anyhow!("failed to serialize turn for verification: {e}"))?;
+    let sig_bytes: &[u8; 64] = turn.signature.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid signature length: expected 64 bytes, got {}",
+            turn.signature.len()
+        )
+    })?;
+    let sig = Signature::from_bytes(sig_bytes);
+    Ok(verifying_key.verify(&data, &sig).is_ok())
 }
 
 impl Default for TurnSigner {
@@ -221,6 +328,28 @@ const SEED_PLAINTEXT_TAG: u8 = 0x00;
 const SEED_ENCRYPTED_TAG: u8 = 0x01;
 const SEED_SALT_LEN: usize = 16;
 const SEED_NONCE_LEN: usize = 12;
+
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+fn from_hex(s: &str) -> Result<Vec<u8>, anyhow::Error> {
+    if !s.len().is_multiple_of(2) {
+        return Err(anyhow::anyhow!("hex string has odd length: {}", s.len()));
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|e| anyhow::anyhow!("invalid hex digit: {e}"))
+        })
+        .collect()
+}
 
 fn is_encrypted(blob: &[u8]) -> bool {
     blob.first() == Some(&SEED_ENCRYPTED_TAG)
