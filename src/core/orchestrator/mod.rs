@@ -433,7 +433,8 @@ impl Orchestrator {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(60),
             )),
-            nix_env: None,
+            nix_env: nix_env
+                .map(|env| std::collections::HashMap::from([("NIX_ENV".to_string(), env)])),
             resource_rx: Mutex::new(resource_rx),
             gold_state: Mutex::new(None),
             turn_tx: tokio::sync::broadcast::channel::<Turn>(256).0,
