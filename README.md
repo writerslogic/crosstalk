@@ -224,6 +224,11 @@ crosstalk emits its orchestration-audit head as a COSE/SCITT statement that cogm
 holographic-memory's verifiers independently accept (real cross-implementation interop), so
 an agent's C2PA credential can bind to the actual reasoning that produced the output.
 
+**Verify it yourself:** `cargo run --example verify_cogmem_sample` re-verifies the exact
+COSE/SCITT cognition statements lifted from cogmem's public C2PA sample with crosstalk's own
+verifier — identical bytes, independent implementation. The cross-implementation conformance
+claim, made runnable.
+
 ## Development
 
 ```sh
