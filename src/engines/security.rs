@@ -3,6 +3,8 @@ use crate::types::fiduciary::PersonaDisclosure;
 use argon2::Argon2;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use coset::iana::Algorithm;
+use coset::{CborSerializable, CoseSign1, CoseSign1Builder, HeaderBuilder};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::Rng;
 use regex::Regex;
@@ -242,6 +244,130 @@ impl TurnSigner {
     pub fn verify_turn(&self, turn: &Turn) -> Result<bool, anyhow::Error> {
         verify_turn_signature(turn, &self.verifying_key())
     }
+
+    /// The signer's `did:key` identifier — the self-certifying DID of the shared
+    /// agent-provenance substrate (`0xed01` multicodec + raw Ed25519 key, base58btc,
+    /// `z` multibase prefix), byte-identical to cogmem's `did_key`.
+    #[must_use]
+    pub fn did_key(&self) -> String {
+        let mut mc = Vec::with_capacity(34);
+        mc.extend_from_slice(&[0xed, 0x01]);
+        mc.extend_from_slice(&self.verifying_key().to_bytes());
+        format!("did:key:z{}", base58btc(&mc))
+    }
+
+    /// Emit the orchestration audit head as a SCITT-style signed statement: an
+    /// untagged `COSE_Sign1` (EdDSA, content type `application/cbor`, kid = raw
+    /// verifying key, empty external AAD) over a CBOR claim committing the audit
+    /// root and session. The envelope is byte-compatible with cogmem/HMS, so any
+    /// substrate verifier accepts it and it can become a C2PA assertion.
+    pub fn orchestration_audit_statement(
+        &self,
+        audit_root: &[u8],
+        session_id: &str,
+        turn_count: u64,
+        timestamp_ms: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let claim = ciborium::Value::Map(vec![
+            (
+                ciborium::Value::Text("iss".to_string()),
+                ciborium::Value::Text(self.did_key()),
+            ),
+            (
+                ciborium::Value::Text("audit_root".to_string()),
+                ciborium::Value::Bytes(audit_root.to_vec()),
+            ),
+            (
+                ciborium::Value::Text("session_id".to_string()),
+                ciborium::Value::Text(session_id.to_string()),
+            ),
+            (
+                ciborium::Value::Text("turn_count".to_string()),
+                ciborium::Value::Integer(turn_count.into()),
+            ),
+            (
+                ciborium::Value::Text("timestamp_ms".to_string()),
+                ciborium::Value::Integer(timestamp_ms.into()),
+            ),
+        ]);
+        let mut payload = Vec::new();
+        ciborium::into_writer(&claim, &mut payload)
+            .map_err(|e| anyhow::anyhow!("CBOR encoding failed: {e}"))?;
+
+        let protected = HeaderBuilder::new()
+            .algorithm(Algorithm::EdDSA)
+            .content_type("application/cbor".to_string())
+            .key_id(self.verifying_key().to_bytes().to_vec())
+            .build();
+        let sign1 = CoseSign1Builder::new()
+            .protected(protected)
+            .payload(payload)
+            .create_signature(b"", |data| self.signing_key.sign(data).to_bytes().to_vec())
+            .build();
+        sign1
+            .to_vec()
+            .map_err(|e| anyhow::anyhow!("COSE serialization failed: {e}"))
+    }
+}
+
+/// Verify an orchestration audit signed statement: parse the untagged
+/// `COSE_Sign1`, verify the EdDSA signature under the kid (raw verifying key) in
+/// its protected header, and return the decoded CBOR claim. Mirrors HMS's
+/// `verify_and_extract` for the shared substrate envelope.
+pub fn verify_orchestration_audit_statement(cose_bytes: &[u8]) -> anyhow::Result<ciborium::Value> {
+    let sign1 = CoseSign1::from_slice(cose_bytes)
+        .map_err(|e| anyhow::anyhow!("COSE deserialization failed: {e}"))?;
+    let kid = &sign1.protected.header.key_id;
+    let key_bytes: [u8; 32] = kid
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("kid must be a 32-byte ed25519 key, got {}", kid.len()))?;
+    let verifying_key = VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|e| anyhow::anyhow!("invalid ed25519 key id: {e}"))?;
+    let payload = sign1
+        .payload
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("COSE envelope has no payload"))?;
+    sign1
+        .verify_signature(b"", |sig, data| {
+            let sig_bytes: &[u8; 64] = sig
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("signature must be 64 bytes, got {}", sig.len()))?;
+            verifying_key
+                .verify(data, &Signature::from_bytes(sig_bytes))
+                .map_err(|e| anyhow::anyhow!("signature verification failed: {e}"))
+        })
+        .map_err(|e| anyhow::anyhow!("COSE verification failed: {e}"))?;
+    ciborium::from_reader(payload.as_slice())
+        .map_err(|e| anyhow::anyhow!("CBOR claim decoding failed: {e}"))
+}
+
+/// base58btc (Bitcoin alphabet) — the multibase encoding for `did:key`, matching
+/// cogmem's `b58encode` so the emitted DID is byte-identical across the substrate.
+fn base58btc(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let zeros = data.iter().take_while(|&&b| b == 0).count();
+    let mut digits: Vec<u8> = Vec::new();
+    for &byte in data {
+        let mut carry = byte as u32;
+        for digit in &mut digits {
+            carry += (*digit as u32) << 8;
+            *digit = (carry % 58) as u8;
+            carry /= 58;
+        }
+        while carry > 0 {
+            digits.push((carry % 58) as u8);
+            carry /= 58;
+        }
+    }
+    let mut out = String::with_capacity(zeros + digits.len());
+    for _ in 0..zeros {
+        out.push('1');
+    }
+    for &digit in digits.iter().rev() {
+        out.push(ALPHABET[digit as usize] as char);
+    }
+    out
 }
 
 /// Verifies turn signatures using only a public key — no secret required, so a
@@ -531,5 +657,73 @@ impl AuditLogger {
             RiskLevel::Low,
             actor,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orchestration_audit_statement_round_trips_and_conforms() {
+        let signer = TurnSigner::new();
+        let audit_root = [0x11u8; 32];
+        let cose = signer
+            .orchestration_audit_statement(&audit_root, "session-xyz", 7, 1_719_878_400_000)
+            .unwrap();
+
+        let claim = verify_orchestration_audit_statement(&cose).unwrap();
+        let map = match claim {
+            ciborium::Value::Map(entries) => entries,
+            _ => panic!("claim is not a CBOR map"),
+        };
+        let field = |name: &str| {
+            map.iter()
+                .find(|(k, _)| k == &ciborium::Value::Text(name.to_string()))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("missing claim field {name}"))
+        };
+        assert_eq!(field("iss"), ciborium::Value::Text(signer.did_key()));
+        assert_eq!(
+            field("audit_root"),
+            ciborium::Value::Bytes(audit_root.to_vec())
+        );
+        assert_eq!(
+            field("session_id"),
+            ciborium::Value::Text("session-xyz".to_string())
+        );
+        assert_eq!(field("turn_count"), ciborium::Value::Integer(7.into()));
+        assert_eq!(
+            field("timestamp_ms"),
+            ciborium::Value::Integer(1_719_878_400_000u64.into())
+        );
+
+        let sign1 = CoseSign1::from_slice(&cose).unwrap();
+        assert_eq!(
+            sign1.protected.header.alg,
+            Some(coset::RegisteredLabelWithPrivate::Assigned(
+                Algorithm::EdDSA
+            ))
+        );
+        assert_eq!(
+            sign1.protected.header.content_type,
+            Some(coset::ContentType::Text("application/cbor".to_string()))
+        );
+        assert_eq!(sign1.protected.header.key_id.len(), 32);
+        assert_eq!(
+            sign1.protected.header.key_id,
+            signer.verifying_key().to_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn orchestration_audit_statement_rejects_tamper() {
+        let signer = TurnSigner::new();
+        let mut cose = signer
+            .orchestration_audit_statement(&[0u8; 32], "s", 1, 1)
+            .unwrap();
+        let last = cose.len() - 1;
+        cose[last] ^= 0xff;
+        assert!(verify_orchestration_audit_statement(&cose).is_err());
     }
 }
