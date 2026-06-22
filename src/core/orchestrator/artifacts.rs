@@ -654,6 +654,13 @@ impl Orchestrator {
         let prev_hash = sigma.state_hash;
         sigma.state_hash = HashChain::compute(&sigma, &prev_hash)?;
 
+        // Emit the orchestration-audit head as a shared-substrate COSE/SCITT statement
+        // (the reasoning provenance that can be embedded as a C2PA assertion). Best-effort:
+        // a failure here must never abort the turn.
+        if let Err(e) = self.emit_orchestration_audit(&sigma) {
+            warn!(error = %e, "orchestration audit statement emit failed");
+        }
+
         sigma.agent_weights = match turn.task_category {
             Some(cat) => {
                 crate::engines::consensus::InfluenceWeightManager::calculate_weights_for_category(
@@ -1020,6 +1027,34 @@ impl Orchestrator {
             current_i,
             artifact_snapshot,
         )))
+    }
+
+    /// Sign and persist this session's orchestration-audit head as a COSE/SCITT statement
+    /// on the shared provenance substrate (byte-compatible with cogmem/HMS). The latest
+    /// head per session overwrites the prior one; retrieve it with [`Self::orchestration_audit`].
+    fn emit_orchestration_audit(&self, sigma: &ConversationState) -> anyhow::Result<()> {
+        let statement = self.signer.orchestration_audit_statement(
+            &sigma.state_hash,
+            &sigma.session_id,
+            u64::from(sigma.iteration_index),
+            ConversationState::now().saturating_mul(1000),
+        )?;
+        self.state_manager
+            .db()
+            .open_tree("orchestration_audit")?
+            .insert(sigma.session_id.as_bytes(), statement)?;
+        Ok(())
+    }
+
+    /// The latest signed orchestration-audit statement for `session_id`, if any — the
+    /// `crosstalk.orchestration.audit` C2PA assertion payload.
+    pub fn orchestration_audit(&self, session_id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self
+            .state_manager
+            .db()
+            .open_tree("orchestration_audit")?
+            .get(session_id.as_bytes())?
+            .map(|v| v.to_vec()))
     }
 
     /// Sub-phase of `commit_turn`: file I/O, verification, post-commit state updates, and
