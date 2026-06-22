@@ -18,11 +18,13 @@
 
 ## Overview
 
-Crosstalk is a **metacognitive multi-agent orchestrator**. It runs several language
+Crosstalk is a **metacognitive multi-model orchestrator**. It runs several language
 models as a reasoning *swarm*, mediates their proposals through an adaptive debate
 topology, scores them along multiple objectives, verifies candidate changes in a
 sandbox, and synthesizes a single result — while observing its own process and
-improving across sessions.
+improving across sessions. Every turn's reasoning is cryptographically signed and
+hash-chained, so the orchestration audit can be verified, resumed, and bound to the
+output it produced.
 
 What makes it more than an ensemble:
 
@@ -35,9 +37,13 @@ What makes it more than an ensemble:
 - Prompts **evolve** (DSPy-inspired tournament selection), and Elo ratings, topology
   scores, agent profiles, and distilled session lessons **persist across runs**.
 - Every turn is **signed and hash-chained** (anchored to git) under a **fiduciary
-  governance** model with signed persona disclosures and data-retention enforcement.
+  governance** model with signed persona disclosures and data-retention enforcement,
+  and each session's audit head is emitted as a portable COSE/SCITT signed statement.
 
 All of it runs from a terminal UI, optionally writing accepted changes back to your source.
+
+> Developed by [WritersLogic](https://github.com/writerslogic) — a metacognitive
+> orchestrator whose reasoning is verifiable end to end.
 
 ## Install
 
@@ -133,6 +139,10 @@ an id containing `/` (or prefixed `openrouter:`) is routed through OpenRouter.
 - Tamper-evident transcripts: each turn is ed25519-signed (persisted, optionally
   passphrase-encrypted key, pinned public identity) and linked into a hash chain anchored
   in git commit messages. See [SECURITY.md](SECURITY.md).
+- A portable **COSE/SCITT orchestration-audit statement**: each session's hash-chain head
+  is emitted as an untagged `COSE_Sign1` (EdDSA, CBOR claim) on a shared provenance
+  substrate, so an external verifier can confirm the reasoning that produced an output.
+  See [Provenance](#provenance--the-orchestration-audit-statement).
 - A fiduciary/principal model with signed persona disclosures and data-retention
   (minimization) enforcement.
 
@@ -163,6 +173,56 @@ Each turn flows through *propose → observe → score → adapt → synthesize 
 commit*. State is checkpointed to an embedded store every turn; resuming a session
 re-verifies its signatures and hash chain before continuing, and rehydrates the
 cross-session learning state (Elo, topology, profiles, lessons).
+
+## Provenance — the orchestration-audit statement
+
+Crosstalk treats its own reasoning as provenance. Beyond the per-turn signing described
+in [SECURITY.md](SECURITY.md), each session emits its hash-chain head as a single,
+portable signed statement that an outside party can verify without the session store.
+
+**What is implemented (real crypto, tested):**
+
+- **ed25519 signing identity**, exposed as a `did:key` that is byte-identical to cogmem's
+  (`src/engines/security.rs`).
+- **COSE/SCITT orchestration-audit statement**: `orchestration_audit_statement` emits an
+  **untagged `COSE_Sign1`** — EdDSA (alg `-8`), content type `application/cbor`, `kid` =
+  the raw 32-byte verifying key, empty external AAD — over a CBOR claim committing the
+  audit root, session id, turn count, and timestamp. This is the shared-substrate
+  envelope (see below), so it is byte-compatible with cogmem and holographic-memory by
+  construction. `verify_orchestration_audit_statement` parses and checks it; a
+  round-trip/conformance test and a tamper-rejection test cover both paths.
+- **Anchoring**: the statement commits the same hash-chain head that the transcript anchors
+  in git, so the portable audit and the resumable session agree.
+
+**Roadmap:** publishing the audit statement as a first-class `crosstalk.orchestration.audit`
+C2PA assertion alongside cogmem's memory statement (the producer side lives in WritersProof),
+and shipping a cross-repo conformance vector so the interop is enforced in CI rather than
+guaranteed by construction.
+
+The envelope, identity model, and assertion labels are specified in
+[UNIFIED-PROVENANCE.md](https://github.com/writerslogic/cogmem/blob/main/UNIFIED-PROVENANCE.md).
+
+## Part of the agent-provenance stack
+
+[crosstalk](https://github.com/writerslogic/crosstalk) is one of four WritersLogic
+projects that compose a single verifiable agent-provenance pipeline — an AI agent's
+identity, the memory that steered it, the reasoning that produced it, and the signed
+output, all cryptographically bound and cross-verifiable, culminating in a C2PA Content
+Credential.
+
+| Project | Role |
+|---|---|
+| [cogmem](https://github.com/writerslogic/cogmem) | Agent identity (CAWG Identity Claims Aggregation credential) + verifiable, tamper-evident memory (COSE/SCITT signed statements) |
+| **crosstalk (this repo)** | Multi-model orchestrator; signs each turn's reasoning/orchestration audit on the shared substrate |
+| [holographic-memory](https://github.com/writerslogic/holographic-memory) | Durable holographic memory store; cross-verifies the signed statements and the C2PA agent identity |
+| WritersProof | The C2PA producer: binds identity + memory + reasoning to the signed asset and hosts the agent's did:web |
+
+All four share one substrate — COSE_Sign1 / SCITT signed statements (Ed25519) and W3C DID
+identity, specified in
+[UNIFIED-PROVENANCE.md](https://github.com/writerslogic/cogmem/blob/main/UNIFIED-PROVENANCE.md).
+crosstalk emits its orchestration-audit head as a COSE/SCITT statement that cogmem's and
+holographic-memory's verifiers independently accept (real cross-implementation interop), so
+an agent's C2PA credential can bind to the actual reasoning that produced the output.
 
 ## Development
 
