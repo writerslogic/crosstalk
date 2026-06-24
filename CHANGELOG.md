@@ -75,6 +75,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 - Reorganize into modular architecture (core, engines, types, mcp, ui, utils)
 
 ### Documentation
+- Update changelog [skip ci]
 - Restructure README with collapsible sections
 - Rewrite README — fix logo tag, add install/quick start, improve structure
 - Polish README and add agent-provenance stack cross-reference
