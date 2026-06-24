@@ -75,7 +75,8 @@ Pass model IDs via `--models`. An ID containing `/` or prefixed `openrouter:` ro
 
 Run `crosstalk --help` for the complete list.
 
-## Why Crosstalk?
+<details>
+<summary><strong>Why Crosstalk?</strong> -- single-model tools give one perspective; Crosstalk treats that as a failure mode</summary>
 
 Single-model AI tools give you one perspective. Crosstalk treats that as a failure mode. Instead of trusting any single model, Crosstalk:
 
@@ -86,43 +87,67 @@ Single-model AI tools give you one perspective. Crosstalk treats that as a failu
 - Synthesizes one result from the best ideas across all models
 - Signs and hash-chains every turn so the reasoning is auditable
 
-## Features
+</details>
 
-### Mediation and Topology
+<details>
+<summary><strong>Features</strong> -- mediation, metacognition, scoring, verification, provenance, memory</summary>
+
+<details>
+<summary><strong>Mediation and Topology</strong></summary>
 
 - Fan a task across multiple models and synthesize one result.
 - Adaptive debate topology per turn: direct implementation, debate-and-critique, step-by-step, ensemble voting, round-robin, adversarial, tree-of-thoughts.
 - Automatic topology shifts on deadlock, quality drop, or agent-count change, selected by a UCB1 bandit over historical outcomes (see `crosstalk-eval`).
 
-### Metacognition and Self-Improvement
+</details>
+
+<details>
+<summary><strong>Metacognition and Self-Improvement</strong></summary>
 
 - A metacognitive observer (the swarm's executive function) that Elo-rates each agent's reliability, detects reasoning fallacies, and injects adversarial challenges when the swarm converges too quickly.
 - DSPy-inspired evolutionary prompt optimization via tournament selection.
 - Cross-session learning: Elo ratings, topology scores, collective agent profiles, recall ranker weights, and distilled session lessons persist between runs.
 
-### Scoring and Selection
+</details>
+
+<details>
+<summary><strong>Scoring and Selection</strong></summary>
 
 - Multi-objective reward (Pareto) combining quality, consistency, novelty, surprise, and completion signals — not a single scalar.
 - Monte Carlo prediction of whether a candidate change will be accepted.
 
-### Verification and Safety
+</details>
+
+<details>
+<summary><strong>Verification and Safety</strong></summary>
 
 - WASM sandbox (wasmtime) with CPU-fuel, epoch-deadline, memory, and wall-clock limits, distinguishing resource-limit kills from ordinary failures.
 - Optional Verus formal verification of safety invariants on critical state transitions (see [VERUS.md](VERUS.md)).
 - Permissioned tool gateway for model-invoked tools (`read_file`, `write_file`, allow-listed `shell_exec`, memory queries), confined to the workspace, with a signed audit log and prompt-injection screening.
 
-### Provenance and Governance
+</details>
+
+<details>
+<summary><strong>Provenance and Governance</strong></summary>
 
 - Tamper-evident transcripts: each turn is Ed25519-signed and linked into a hash chain anchored in git commit messages.
 - A portable COSE/SCITT orchestration-audit statement: each session's hash-chain head is emitted as an untagged `COSE_Sign1` (EdDSA, CBOR claim) on the shared provenance substrate — byte-compatible with cogmem and holographic-memory by construction. External verifiers can confirm the reasoning that produced an output without the session store.
 - A fiduciary/principal model with signed persona disclosures and data-retention (minimization) enforcement.
 
-### Memory and Interface
+</details>
+
+<details>
+<summary><strong>Memory and Interface</strong></summary>
 
 - Embedding-based memory with relevance recall across sessions.
 - ratatui terminal UI showing per-model progress, scoring, and synthesis.
 
-## Provenance — the Orchestration-Audit Statement
+</details>
+
+</details>
+
+<details>
+<summary><strong>Provenance -- the Orchestration-Audit Statement</strong></summary>
 
 Crosstalk treats its own reasoning as provenance. Each session emits its hash-chain head as a single, portable signed statement that any party can verify independently.
 
@@ -140,7 +165,10 @@ cargo run --example verify_cogmem_sample
 
 Re-verifies the exact COSE/SCITT cognition statements from cogmem's public C2PA sample with crosstalk's own verifier — identical bytes, independent implementation.
 
-## Architecture
+</details>
+
+<details>
+<summary><strong>Architecture</strong></summary>
 
 ```
 src/
@@ -161,6 +189,8 @@ crosstalk-eval/          UCB1 topology-selection benchmarking harness
 Each turn flows through: propose -> observe -> score -> adapt -> synthesize -> verify -> commit.
 
 State is checkpointed every turn; resuming a session re-verifies its signatures and hash chain before continuing and rehydrates cross-session learning state (Elo, topology, profiles, lessons).
+
+</details>
 
 ## Part of the Agent-Provenance Stack
 
